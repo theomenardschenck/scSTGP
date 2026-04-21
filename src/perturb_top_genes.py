@@ -2,14 +2,23 @@
 """
 perturb_top_genes.py — Batch perturbation of the top-ranked GNN genes.
 
-Runs knockdown / knockout / overexpression on the top-N genes by
-`vgae_importance` from a trained VGAE run. Optionally also extracts each
-gene's dominant REACTOME pathway (smallest REACTOME set containing the
-gene, within size bounds) and re-runs the same three modes on the full
-pathway.
+Two modes:
 
-Every perturbation is delegated to `gnn_perturbation.py` via subprocess,
-so this script stays decoupled from the model internals.
+(1) TOP-N mode (default, subprocess-based, one folder per target)
+    Runs knockdown / knockout / overexpression on the top-N genes by
+    `vgae_importance` from a trained VGAE run. Optionally also extracts
+    each gene's dominant REACTOME pathway and re-runs the same three
+    modes on the full pathway. Each perturbation is delegated to
+    `gnn_perturbation.py` via subprocess and produces its own directory.
+
+(2) ALL mode (--all-genes / --all-pathways, in-process, no per-target folder)
+    Loads the VGAE run once and iterates over EVERY gene (or every
+    REACTOME pathway within size bounds), running each mode in-process
+    via `gnn_perturbation.run_perturbation_once()`. No per-target folder
+    is created — a single aggregated TSV is written at the run_dir root:
+        perturbation_all_genes_summary.tsv
+        perturbation_all_pathways_summary.tsv
+    One row per (target, mode), columns flattened from summary.json.
 
 Usage
 -----
@@ -33,12 +42,27 @@ Usage
         --run-dir output/gnn_vgae/V3_Run3 \\
         --top-n 20 --extra-genes ATF3,CEBPB,DDIT3
 
+    # ALL genes, single mode (fast-ish: ~n_genes forward passes)
+    python src/perturb_top_genes.py \\
+        --run-dir output/gnn_vgae/V3_Run3 \\
+        --all-genes --modes knockdown
+
+    # ALL REACTOME pathways (size in [10, 300]), all three modes
+    python src/perturb_top_genes.py \\
+        --run-dir output/gnn_vgae/V3_Run3 \\
+        --all-pathways --pw-min-size 10 --pw-max-size 300
+
 Outputs
 -------
-    <run-dir>/perturbation/<mode>_<gene>/                       — per-gene
-    <run-dir>/perturbation/<mode>_pw_<pathway_slug>/            — per-pathway
-    <run-dir>/perturbation/manifest.csv                         — index
-    data/pathway_gene_list/<pathway_slug>.txt                   — pathway lists
+    TOP-N mode:
+      <run-dir>/perturbation/<mode>_<gene>/                     — per-gene
+      <run-dir>/perturbation/<mode>_pw_<pathway_slug>/          — per-pathway
+      <run-dir>/perturbation/manifest.csv                       — index
+      data/pathway_gene_list/<pathway_slug>.txt                 — pathway lists
+
+    ALL mode:
+      <run-dir>/perturbation_all_genes_summary.tsv              — flat TSV
+      <run-dir>/perturbation_all_pathways_summary.tsv           — flat TSV
 """
 
 from __future__ import annotations
@@ -57,6 +81,159 @@ PATHWAY_LIST_DIR = ROOT / "data/pathway_gene_list"
 GMT_PATH = ROOT / "data/databases/c2.cp.reactome.symbols.gmt"
 
 DEFAULT_MODES = ("knockdown", "knockout", "overexpress")
+
+# Colonnes attendues dans le TSV agrégé (--all-genes / --all-pathways).
+# L'ordre fixe ici reflète l'ordre CELL_GROUPS dans gnn_perturbation.py.
+CELL_GROUPS = ("P4", "P16_cluster_0", "P16_cluster_1",
+               "P16_cluster_2", "P16_cluster_3")
+
+
+def flatten_summary(target_type: str, target: str,
+                    pathway: str, mode: str, factor,
+                    summary: dict) -> dict:
+    """Convert a nested summary dict to a flat row for the aggregated TSV.
+
+    Flattens cell_group_shift_relative into per-group columns and joins
+    list-valued fields (top5_delta_pathways, targets_missing) with ';'.
+    """
+    shift = summary.get("cell_group_shift_relative", {}) or {}
+    row = {
+        "target_type": target_type,
+        "target": target,
+        "pathway": pathway,
+        "mode": mode,
+        "factor": factor if factor is not None else "",
+        "n_targets_in_graph": summary.get("n_targets_in_graph"),
+        "n_targets_missing": len(summary.get("targets_missing", []) or []),
+        "targets_missing": ";".join(summary.get("targets_missing", []) or []),
+        "n_rising": summary.get("n_rising"),
+        "n_falling": summary.get("n_falling"),
+        "median_abs_delta_rank": summary.get("median_abs_delta_rank"),
+        "max_up_gene": summary.get("max_up_gene"),
+        "max_up_delta_rank": summary.get("max_up_delta_rank"),
+        "max_down_gene": summary.get("max_down_gene"),
+        "max_down_delta_rank": summary.get("max_down_delta_rank"),
+        "n_sig_delta_pathways": summary.get("n_sig_delta_pathways"),
+        "top5_delta_pathways": ";".join(
+            summary.get("top5_delta_pathways", []) or []),
+        "max_shift_group": summary.get("max_shift_group"),
+        "max_shift_relative": summary.get("max_shift_relative"),
+    }
+    for grp in CELL_GROUPS:
+        row[f"shift_{grp}"] = shift.get(grp)
+    return row
+
+
+def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
+                             n_layers: int, n_heads: int):
+    """Load the VGAE run + compute the shared baseline once.
+
+    Imports gnn_perturbation lazily so the subprocess TOP-N mode doesn't
+    pull torch when not needed.
+    """
+    # Local import — gnn_perturbation needs torch + PyG which are heavy.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from gnn_perturbation import (  # noqa: E402
+        load_run, prepare_baseline,
+        load_reactome_gmt as _load_gmt,
+        load_background as _load_bg,
+    )
+    data, model, gene_symbols, gene_to_idx, baseline = load_run(
+        run_dir, hidden, latent, n_layers, n_heads)
+    spec, base_imp, base_rank, z_cg_base = prepare_baseline(
+        model, data, baseline, gene_symbols)
+    reactome = _load_gmt()
+    background = _load_bg()
+    print(f"Loaded run ({len(gene_symbols)} genes); baseline computed.")
+    return {
+        "data": data, "model": model,
+        "gene_symbols": gene_symbols, "gene_to_idx": gene_to_idx,
+        "spec": spec, "base_imp": base_imp,
+        "base_rank": base_rank, "z_cg_base": z_cg_base,
+        "reactome": reactome, "background": background,
+    }
+
+
+def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
+                  top_k: int, fdr: float, out_tsv: Path,
+                  reactome_for_pw: dict | None = None) -> None:
+    """Perturb every gene in the graph, every mode, into a single TSV."""
+    from gnn_perturbation import run_perturbation_once  # local import
+    gene_symbols = ctx["gene_symbols"]
+    n_total = len(gene_symbols) * len(modes)
+    print(f"\n[ALL GENES] {len(gene_symbols)} genes × {len(modes)} modes "
+          f"= {n_total} perturbations.")
+
+    rows: list[dict] = []
+    done = 0
+    for gene in gene_symbols:
+        for mode in modes:
+            factor = oe_factor if mode == "overexpress" else None
+            summary = run_perturbation_once(
+                ctx["model"], ctx["data"],
+                gene_symbols, ctx["gene_to_idx"],
+                ctx["spec"], ctx["base_imp"],
+                ctx["base_rank"], ctx["z_cg_base"],
+                targets=[str(gene)], mode=mode, factor=factor,
+                top_k=top_k, fdr=fdr,
+                reactome=ctx["reactome"], background=ctx["background"],
+                out_dir=None)
+            if summary is None:
+                continue
+            rows.append(flatten_summary("gene", str(gene), "",
+                                        mode, factor, summary))
+            done += 1
+            if done % 50 == 0 or done == n_total:
+                print(f"  [{done}/{n_total}] last: {gene} ({mode})")
+                # Flush partial TSV so long runs leave intermediate state.
+                pd.DataFrame(rows).to_csv(out_tsv, sep="\t", index=False)
+
+    pd.DataFrame(rows).to_csv(out_tsv, sep="\t", index=False)
+    print(f"\nWrote aggregated summary: {out_tsv}  ({len(rows)} rows)")
+
+
+def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
+                     top_k: int, fdr: float, out_tsv: Path,
+                     pw_min_size: int, pw_max_size: int) -> None:
+    """Perturb every REACTOME pathway (within size bounds) in a single TSV."""
+    from gnn_perturbation import run_perturbation_once
+    reactome = ctx["reactome"]
+    pathways = [
+        (name, sorted(members))
+        for name, members in reactome.items()
+        if pw_min_size <= len(members) <= pw_max_size
+    ]
+    pathways.sort(key=lambda x: x[0])
+    n_total = len(pathways) * len(modes)
+    print(f"\n[ALL PATHWAYS] {len(pathways)} pathways (size in "
+          f"[{pw_min_size},{pw_max_size}]) × {len(modes)} modes "
+          f"= {n_total} perturbations.")
+
+    rows: list[dict] = []
+    done = 0
+    for pw_name, members in pathways:
+        for mode in modes:
+            factor = oe_factor if mode == "overexpress" else None
+            summary = run_perturbation_once(
+                ctx["model"], ctx["data"],
+                ctx["gene_symbols"], ctx["gene_to_idx"],
+                ctx["spec"], ctx["base_imp"],
+                ctx["base_rank"], ctx["z_cg_base"],
+                targets=list(members), mode=mode, factor=factor,
+                top_k=top_k, fdr=fdr,
+                reactome=ctx["reactome"], background=ctx["background"],
+                out_dir=None)
+            if summary is None:
+                continue
+            rows.append(flatten_summary("pathway", pw_name, pw_name,
+                                        mode, factor, summary))
+            done += 1
+            if done % 25 == 0 or done == n_total:
+                print(f"  [{done}/{n_total}] last: {pw_name} ({mode})")
+                pd.DataFrame(rows).to_csv(out_tsv, sep="\t", index=False)
+
+    pd.DataFrame(rows).to_csv(out_tsv, sep="\t", index=False)
+    print(f"\nWrote aggregated summary: {out_tsv}  ({len(rows)} rows)")
 
 
 def load_reactome_gmt() -> dict[str, set[str]]:
@@ -206,9 +383,52 @@ def main():
                     help="Multiplier used for overexpress (default 3.0).")
     ap.add_argument("--force", action="store_true",
                     help="Re-run even if summary.json already exists.")
+    # --- ALL mode ---
+    ap.add_argument("--all-genes", action="store_true",
+                    help="Perturb EVERY gene in the graph (in-process). "
+                         "Output: one aggregated TSV, no per-target folder.")
+    ap.add_argument("--all-pathways", action="store_true",
+                    help="Perturb EVERY REACTOME pathway (within size bounds, "
+                         "in-process). Output: one aggregated TSV, no per-target folder.")
+    ap.add_argument("--pw-min-size", type=int, default=5,
+                    help="Min pathway size when --all-pathways (default 5).")
+    ap.add_argument("--pw-max-size", type=int, default=500,
+                    help="Max pathway size when --all-pathways (default 500).")
+    ap.add_argument("--top-k", type=int, default=100,
+                    help="Top-K rising genes for delta-ORA per perturbation "
+                         "(default 100). Forwarded to gnn_perturbation.")
+    ap.add_argument("--fdr", type=float, default=0.05,
+                    help="FDR threshold for delta-ORA (default 0.05).")
+    # Hyperparams forwarded to gnn_perturbation.load_run (ALL mode only).
+    ap.add_argument("--hidden", type=int, default=128)
+    ap.add_argument("--latent", type=int, default=64)
+    ap.add_argument("--n-layers", type=int, default=3)
+    ap.add_argument("--n-heads", type=int, default=4)
     args = ap.parse_args()
 
     run_dir: Path = args.run_dir
+    modes = tuple(args.modes)
+
+    # --------------------------------------------------------------- #
+    # ALL mode — in-process, single aggregated TSV per target type.
+    # --------------------------------------------------------------- #
+    if args.all_genes or args.all_pathways:
+        ctx = _load_model_and_baseline(run_dir, args.hidden, args.latent,
+                                       args.n_layers, args.n_heads)
+        if args.all_genes:
+            out_tsv = run_dir / "perturbation_all_genes_summary.tsv"
+            run_all_genes(ctx, modes, args.oe_factor,
+                          args.top_k, args.fdr, out_tsv)
+        if args.all_pathways:
+            out_tsv = run_dir / "perturbation_all_pathways_summary.tsv"
+            run_all_pathways(ctx, modes, args.oe_factor,
+                             args.top_k, args.fdr, out_tsv,
+                             args.pw_min_size, args.pw_max_size)
+        return
+
+    # --------------------------------------------------------------- #
+    # TOP-N mode — legacy subprocess path, one folder per target.
+    # --------------------------------------------------------------- #
     perturb_root = run_dir / "perturbation"
     perturb_root.mkdir(parents=True, exist_ok=True)
 
