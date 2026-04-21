@@ -96,7 +96,7 @@ FIG_DIR = os.path.join(OUT_DIR, "figure")
 # au contexte) + Corner Sampling (échantillonnage de l'espace des flux) pour
 # estimer l'importance métabolique de chaque gène dans les conditions P4 et P16.
 # HUMESS_DIR pointe vers les sorties HuMess pour les HUVEC.
-HUMESS_DIR = os.path.join(BASE_DIR, "humess", "output_huvec")
+HUMESS_DIR = os.path.join(LAB_DIR, "humess", "output_huvec")
 # Local fallback si la structure diffère :
 # HUMESS_DIR = "/home/USER/M2/S2/Stage/Projet_Colin/humess/output_huvec"
 HUMESS_CONDITIONS = ["P4", "P16"]  # Les deux conditions à comparer
@@ -2600,6 +2600,19 @@ print(f"  → gene_embeddings_vgae.csv ({gene_emb.shape})")
 # Poids du modèle PyTorch (pour réutilisation dans les perturbations)
 torch.save(model.state_dict(), os.path.join(OUT_DIR, "vgae_weights.pt"))
 print("  → vgae_weights.pt")
+
+# Expression par groupe cellulaire — requis par gnn_perturbation.py pour le
+# shift pondéré au niveau gène. On exporte mean_expression et pct_expressing
+# sous leur forme BRUTE (avant Z-scoring), car gnn_vgae.py applique un Z-score
+# in-place à edge_attr_expresses ce qui détruit les valeurs originales dans le
+# HeteroData sauvé.
+_group_expr_rows = {"gene": gene_symbols}
+for grp in CELL_GROUPS:
+    _group_expr_rows[f"mean_{grp}"] = group_stats[grp]["mean_expression"]
+    _group_expr_rows[f"pct_{grp}"] = group_stats[grp]["pct_expressing"]
+pd.DataFrame(_group_expr_rows).to_csv(
+    os.path.join(OUT_DIR, "group_expression.tsv"), sep="\t", index=False)
+print(f"  → group_expression.tsv (mean + pct × {len(CELL_GROUPS)} groupes)")
 
 # =============================================================================
 # RÉSUMÉ
