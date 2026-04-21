@@ -23,6 +23,16 @@ Usage
         --run-dir output/gnn_vgae/V3_Run3 \\
         --top-n 20 --also-pathway
 
+    # Custom gene list ONLY (no top-N), all three modes
+    python src/perturb_top_genes.py \\
+        --run-dir output/gnn_vgae/V3_Run3 \\
+        --top-n 0 --genes-file my_genes.txt
+
+    # Top-20 + a few extras (deduped, top-N first)
+    python src/perturb_top_genes.py \\
+        --run-dir output/gnn_vgae/V3_Run3 \\
+        --top-n 20 --extra-genes ATF3,CEBPB,DDIT3
+
 Outputs
 -------
     <run-dir>/perturbation/<mode>_<gene>/                       — per-gene
@@ -100,9 +110,37 @@ def write_pathway_gene_list(pathway: str,
 
 
 def load_top_genes(run_dir: Path, top_n: int) -> list[str]:
+    if top_n <= 0:
+        return []
     rk = pd.read_csv(run_dir / "gene_ranking_vgae.csv")
     rk = rk.sort_values("vgae_importance", ascending=False)
     return rk["gene"].head(top_n).astype(str).tolist()
+
+
+def load_extra_genes(genes_file: Path | None,
+                     extra_genes: str | None) -> list[str]:
+    """Combine genes from a file and/or a comma-separated string."""
+    out: list[str] = []
+    if genes_file is not None:
+        with open(genes_file) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                out.append(line)
+    if extra_genes:
+        out.extend(g.strip() for g in extra_genes.split(",") if g.strip())
+    return out
+
+
+def dedupe_preserve_order(genes: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for g in genes:
+        if g not in seen:
+            seen.add(g)
+            out.append(g)
+    return out
 
 
 def run_perturbation(run_dir: Path,
@@ -149,7 +187,15 @@ def main():
                     help="Trained VGAE run directory (must contain "
                          "gene_ranking_vgae.csv + best_vgae.pt).")
     ap.add_argument("--top-n", type=int, default=20,
-                    help="Number of top-importance genes to perturb (default 20).")
+                    help="Number of top-importance genes to perturb (default 20). "
+                         "Set to 0 to skip the top-N selection and use only "
+                         "--genes-file / --extra-genes.")
+    ap.add_argument("--genes-file", type=Path, default=None,
+                    help="Optional file with one gene symbol per line "
+                         "(# comments allowed). Combined with --top-n.")
+    ap.add_argument("--extra-genes", type=str, default=None,
+                    help="Optional comma-separated list of additional gene "
+                         "symbols. Combined with --top-n and --genes-file.")
     ap.add_argument("--modes", nargs="+", default=list(DEFAULT_MODES),
                     choices=list(DEFAULT_MODES),
                     help="Perturbation modes to run (default: all three).")
@@ -167,8 +213,20 @@ def main():
     perturb_root.mkdir(parents=True, exist_ok=True)
 
     top_genes = load_top_genes(run_dir, args.top_n)
-    print(f"Top-{args.top_n} genes by vgae_importance:")
-    print("  " + ", ".join(top_genes))
+    extra_genes = load_extra_genes(args.genes_file, args.extra_genes)
+    all_genes = dedupe_preserve_order(top_genes + extra_genes)
+
+    if not all_genes:
+        ap.error("No genes to perturb. Provide --top-n > 0 and/or "
+                 "--genes-file / --extra-genes.")
+
+    if top_genes:
+        print(f"Top-{args.top_n} genes by vgae_importance:")
+        print("  " + ", ".join(top_genes))
+    if extra_genes:
+        deduped_extra = [g for g in extra_genes if g not in set(top_genes)]
+        print(f"Extra genes ({len(deduped_extra)} new): "
+              + ", ".join(deduped_extra))
 
     reactome = None
     if args.also_pathway:
@@ -179,7 +237,7 @@ def main():
     manifest: list[dict] = []
 
     # ---- per-gene perturbations ----
-    for gene in top_genes:
+    for gene in all_genes:
         print(f"\n=== gene: {gene} ===")
         for mode in args.modes:
             out = perturb_root / f"{mode}_{gene}"
@@ -200,7 +258,7 @@ def main():
     # ---- per-pathway perturbations (dominant pathway of each top gene) ----
     if args.also_pathway:
         seen_pathways: set[str] = set()
-        for gene in top_genes:
+        for gene in all_genes:
             pw = find_dominant_pathway(gene, reactome)
             if pw is None:
                 print(f"\n[warn] no suitable REACTOME pathway for {gene}")
