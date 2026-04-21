@@ -59,51 +59,107 @@ import seaborn as sns
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+# Cette section définit tous les chemins d'accès aux données et les
+# hyperparamètres du pipeline. Les chemins pointent vers le cluster Nautilus
+# (GLiCID) ; des chemins locaux commentés sont disponibles pour le debug.
 
-# Directory sur nautilus
+# --- Chemins principaux sur le cluster Nautilus (GLiCID) ---
+# LAB_DIR : racine de l'espace utilisateur sur le stockage partagé GLiCID.
+# BASE_DIR : sous-dossier contenant le projet GNN (code + données).
+# DATA_DIR : données d'entrée (scRNA-seq, PPI, pySCENIC, bases de données).
+# SCENIC_DIR : sorties de pySCENIC (regulons, adjacencies, TF activity).
+# OUT_DIR : dossier de sortie sur /scratch (écriture rapide, non sauvegardé).
 LAB_DIR = "/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/"
 BASE_DIR = os.path.join(LAB_DIR, "gnn")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 SCENIC_DIR = os.path.join(BASE_DIR, "output", "pyscenic")
 OUT_DIR = "/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae"
 
-# directory local
+# --- Chemins locaux (décommentez pour debug sur votre machine) ---
 # BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # DATA_DIR = os.path.join(BASE_DIR, "..", "data")
 # SCENIC_DIR = os.path.join(BASE_DIR, "..", "output", "pyscenic")
 # OUT_DIR = os.path.join(BASE_DIR, "..", "output", "gnn_vgae")
 
-# Commun
+# --- Sous-dossiers communs ---
+# GNN_DATA_DIR : matrices normalisées + metadata (sortie du preprocessing Seurat).
+# PPI_DIR : cache local de STRING (protein-protein interactions).
+# DB_DIR : bases de données de validation (GenAge, CellAge, MSigDB, etc.).
+# FIG_DIR : figures générées par le pipeline.
 GNN_DATA_DIR = os.path.join(DATA_DIR, "gnn_data")
 PPI_DIR = os.path.join(DATA_DIR, "PPI")
 DB_DIR = os.path.join(DATA_DIR, "databases")
 FIG_DIR = os.path.join(OUT_DIR, "figure")
 
-# HuMess (métabolisme — CarveMe + Corner Sampling)
+# --- HuMess (modélisation métabolique) ---
+# HuMess utilise CarveMe (reconstruction de modèles métaboliques spécifiques
+# au contexte) + Corner Sampling (échantillonnage de l'espace des flux) pour
+# estimer l'importance métabolique de chaque gène dans les conditions P4 et P16.
+# HUMESS_DIR pointe vers les sorties HuMess pour les HUVEC.
 HUMESS_DIR = os.path.join(BASE_DIR, "humess", "output_huvec")
 # Local fallback si la structure diffère :
 # HUMESS_DIR = "/home/USER/M2/S2/Stage/Projet_Colin/humess/output_huvec"
-HUMESS_CONDITIONS = ["P4", "P16"]
+HUMESS_CONDITIONS = ["P4", "P16"]  # Les deux conditions à comparer
 
+# Création des dossiers de sortie s'ils n'existent pas
 for d in [PPI_DIR, DB_DIR, OUT_DIR, FIG_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # ── Paramètres du graphe ─────────────────────────────────────────────────────
+# PPI_SCORE_THRESH : seuil de confiance STRING (0-1000). 900 = "highest
+#   confidence". On ne garde que les interactions protéine-protéine très
+#   fiables pour éviter le bruit dans le graphe.
 PPI_SCORE_THRESH = 900
+# REACTOME_MAX_PATHWAY : taille max d'un pathway REACTOME (en gènes).
+#   Les très grands pathways (ex : "Metabolism") sont non informatifs —
+#   ils connectent trop de gènes entre eux et diluent le signal.
+#   Les très petits (< 2 gènes) ne créent pas d'arêtes utiles.
 REACTOME_MAX_PATHWAY = 20
+# COEXPR_TOP_QUANTILE : seules les co-expressions GRNBoost2 au-dessus de
+#   ce quantile sont conservées. 0.98 = top 2% des poids → réseau épars
+#   de haute confiance.
 COEXPR_TOP_QUANTILE = 0.98
 
 # ── Paramètres du VGAE ──────────────────────────────────────────────────────
+# HIDDEN_DIM : dimension des couches cachées du GNN (après projection des
+#   features d'entrée). Chaque couche GATConv produit un vecteur de cette
+#   taille pour chaque noeud. Avec N_HEADS=4, chaque tête travaille en
+#   dimension HIDDEN_DIM/N_HEADS = 32, puis les résultats sont concaténés.
 HIDDEN_DIM = 128
-LATENT_DIM = 64           # Dimension de l'espace latent (μ, σ)
+# LATENT_DIM : dimension de l'espace latent (μ et log(σ²) ont cette taille).
+#   C'est l'espace dans lequel on calcule le score d'importance. 64 offre
+#   un bon compromis entre expressivité et risque de KL collapse.
+LATENT_DIM = 64
+# N_LAYERS : nombre de couches de message passing. Chaque couche permet
+#   à un gène de "voir" un voisin de plus. Avec 3 couches, chaque gène
+#   agrège l'information de ses voisins jusqu'à distance 3 dans le graphe.
 N_LAYERS = 3
+# N_HEADS : nombre de têtes d'attention dans GATConv. Le multi-head
+#   attention permet au modèle d'apprendre différents types de relations
+#   (ex : une tête pour la co-expression, une autre pour la régulation).
 N_HEADS = 4
+# DROPOUT : régularisation par extinction aléatoire de neurones pendant
+#   l'entraînement. 0.2 = 20% des neurones sont désactivés à chaque
+#   forward pass, ce qui réduit le surapprentissage.
 DROPOUT = 0.2
+# N_EPOCHS : nombre maximal d'epochs (itérations complètes sur les données).
+#   L'early stopping arrêtera souvent avant (typiquement epoch 30-80).
 N_EPOCHS = 400
+# LR : learning rate de l'optimiseur Adam. 0.005 est relativement élevé
+#   (typique des GNN qui convergent vite) mais compensé par le gradient
+#   clipping et le weight decay.
 LR = 0.005
-EDGE_SAMPLE_RATIO = 0.1   # Fraction d'arêtes pour train/test split
-NEG_SAMPLE_RATIO = 1.0    # Ratio négatifs/positifs pour la reconstruction
-N_CLUSTERS = 8            # Nombre de clusters K-means sur les embeddings
+# EDGE_SAMPLE_RATIO : fraction d'arêtes réservées pour le test. 10% des
+#   arêtes sont masquées et le VGAE doit les prédire. Les 90% restantes
+#   servent à l'entraînement.
+EDGE_SAMPLE_RATIO = 0.1
+# NEG_SAMPLE_RATIO : pour chaque arête positive (vraie connexion), on
+#   échantillonne ce ratio d'arêtes négatives (paires non connectées).
+#   1.0 = autant de négatifs que de positifs → classes équilibrées.
+NEG_SAMPLE_RATIO = 1.0
+# N_CLUSTERS : nombre de clusters K-means sur les embeddings finaux.
+#   Sert à identifier des groupes fonctionnels de gènes dans l'espace latent.
+N_CLUSTERS = 8
 
 # ── Paramètres anti-KL-collapse ──────────────────────────────────────────────
 # Le posterior collapse est un problème classique des VGAE : le modèle apprend
@@ -121,11 +177,15 @@ KL_WARMUP_EPOCHS = 50     # Warmup court puis β stable — le cosinus n'a pas b
 FREE_BITS = 0.5           # Minimum KL par dimension latente (en nats)
 
 # ── Paramètres du baseline MLP ───────────────────────────────────────────────
-MLP_HIDDEN = 64
-MLP_EPOCHS = 200
-MLP_LR = 0.001
+# Le MLP est une baseline "sans graphe" : il utilise les mêmes features que
+# le VGAE mais ne fait PAS de message passing. Si le VGAE bat le MLP en AUC
+# de reconstruction, cela prouve que la topologie du graphe apporte de
+# l'information au-delà des features brutes.
+MLP_HIDDEN = 64    # Dimension cachée du MLP (plus petit que le VGAE)
+MLP_EPOCHS = 200   # Moins d'epochs car le MLP converge vite (pas de graphe)
+MLP_LR = 0.001     # Learning rate plus faible que le VGAE (MLP est plus stable)
 
-# ── Style ────────────────────────────────────────────────────────────────────
+# ── Style des figures ────────────────────────────────────────────────────────
 sns.set_style("whitegrid")
 plt.rcParams.update({"figure.dpi": 150, "savefig.dpi": 200, "font.size": 11})
 
@@ -134,6 +194,17 @@ plt.rcParams.update({"figure.dpi": 150, "savefig.dpi": 200, "font.size": 11})
 # UTILITAIRES
 # =============================================================================
 def download_if_absent(url, local_path, label=""):
+    """
+    Télécharge un fichier depuis `url` vers `local_path` s'il n'existe pas déjà.
+
+    Utilisé pour télécharger automatiquement les bases de données externes
+    (STRING PPI, MSigDB REACTOME/Hallmarks, GenAge, CellAge, AgeAnno) lors
+    de la première exécution. Le fichier est mis en cache localement pour
+    éviter de retélécharger à chaque run.
+
+    Le User-Agent est défini pour éviter les blocages par certains serveurs
+    (ex : Broad Institute) qui rejettent les requêtes sans User-Agent.
+    """
     if os.path.exists(local_path):
         print(f"    [cache] {label or os.path.basename(local_path)}")
         return
@@ -150,48 +221,93 @@ def download_if_absent(url, local_path, label=""):
 # =============================================================================
 # 1. CHARGEMENT DES DONNÉES scRNA-seq
 # =============================================================================
+# Les données proviennent de GSE102090 : des HUVEC (Human Umbilical Vein
+# Endothelial Cells) en scRNA-seq, deux passages :
+#   - P4 (passage 4) : cellules jeunes / prolifératives
+#   - P16 (passage 16) : cellules sénescentes (sénescence réplicative)
+# Le preprocessing a été fait dans Seurat (normalisation LogNormalize,
+# clustering des P16 en 4 sous-populations). On charge ici la metadata
+# (barcode, passage, cluster) et l'en-tête de la matrice normalisée
+# pour récupérer la liste de tous les gènes mesurés.
 print("=" * 70)
 print("1. Chargement des données scRNA-seq (P4 / P16)")
 print("=" * 70)
 
+# metadata : une ligne par cellule, colonnes = barcode, passage, cluster_P16, cell_state
 metadata = pd.read_csv(os.path.join(GNN_DATA_DIR, "merged_P4_P16_metadata.csv"))
 print(f"  Metadata : {len(metadata)} cellules")
 print(f"    P4  : {(metadata['passage'] == 'P4').sum()} cellules")
 print(f"    P16 : {(metadata['passage'] == 'P16').sum()} cellules")
 
+# Les P16 sont subdivisées en 4 clusters (identifiés par clustering Seurat).
+# Ces clusters représentent des sous-états de la sénescence : certains sont
+# plus SASP (sécrétoire), d'autres plus quiescents, etc.
 p16_meta = metadata[metadata["passage"] == "P16"].copy()
 p16_clusters = sorted(p16_meta["cluster_P16"].dropna().unique())
 print(f"    Clusters P16 : {p16_clusters}")
 
-# Liste de TOUS les gènes disponibles (pas de filtrage par DEG)
-# On prend tous les gènes de la matrice normalisée — le VGAE n'a pas besoin
-# de sélection par DEG puisqu'il n'utilise pas de labels.
+# POINT CLÉ : on prend TOUS les gènes de la matrice normalisée, sans
+# filtrer par DEG (Differentially Expressed Genes). C'est essentiel car :
+#   1. Le VGAE est non supervisé — il n'a pas besoin de labels DEG.
+#   2. Filtrer par DEG introduirait la circularité qu'on veut éviter
+#      (les DEG sont définis par log2FC/padj, qui étaient les features
+#       et les labels du pipeline supervisé précédent gnn.py).
+# On ne lit que l'en-tête (première ligne) pour économiser la mémoire —
+# la matrice complète sera chargée plus tard (section 4) avec usecols.
 with open(os.path.join(GNN_DATA_DIR, "merged_P4_P16_normalized.csv")) as f:
     header = f.readline().strip().split(",")
+# Les 4 premières colonnes sont barcode, passage, cluster_P16, cell_state.
+# Le reste = noms de gènes (potentiellement entre guillemets).
 all_available_genes = [g.strip('"') for g in header[4:]]
 
-# Mais on ne garde que les gènes qui ont au moins une interaction dans le graphe
-# (PPI, SCENIC, ou pathway). Les gènes isolés n'apportent rien au VGAE.
-# Cette filtration sera faite APRÈS le chargement des arêtes (section 3).
+# NOTE : cette liste sera filtrée en section 3 pour ne garder que les gènes
+# ayant au moins une connexion dans le graphe (PPI, SCENIC, pathway, etc.).
+# Un gène isolé (sans arête) ne reçoit aucun message pendant le GNN et
+# ne contribue pas à la reconstruction des arêtes → inutile pour le VGAE.
 print(f"  Gènes dans la matrice : {len(all_available_genes)}")
 
 # =============================================================================
 # 2. CHARGEMENT DES DONNÉES pySCENIC
 # =============================================================================
+# pySCENIC est un pipeline d'inférence de réseaux de régulation génique
+# (Gene Regulatory Networks, GRN) à partir de données scRNA-seq. Il produit :
+#   1. regulon_edges : liens TF → gène cible (avec un poids de régulation).
+#      Un "regulon" = un TF + l'ensemble de ses gènes cibles prédits.
+#   2. tf_activity (AUCell) : score d'activité de chaque TF dans chaque
+#      cluster. AUCell évalue si les cibles d'un TF sont enrichies parmi
+#      les gènes les plus exprimés d'une cellule.
+#   3. adjacencies (GRNBoost2) : réseau de co-expression brut inféré par
+#      GRNBoost2 (gradient boosting sur les paires de gènes). Les poids
+#      "importance" mesurent la force de la co-expression prédite.
+# Ces 3 sorties alimentent 3 types d'arêtes différents dans le graphe :
+#   - regulon_edges → arêtes "regulates" (section 6d)
+#   - tf_activity → feature d'arête sur "expresses" (section 6a)
+#   - adjacencies → arêtes "coexpression" (section 6e)
 print("\n" + "=" * 70)
 print("2. Chargement des données pySCENIC")
 print("=" * 70)
 
+# regulon_edges : colonnes = TF, target_gene, weight
+# Le TF contient un suffixe "(+)" (ex : "ATF3(+)") qu'on nettoie → TF_clean.
 regulon_edges = pd.read_csv(os.path.join(SCENIC_DIR, "regulon_edges_TF_to_gene.csv"))
 regulon_edges["TF_clean"] = regulon_edges["TF"].str.replace(r"\(\+\)$", "", regex=True)
 print(f"  Regulon edges : {len(regulon_edges)} interactions TF→cible")
 
+# tf_activity : matrice (clusters × TFs) — score AUCell moyen par cluster.
+# Sera utilisé comme feature d'arête sur les liens cell_group → gene : pour
+# une arête (cluster_k, gene_g), si gene_g est un TF, on ajoute son score
+# AUCell dans cluster_k comme feature. Cela injecte l'activité régulatrice
+# condition-spécifique dans le graphe.
 tf_activity = pd.read_csv(
     os.path.join(SCENIC_DIR, "mean_TF_activity_per_cluster.csv"), index_col=0
 )
 tf_activity.columns = [c.replace("(+)", "") for c in tf_activity.columns]
 print(f"  TF activity : {tf_activity.shape[0]} clusters × {tf_activity.shape[1]} TFs")
 
+# adjacencies (GRNBoost2) : réseau de co-expression brut.
+# Colonnes = TF, target, importance. On ne garde que le top 2% (COEXPR_TOP_QUANTILE)
+# pour avoir un réseau épars de haute confiance. Les poids faibles sont
+# vraisemblablement du bruit et ajouteraient des arêtes non informatives.
 adjacencies = pd.read_csv(os.path.join(SCENIC_DIR, "adjacencies.csv"))
 importance_thresh = adjacencies["importance"].quantile(COEXPR_TOP_QUANTILE)
 adjacencies_filtered = adjacencies[adjacencies["importance"] >= importance_thresh].copy()
@@ -201,24 +317,43 @@ print(f"  Adjacencies : {len(adjacencies)} → {len(adjacencies_filtered)} "
 # =============================================================================
 # 3. SÉLECTION DES GÈNES — BASÉE SUR LA CONNECTIVITÉ (pas les DEGs)
 # =============================================================================
-# JUSTIFICATION : dans le VGAE, un gène isolé (sans arête) ne reçoit aucune
-# information par message passing et ne contribue pas à la reconstruction.
-# On garde les gènes qui participent à au moins un type d'interaction.
+# JUSTIFICATION : dans un GNN, le message passing propage l'information le
+# long des arêtes du graphe. Un gène ISOLÉ (sans arête) :
+#   - Ne reçoit aucun message de ses voisins (pas d'agrégation)
+#   - Ne contribue à aucune arête à reconstruire (pas de signal de loss)
+#   - Son embedding sera uniquement basé sur ses features → pas d'utilité GNN
+# On ne garde donc que les gènes connectés dans au moins un réseau :
+# SCENIC (régulation), GRNBoost2 (co-expression), STRING (PPI), REACTOME
+# (pathway), ou HuMess (cocatalyse métabolique).
+# C'est un filtre TOPOLOGIQUE, pas statistique — aucun biais DEG.
 print("\n" + "=" * 70)
 print("3. Sélection des gènes par connectivité")
 print("=" * 70)
 
+# available_set : ensemble des gènes mesurés dans le scRNA-seq.
+# Sert de filtre pour ne garder que les gènes qu'on peut observer
+# (certains gènes des bases externes ne sont pas dans notre matrice).
 available_set = set(all_available_genes)
 
-# Gènes dans le réseau de régulation SCENIC
+# --- 3a. Gènes SCENIC (régulation transcriptionnelle) ---
+# Un gène est "SCENIC-connecté" s'il est soit un TF qui régule des cibles,
+# soit une cible régulée par un TF. On prend l'union des deux.
+# L'intersection avec available_set garantit que le gène est dans notre matrice.
 scenic_genes = set(regulon_edges["TF_clean"]) | set(regulon_edges["target_gene"])
 scenic_genes &= available_set
 
-# Gènes dans la co-expression GRNBoost2 (filtrée)
+# --- 3b. Gènes GRNBoost2 (co-expression filtrée au top 2%) ---
+# GRNBoost2 produit un réseau dirigé (TF → target) mais en pratique les liens
+# sont interprétés comme de la co-expression. On prend l'union des deux côtés.
 coexpr_genes = set(adjacencies_filtered["TF"].astype(str)) | set(adjacencies_filtered["target"].astype(str))
 coexpr_genes &= available_set
 
-# Gènes dans STRING PPI — chargement léger pour identifier les gènes connectés
+# --- 3c. Gènes STRING PPI (protein-protein interactions) ---
+# STRING v12 : base de données d'interactions protéine-protéine (expérimentales,
+# co-expression, text mining, etc.). Le "combined_score" (0-1000) agrège
+# plusieurs canaux de preuve. On télécharge 2 fichiers :
+#   - links : les interactions (protein1, protein2, combined_score)
+#   - aliases : mapping identifiant STRING → symbole HGNC (ex : ENSP00000... → TP53)
 PPI_FILE = os.path.join(PPI_DIR, "9606.protein.links.v12.0.txt.gz")
 PPI_ALIAS_FILE = os.path.join(PPI_DIR, "9606.protein.aliases.v12.0.txt.gz")
 download_if_absent(
@@ -230,44 +365,69 @@ download_if_absent(
     PPI_ALIAS_FILE, "STRING aliases"
 )
 
+# Construction du mapping symbole ↔ identifiant STRING.
+# On filtre par "Ensembl_HGNC" pour avoir des symboles de gènes standards
+# (ex : TP53, CDKN1A) et non des alias ambigus. Cela évite les collisions
+# où un alias pourrait correspondre à plusieurs protéines.
 aliases = pd.read_csv(PPI_ALIAS_FILE, sep="\t", compression="gzip")
 aliases_filt = aliases[
     (aliases["alias"].isin(available_set)) &
     (aliases["source"].str.contains("Ensembl_HGNC", na=False))
 ]
+# sym2string : "TP53" → "9606.ENSP00000269305"
 sym2string = dict(zip(aliases_filt["alias"], aliases_filt["#string_protein_id"]))
+# string2sym : inverse, pour reconvertir après filtrage
 string2sym = {v: k for k, v in sym2string.items()}
 string_ids = set(sym2string.values())
 
+# Chargement du réseau PPI complet puis filtrage :
+# 1. Les deux protéines doivent être dans notre ensemble de gènes
+# 2. Le combined_score doit dépasser PPI_SCORE_THRESH (900 = highest confidence)
 ppi_raw = pd.read_csv(PPI_FILE, sep=" ", compression="gzip")
 ppi_hc = ppi_raw[
     (ppi_raw["protein1"].isin(string_ids)) &
     (ppi_raw["protein2"].isin(string_ids)) &
     (ppi_raw["combined_score"] >= PPI_SCORE_THRESH)
 ]
+# Extraction des symboles de gènes impliqués dans au moins une PPI fiable
 ppi_genes = set()
 for _, row in ppi_hc.iterrows():
     s1, s2 = string2sym.get(row["protein1"]), string2sym.get(row["protein2"])
     if s1 and s2:
         ppi_genes.update([s1, s2])
 
-# REACTOME
+# --- 3d. Gènes REACTOME (pathways biologiques) ---
+# REACTOME via MSigDB : fichier GMT (Gene Matrix Transposed) où chaque ligne
+# est un pathway avec ses gènes membres. Format : NOM_PATHWAY <tab> URL <tab> GENE1 <tab> GENE2 ...
+# On filtre par taille : un pathway de 2-20 gènes est informatif. Au-delà de
+# REACTOME_MAX_PATHWAY gènes, le pathway est trop générique (ex : "Metabolism")
+# et connecterait des gènes sans rapport fonctionnel direct.
 MSIGDB_REACTOME = os.path.join(DB_DIR, "c2.cp.reactome.symbols.gmt")
 download_if_absent(
     "https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2024.1.Hs/c2.cp.reactome.v2024.1.Hs.symbols.gmt",
     MSIGDB_REACTOME, "MSigDB REACTOME"
 )
-reactome_pathways = {}
-reactome_genes = set()
+# Parse du fichier GMT REACTOME : on ne garde que les pathways de taille
+# raisonnable (2 à REACTOME_MAX_PATHWAY gènes) après intersection avec
+# les gènes disponibles dans notre matrice scRNA-seq.
+reactome_pathways = {}   # nom_pathway → set(gènes)
+reactome_genes = set()   # union de tous les gènes dans au moins un pathway
 with open(MSIGDB_REACTOME) as f:
     for line in f:
         parts = line.strip().split("\t")
+        # parts[0] = nom du pathway, parts[1] = URL, parts[2:] = gènes
         genes_in_pw = set(parts[2:]) & available_set
         if 2 <= len(genes_in_pw) <= REACTOME_MAX_PATHWAY:
             reactome_pathways[parts[0]] = genes_in_pw
             reactome_genes |= genes_in_pw
 
-# Union de tous les gènes connectés
+# --- 3e. UNION FINALE : tous les gènes connectés par au moins un réseau ---
+# connected_genes = SCENIC ∪ GRNBoost2 ∪ PPI ∪ REACTOME
+# (HuMess sera ajouté plus tard en section 6f, mais ses gènes sont typiquement
+# déjà dans l'un des réseaux ci-dessus.)
+# gene_symbols : array trié de tous les gènes retenus (l'index dans cet
+#   array = l'identifiant du noeud dans le graphe PyG).
+# gene_to_idx : dictionnaire inverse, symbole → index dans le graphe.
 connected_genes = scenic_genes | coexpr_genes | ppi_genes | reactome_genes
 gene_symbols = np.array(sorted(connected_genes & available_set))
 gene_to_idx = {g: i for i, g in enumerate(gene_symbols)}
@@ -282,47 +442,75 @@ print(f"    REACTOME     : {len(reactome_genes & set(gene_symbols))}")
 # =============================================================================
 # 4. CALCUL DE L'EXPRESSION PAR GROUPE — FEATURES D'ARÊTES
 # =============================================================================
-# L'expression est placée sur les ARÊTES (cell_group → gene), pas sur les
-# noeuds gene. C'est ce qui supprime la circularité : les noeuds gene n'ont
-# que des features topologiques.
+# ARCHITECTURE CLÉ : l'expression génique est placée sur les ARÊTES
+# (cell_group → gene) et NON sur les noeuds "gene". C'est le point central
+# de la suppression de la circularité :
+#   - Pipeline supervisé (gnn.py) : features de noeud = log2FC, padj → labels = DEG
+#     → circularité car les features CONTIENNENT l'information des labels.
+#   - Pipeline VGAE (ici) : features de noeud = topologiques (is_tf, variance, degree)
+#     → l'expression est sur les arêtes, le score d'importance ÉMERGE de
+#     l'espace latent sans jamais voir le log2FC/padj.
+#
+# On calcule 6 statistiques d'expression pour chaque combinaison (groupe, gène) :
+#   1. mean_expression : expression moyenne (LogNormalize) dans le groupe
+#   2. pct_expressing : fraction de cellules du groupe qui expriment le gène (> 0)
+#   3. std_expression : écart-type intra-groupe (mesure la variabilité cellulaire)
+#   4. cv_expression : coefficient de variation = std/mean (variabilité relative)
+#   5. q25, q75 : quartiles d'expression (caractérisent la distribution)
+# + 1 feature supplémentaire (tf_activity) ajoutée en section 6a.
 print("\n" + "=" * 70)
 print("4. Expression par groupe cellulaire (features d'arêtes)")
 print("=" * 70)
 
+# Les 5 groupes cellulaires du graphe :
+# P4 = cellules jeunes (1 seul groupe car pas de sous-clusters)
+# P16_cluster_0..3 = 4 sous-populations sénescentes (identifiées par Seurat)
 CELL_GROUPS = ["P4", "P16_cluster_0", "P16_cluster_1",
                "P16_cluster_2", "P16_cluster_3"]
 
+# On charge la matrice normalisée (LogNormalize de Seurat) mais UNIQUEMENT
+# pour les gènes retenus en section 3 (gene_symbols). usecols évite de charger
+# les ~20000 gènes en mémoire quand on n'en utilise que ~5000.
 print("  Chargement de la matrice normalisée...")
 cols_to_read = ["barcode", "passage", "cluster_P16", "cell_state"] + gene_symbols.tolist()
 normalized = pd.read_csv(
     os.path.join(GNN_DATA_DIR, "merged_P4_P16_normalized.csv"),
     usecols=cols_to_read,
-).copy()  # .copy() défragmente le DataFrame après read_csv avec usecols
+).copy()  # .copy() défragmente le DataFrame (pandas alloue des blocs contigus)
 
 def assign_group(row):
+    """Assigne chaque cellule à son groupe (P4 ou P16_cluster_X)."""
     if row["passage"] == "P4":
         return "P4"
     c = row["cluster_P16"]
     if pd.notna(c):
         return f"P16_cluster_{int(c)}"
-    return None
+    return None  # Cellules sans cluster assigné → seront supprimées
 
 normalized["group"] = normalized.apply(assign_group, axis=1)
-normalized = normalized.dropna(subset=["group"])
+normalized = normalized.dropna(subset=["group"])  # Supprime les cellules sans groupe
 print(f"  Matrice : {normalized.shape}")
 
-# Statistiques par groupe : mean, pct, std, cv, q25, q75
+# Calcul des statistiques par groupe cellulaire.
+# Pour chaque groupe, on calcule les 6 stats sur les colonnes de gènes.
+# Ces stats deviendront les features d'arêtes "expresses" en section 6a.
 print("  Calcul des statistiques (mean, pct, std, cv, q25, q75)...")
 group_stats = {}
 for grp in CELL_GROUPS:
     mask = normalized["group"] == grp
-    sub = normalized.loc[mask, gene_symbols]
+    sub = normalized.loc[mask, gene_symbols]  # Sous-matrice (cellules du groupe × gènes)
     n_cells = mask.sum()
 
+    # mean_expression : expression moyenne normalisée du gène dans ce groupe
     mean_expr = sub.mean(axis=0).values.astype(np.float32)
+    # pct_expressing : fraction de cellules exprimant ce gène (dropout rate = 1 - pct)
     pct_expr = (sub > 0).mean(axis=0).values.astype(np.float32)
+    # std_expression : variabilité intra-groupe (forte = gène hétérogène)
     std_expr = sub.std(axis=0).values.astype(np.float32)
+    # cv_expression : coefficient de variation (normalise la std par la mean)
+    # Un CV élevé = bimodal ou très variable. +1e-8 évite la division par zéro.
     cv_expr = std_expr / (mean_expr + 1e-8)
+    # q25, q75 : quartiles de la distribution d'expression
     q25 = sub.quantile(0.25, axis=0).values.astype(np.float32)
     q75 = sub.quantile(0.75, axis=0).values.astype(np.float32)
 
@@ -333,33 +521,59 @@ for grp in CELL_GROUPS:
     }
     print(f"    {grp:20s} : {n_cells} cellules, mean={mean_expr.mean():.3f}")
 
+# Libération de la matrice normalisée (plusieurs Go) — les stats sont calculées.
 del normalized
 
 # =============================================================================
 # 5. FEATURES DES NOEUDS (topologiques uniquement — PAS de log2FC/padj)
 # =============================================================================
-# JUSTIFICATION : les features de noeuds ne doivent PAS contenir l'information
-# qui servait de labels (log2FC, padj, delta_pct). On ne garde que :
-#   - is_tf : le gène est-il un TF (propriété intrinsèque)
-#   - variance_across_groups : variabilité de l'expression entre groupes
-#     (pas le log2FC qui est un test stat, mais la variance brute)
-# Le degré PPI et le degré de régulation seront ajoutés après section 6.
+# POINT ANTI-CIRCULARITÉ : les features de noeuds "gene" ne doivent JAMAIS
+# contenir les statistiques différentielles (log2FC, padj, delta_pct) car :
+#   - Le pipeline supervisé précédent (gnn.py) utilisait ces features ET ces
+#     mêmes stats comme labels DEG → circularité.
+#   - Ici, on utilise uniquement des propriétés TOPOLOGIQUES / INTRINSÈQUES :
+#     1. is_tf : le gène est-il un facteur de transcription ? (booléen, propriété
+#        intrinsèque du gène qui ne dépend pas du contexte expérimental)
+#     2. variance_across_groups : variabilité de l'expression ENTRE les 5 groupes
+#        cellulaires. C'est une mesure brute de variabilité (pas un test statistique
+#        comme le log2FC). Un gène avec haute variance = expression différente
+#        entre P4 et les clusters P16 → potentiellement intéressant.
+#     3. ppi_degree : nombre de voisins PPI (ajouté après section 6)
+#     4. reg_degree : nombre de liens de régulation (ajouté après section 6)
+#   + En V3 (avec HuMess) : 4 features métaboliques supplémentaires (section 6f)
+# Note : les features de degré (3-4) sont ajoutées APRÈS la construction des
+# arêtes en section 6, car on a besoin des arêtes pour les compter.
 print("\n" + "=" * 70)
 print("5. Features des noeuds (topologiques)")
 print("=" * 70)
 
+# Feature 1 : is_tf — binaire, 1.0 si le gène est un TF détecté par pySCENIC.
+# Les TFs sont identifiés par leur présence comme régulateur dans les regulons.
 scenic_tfs = set(regulon_edges["TF_clean"].unique())
 is_tf = np.array([1.0 if g in scenic_tfs else 0.0 for g in gene_symbols],
                  dtype=np.float32)
 print(f"  is_tf : {int(is_tf.sum())} TFs")
 
+# Feature 2 : variance_across_groups — variance de l'expression moyenne entre
+# les 5 groupes cellulaires. Calculée sur les mean_expression déjà calculées
+# en section 4. Normalisée par le max pour être dans [0, 1].
+# Intuition : un gène dont l'expression est stable entre P4 et P16 aura une
+# faible variance ; un gène fortement dérégulé aura une forte variance.
 mean_expr_per_group = np.array([
     group_stats[grp]["mean_expression"] for grp in CELL_GROUPS
-])
-variance_across = mean_expr_per_group.var(axis=0).astype(np.float32)
+])  # Shape : (5, n_genes) — 5 groupes × n_genes
+variance_across = mean_expr_per_group.var(axis=0).astype(np.float32)  # Variance sur l'axe des groupes
 variance_norm = variance_across / (variance_across.max() + 1e-8)
 
 # ── Cell group features ─────────────────────────────────────────────────────
+# Les noeuds "cell_group" ont aussi des features (3 dimensions) :
+#   1. is_senescent : 0 pour P4, 1 pour tous les P16 → encode la condition
+#   2. n_cells_norm : fraction du nombre total de cellules dans ce groupe
+#      → encode la taille relative du groupe
+#   3. cluster_idx : index normalisé du cluster (0 pour P4, 0.25/0.5/0.75/1.0
+#      pour les clusters P16) → encode l'identité du sous-cluster
+# Ces features permettent au modèle de distinguer les groupes cellulaires
+# et de moduler les messages "expresses" en conséquence.
 cell_group_features_list = []
 for grp in CELL_GROUPS:
     is_senescent = 0.0 if grp == "P4" else 1.0
@@ -368,44 +582,69 @@ for grp in CELL_GROUPS:
         cluster_idx = 0.0
     else:
         c = int(grp.split("_")[-1])
-        cluster_idx = (c + 1) / 4.0
+        cluster_idx = (c + 1) / 4.0  # 0.25, 0.5, 0.75, 1.0
     cell_group_features_list.append([is_senescent, n_cells_norm, cluster_idx])
 cell_group_features = torch.tensor(cell_group_features_list, dtype=torch.float)
 
 # =============================================================================
 # 6. CONSTRUCTION DES ARÊTES
 # =============================================================================
+# Le graphe hétérogène contient 7 types d'arêtes (+ les reverses) :
+#   a. expresses     : cell_group → gene (expression, 7 features)
+#   b. ppi           : gene ↔ gene (STRING, 1 feature = score normalisé)
+#   c. same_pathway  : gene ↔ gene (REACTOME, pas de features)
+#   d. regulates     : TF → cible (pySCENIC, 1 feature = poids de régulation)
+#   e. coexpression  : gene ↔ gene (GRNBoost2 top 2%, 1 feature = importance)
+#   f. cocatalysis   : gene ↔ gene (HuMess, 2 features = [in_P4, in_P16])
+# Toutes les arêtes gene↔gene sont rendues BIDIRECTIONNELLES (i→j ET j→i)
+# car le message passing dans un GNN est directionnel : un noeud agrège les
+# messages de ses voisins entrants. Sans bidirectionnel, un gène ne verrait
+# que ses voisins dans un sens (ex : un TF verrait ses cibles mais pas l'inverse).
 print("\n" + "=" * 70)
 print("6. Construction des arêtes")
 print("=" * 70)
 
 # ── 6a. cell_group → gene (expression) ──────────────────────────────────────
+# Arêtes bipartites reliant chaque groupe cellulaire à chaque gène.
+# 7 features par arête = les stats d'expression calculées en section 4 +
+# le score d'activité TF (AUCell) pour ce gène dans ce cluster.
+# C'est un graphe COMPLET (chaque groupe est connecté à chaque gène),
+# donc n_arêtes = 5 groupes × n_genes.
 expr_src, expr_dst, expr_attrs = [], [], []
 for grp_idx, grp in enumerate(CELL_GROUPS):
     stats = group_stats[grp]
+    # cluster_id sert à récupérer le score AUCell : None pour P4 (pas de
+    # clustering), 0-3 pour les clusters P16.
     cluster_id = None if grp == "P4" else int(grp.split("_")[-1])
 
     for gene_idx in range(n_genes):
         gene_name = gene_symbols[gene_idx]
+        # tf_activity : score AUCell du TF dans ce cluster. Vaut 0 si le
+        # gène n'est pas un TF ou si on est dans P4 (pas de clusters).
         tf_act = 0.0
         if cluster_id is not None and gene_name in tf_activity.columns:
             if cluster_id in tf_activity.index:
                 tf_act = float(tf_activity.loc[cluster_id, gene_name])
 
-        expr_src.append(grp_idx)
-        expr_dst.append(gene_idx)
+        expr_src.append(grp_idx)     # Index du noeud cell_group source
+        expr_dst.append(gene_idx)    # Index du noeud gene destination
         expr_attrs.append([
-            float(stats["mean_expression"][gene_idx]),
-            float(stats["pct_expressing"][gene_idx]),
-            tf_act,
-            float(stats["std_expression"][gene_idx]),
-            float(stats["cv_expression"][gene_idx]),
-            float(stats["q25"][gene_idx]),
-            float(stats["q75"][gene_idx]),
+            float(stats["mean_expression"][gene_idx]),   # Feature 1 : expression moyenne
+            float(stats["pct_expressing"][gene_idx]),     # Feature 2 : % de cellules exprimant
+            tf_act,                                       # Feature 3 : activité TF (AUCell)
+            float(stats["std_expression"][gene_idx]),     # Feature 4 : écart-type
+            float(stats["cv_expression"][gene_idx]),      # Feature 5 : coefficient de variation
+            float(stats["q25"][gene_idx]),                # Feature 6 : 1er quartile
+            float(stats["q75"][gene_idx]),                # Feature 7 : 3ème quartile
         ])
 
+# Conversion en tenseurs PyG (format COO : [2, n_edges])
 edge_index_expresses = torch.tensor([expr_src, expr_dst], dtype=torch.long)
 edge_attr_expresses = torch.tensor(expr_attrs, dtype=torch.float)
+# Z-score normalisation colonne par colonne pour que chaque feature ait
+# mean=0 et std=1. Important pour GATConv qui calcule des scores d'attention
+# sur les features d'arête — sans normalisation, les features à grande
+# échelle domineraient le calcul d'attention.
 for col in range(edge_attr_expresses.shape[1]):
     col_data = edge_attr_expresses[:, col]
     mu, std = col_data.mean(), col_data.std() + 1e-8
@@ -414,24 +653,40 @@ print(f"  expresses : {edge_index_expresses.shape[1]} arêtes, "
       f"7 features [mean, pct, tf_act, std, cv, q25, q75]")
 
 # ── 6b. PPI STRING ──────────────────────────────────────────────────────────
+# Arêtes protéine-protéine de STRING (>= 900, highest confidence).
+# Chaque interaction est BIDIRECTIONNELLE (i→j ET j→i).
+# Feature = combined_score / 1000 (normalisé dans [0, 1]).
+# Rôle biologique : encode les interactions physiques entre protéines.
+# Les hubs PPI (gènes avec beaucoup de partenaires) reçoivent plus de
+# messages et tendent à avoir des embeddings plus informatifs.
 ppi_src, ppi_dst, ppi_w = [], [], []
 for _, row in ppi_hc.iterrows():
     s1, s2 = string2sym.get(row["protein1"]), string2sym.get(row["protein2"])
     if s1 and s2 and s1 in gene_to_idx and s2 in gene_to_idx:
         i, j = gene_to_idx[s1], gene_to_idx[s2]
+        # Bidirectionnel : on ajoute les deux directions
         ppi_src.extend([i, j])
         ppi_dst.extend([j, i])
-        ppi_w.extend([row["combined_score"] / 1000.0] * 2)
+        ppi_w.extend([row["combined_score"] / 1000.0] * 2)  # Même poids dans les deux sens
 
 edge_index_ppi = torch.tensor([ppi_src, ppi_dst], dtype=torch.long)
-edge_attr_ppi = torch.tensor(ppi_w, dtype=torch.float).unsqueeze(1)
+edge_attr_ppi = torch.tensor(ppi_w, dtype=torch.float).unsqueeze(1)  # (n_edges, 1)
 print(f"  ppi : {len(ppi_src)//2} interactions ({len(ppi_src)} arêtes)")
 
-# ── 6c. REACTOME ────────────────────────────────────────────────────────────
+# ── 6c. REACTOME (same_pathway) ─────────────────────────────────────────────
+# Pour chaque pathway REACTOME (2 à 20 gènes), on crée une arête entre
+# TOUTES les paires de gènes du pathway (graphe complet intra-pathway).
+# Pas de features d'arête — la simple existence de l'arête encode le fait
+# que les deux gènes partagent un pathway biologique.
+# react_pairs déduplique : si deux gènes partagent plusieurs pathways,
+# on ne crée qu'une seule arête (bidirectionnelle).
+# Rôle biologique : les gènes d'un même pathway coopèrent fonctionnellement.
+# Le message passing propagera l'information au sein des modules fonctionnels.
 react_src, react_dst = [], []
-react_pairs = set()
+react_pairs = set()  # Déduplique les paires (un gène peut être dans plusieurs pathways)
 for pw_genes in reactome_pathways.values():
     gene_list = sorted(pw_genes)
+    # Double boucle : toutes les paires (i, j) avec i < j (évite les doublons a↔b / b↔a)
     for i_idx in range(len(gene_list)):
         for j_idx in range(i_idx + 1, len(gene_list)):
             g1, g2 = gene_list[i_idx], gene_list[j_idx]
@@ -440,33 +695,53 @@ for pw_genes in reactome_pathways.values():
                         max(gene_to_idx[g1], gene_to_idx[g2]))
                 if pair not in react_pairs:
                     react_pairs.add(pair)
+                    # Bidirectionnel
                     react_src.extend([pair[0], pair[1]])
                     react_dst.extend([pair[1], pair[0]])
 
 edge_index_pathway = torch.tensor([react_src, react_dst], dtype=torch.long)
 print(f"  pathway : {len(react_pairs)} paires ({len(react_src)} arêtes)")
 
-# ── 6d. Regulon (pySCENIC) ──────────────────────────────────────────────────
+# ── 6d. Regulon (pySCENIC) — arêtes "regulates" ────────────────────────────
+# Liens DIRIGÉS TF → gène cible (pas bidirectionnel à ce stade).
+# Feature = poids de régulation (confiance du lien dans le regulon).
+# Ces arêtes encodent la structure régulatrice : un TF qui active ou
+# réprime ses cibles. Le sens est important biologiquement.
+# MAIS on crée aussi l'arête inverse "regulated_by" (cible → TF) plus bas,
+# pour que les TFs reçoivent aussi de l'information de leurs cibles
+# pendant le message passing. Biologiquement, ça n'a pas de sens causal,
+# mais pour le GNN c'est nécessaire : sans ça, les cibles ne propagent
+# pas d'information vers les TFs qui les régulent.
 reg_src, reg_dst, reg_w = [], [], []
-reg_pairs = set()
+reg_pairs = set()  # Déduplique si un TF régule la même cible dans plusieurs regulons
 for _, row in regulon_edges.iterrows():
     tf, target = row["TF_clean"], row["target_gene"]
     if tf in gene_to_idx and target in gene_to_idx:
         pair = (gene_to_idx[tf], gene_to_idx[target])
         if pair not in reg_pairs:
             reg_pairs.add(pair)
-            reg_src.append(pair[0])
-            reg_dst.append(pair[1])
-            reg_w.append(float(row["weight"]))
+            reg_src.append(pair[0])      # TF (source)
+            reg_dst.append(pair[1])      # Cible (destination)
+            reg_w.append(float(row["weight"]))  # Poids de régulation
 
 edge_index_regulates = torch.tensor([reg_src, reg_dst], dtype=torch.long)
 edge_attr_regulates = torch.tensor(reg_w, dtype=torch.float).unsqueeze(1)
+# Normalisation min-max par le poids max (les poids SCENIC ne sont pas bornés)
 if edge_attr_regulates.numel() > 0:
     edge_attr_regulates = edge_attr_regulates / (edge_attr_regulates.max() + 1e-8)
+# Arête inverse "regulated_by" : cible → TF (même poids, sens inversé).
+# Permet aux TFs de recevoir de l'information de leurs cibles pendant
+# le message passing.
 edge_index_regulated_by = torch.tensor([reg_dst, reg_src], dtype=torch.long)
 print(f"  regulates : {len(reg_pairs)} liens TF→cible")
 
-# ── 6e. Co-expression (GRNBoost2) ───────────────────────────────────────────
+# ── 6e. Co-expression (GRNBoost2) ──────────────────────────────────────────
+# Arêtes de co-expression inférées par GRNBoost2 (top 2% des poids).
+# GRNBoost2 utilise le gradient boosting pour prédire l'expression d'un
+# gène à partir de tous les autres. Les "TF" et "target" dans GRNBoost2
+# ne sont pas nécessairement des TF biologiques — c'est juste la nomenclature
+# du modèle (prédicteur → prédit). On traite ces arêtes comme non dirigées.
+# Feature = importance GRNBoost2 normalisée par le max.
 coexpr_src, coexpr_dst, coexpr_w = [], [], []
 coexpr_pairs = set()
 for _, row in adjacencies_filtered.iterrows():
@@ -481,37 +756,64 @@ for _, row in adjacencies_filtered.iterrows():
             imp = float(row["importance"])
             coexpr_w.extend([imp, imp])
 
+# Conversion en tenseurs PyG. Si aucune co-expression n'a été trouvée,
+# on crée un tenseur vide (0 arêtes) pour éviter les erreurs en aval.
 edge_index_coexpr = torch.tensor(
     [coexpr_src, coexpr_dst] if coexpr_src else [[], []], dtype=torch.long
 )
 coexpr_w_tensor = (torch.tensor(coexpr_w, dtype=torch.float).unsqueeze(1)
                    if coexpr_w else torch.zeros((0, 1)))
+# Normalisation min-max par le max
 if coexpr_w_tensor.numel() > 0:
     coexpr_w_tensor = coexpr_w_tensor / (coexpr_w_tensor.max() + 1e-8)
 print(f"  coexpression : {len(coexpr_pairs)} paires ({len(coexpr_src)} arêtes)")
 
 # ── 6f. HuMess : cocatalysis (A) + importance métabolique (B) ───────────────
-# A : arête entre gènes catalysant la même réaction (GPR rules), union P4 ∪ P16.
-#     edge_attr binaire [in_P4, in_P16] → permet au modèle d'apprendre la
-#     condition-spécificité du lien métabolique.
-# B : importance métabolique par gène (max sur les réactions catalysées),
-#     log1p + z-score, par condition + delta. Feature mask `has_humess` pour
-#     éviter que le modèle interprète les 0 imputés comme un signal.
+# HuMess (Métabolisme Humain par Échantillonnage de Solutions) est un pipeline
+# de modélisation métabolique qui produit deux informations complémentaires :
+#
+# PARTIE A — Arêtes "metabolic_cocatalysis" :
+#   Deux gènes sont reliés s'ils catalysent la même réaction métabolique
+#   (déduit des GPR rules = Gene-Protein-Reaction rules de CarveMe).
+#   Les GPR rules associent chaque réaction du modèle métabolique à une
+#   combinaison booléenne de gènes (ex : "(ALDOB or ALDOC) and GAPDH").
+#   Feature d'arête = [in_P4, in_P16] (binaire) : le lien peut exister
+#   dans P4 seul, P16 seul, ou les deux → le modèle apprend la
+#   CONDITION-SPÉCIFICITÉ du lien métabolique.
+#
+# PARTIE B — Features de noeud "gene" (ajoutées au vecteur de features) :
+#   Importance métabolique par gène = max(importance) sur les réactions
+#   catalysées par ce gène, calculée par Corner Sampling.
+#   On ajoute 4 features : imp_P4_z, imp_P16_z, imp_delta, has_humess.
+#   has_humess est un masque binaire (1 si le gène a des données HuMess)
+#   pour éviter que les 0 imputés pour les gènes absents du modèle
+#   métabolique soient interprétés comme "importance nulle" (ce serait
+#   un faux signal — l'absence de données ≠ absence d'importance).
 print("\n  HuMess (cocatalysis + importance)...")
 
+# Regex pour extraire les symboles de gène d'une règle GPR.
+# Exemple : "(ALDOB or ALDOC) and GAPDH" → {"ALDOB", "ALDOC", "GAPDH"}
 _gene_token_re = re.compile(r"[A-Za-z0-9_\-\.]+")
-_gpr_skip = {"and", "or", "AND", "OR", "And", "Or"}
+_gpr_skip = {"and", "or", "AND", "OR", "And", "Or"}  # Mots-clés booléens à ignorer
 
 
 def _parse_gpr(gpr_str):
-    """Extrait les symboles de gène d'une règle GPR (sépare and/or/parenthèses)."""
+    """
+    Extrait les symboles de gène d'une règle GPR (Gene-Protein-Reaction).
+    Supprime les parenthèses, puis filtre les mots-clés booléens (and/or).
+    Retourne un set de symboles de gènes.
+    """
     cleaned = gpr_str.replace("(", " ").replace(")", " ")
     return {t for t in _gene_token_re.findall(cleaned) if t not in _gpr_skip}
 
 
-# --- A : parse gr-rules par condition ---
-reaction_to_genes = {}   # cond -> {reaction: set(genes)}
-gene_to_reactions = {c: {} for c in HUMESS_CONDITIONS}  # cond -> {gene: set(reactions)}
+# --- PARTIE A : parse des GPR rules par condition ---
+# Pour chaque condition (P4, P16), on charge les GPR rules du modèle
+# métabolique CarveMe et on identifie quels gènes catalysent quelles réactions.
+# Format du fichier : réaction_id <TAB> GPR_rule
+# Exemple : "R_PFK → (PFKL or PFKM or PFKP)"
+reaction_to_genes = {}   # condition → {réaction : set(gènes)}
+gene_to_reactions = {c: {} for c in HUMESS_CONDITIONS}  # condition → {gène : set(réactions)}
 
 for cond in HUMESS_CONDITIONS:
     path = os.path.join(HUMESS_DIR, "models", cond, "stats", "carveme.gr-rules.tsv")
@@ -526,30 +828,40 @@ for cond in HUMESS_CONDITIONS:
             if len(parts) < 2:
                 continue
             rxn, gpr = parts[0], parts[1]
-            genes = _parse_gpr(gpr)
+            genes = _parse_gpr(gpr)  # Extrait les gènes de la règle GPR
             cond_map[rxn] = genes
+            # Index inverse : pour chaque gène, stocker les réactions qu'il catalyse
             for g in genes:
                 gene_to_reactions[cond].setdefault(g, set()).add(rxn)
     reaction_to_genes[cond] = cond_map
     print(f"    {cond} : {len(cond_map)} réactions, "
           f"{len(gene_to_reactions[cond])} gènes")
 
-# Construction des paires de cocatalysis (indices graphe)
-cocat_pair_flags = {}  # (i,j) -> [in_P4, in_P16]
+# Construction des paires de cocatalyse (indices graphe).
+# Deux gènes sont co-catalytiques s'ils apparaissent dans la même GPR rule
+# (= catalysent la même réaction). Le flag [in_P4, in_P16] indique dans
+# quelle(s) condition(s) ce lien existe. Exemple :
+#   [1, 1] = la réaction existe dans les deux conditions
+#   [1, 0] = la réaction n'existe que dans P4 (perdue en sénescence)
+#   [0, 1] = la réaction apparaît en P16 (gain métabolique en sénescence)
+cocat_pair_flags = {}  # (index_gene_i, index_gene_j) → [in_P4, in_P16]
 for cond_idx, cond in enumerate(HUMESS_CONDITIONS):
     for rxn, genes in reaction_to_genes[cond].items():
+        # Convertir les symboles en indices du graphe (ignorer les gènes absents)
         idx_list = sorted({gene_to_idx[g] for g in genes if g in gene_to_idx})
+        # Toutes les paires (graphe complet intra-réaction)
         for a in range(len(idx_list)):
             for b in range(a + 1, len(idx_list)):
                 pair = (idx_list[a], idx_list[b])
                 flags = cocat_pair_flags.setdefault(pair, [0.0, 0.0])
-                flags[cond_idx] = 1.0
+                flags[cond_idx] = 1.0  # Marquer la condition dans le flag
 
+# Conversion en arêtes bidirectionnelles avec features [in_P4, in_P16]
 cocat_src, cocat_dst, cocat_attr = [], [], []
 for (i, j), flags in cocat_pair_flags.items():
-    cocat_src.extend([i, j])
+    cocat_src.extend([i, j])       # Bidirectionnel
     cocat_dst.extend([j, i])
-    cocat_attr.append(flags)
+    cocat_attr.append(flags)       # Même flags dans les deux sens
     cocat_attr.append(flags)
 
 edge_index_cocat = torch.tensor(
@@ -560,7 +872,11 @@ edge_attr_cocat = (torch.tensor(cocat_attr, dtype=torch.float)
 print(f"    cocatalysis : {len(cocat_pair_flags)} paires "
       f"({edge_index_cocat.shape[1]} arêtes, attr=[in_P4, in_P16])")
 
-# --- B : importance métabolique par gène ---
+# --- PARTIE B : importance métabolique par gène ---
+# Corner Sampling (CS) estime l'importance de chaque gène dans le modèle
+# métabolique en mesurant l'impact de sa suppression sur l'espace des flux.
+# Un gène peut catalyser plusieurs réactions → on prend le MAX d'importance
+# (le gène est "aussi important que sa réaction la plus importante").
 gene_importance = {c: np.zeros(n_genes, dtype=np.float32) for c in HUMESS_CONDITIONS}
 gene_in_model = {c: np.zeros(n_genes, dtype=np.float32) for c in HUMESS_CONDITIONS}
 
@@ -571,17 +887,24 @@ for cond in HUMESS_CONDITIONS:
         print(f"    [warn] introuvable : {path}")
         continue
     df_imp = pd.read_csv(path, sep="\t")
-    # format attendu : symbol, bigg, importance (une ligne par (gène, réaction))
+    # Format : symbol, bigg (réaction), importance (une ligne par (gène, réaction))
     df_imp = df_imp.dropna(subset=["symbol", "importance"])
-    # max importance par symbole (agrégation sur réactions catalysées)
+    # Max importance par symbole : agrège les réactions → 1 valeur par gène
     agg = df_imp.groupby("symbol")["importance"].max()
     for sym, val in agg.items():
         if sym in gene_to_idx:
             gene_importance[cond][gene_to_idx[sym]] = float(val)
-            gene_in_model[cond][gene_to_idx[sym]] = 1.0
+            gene_in_model[cond][gene_to_idx[sym]] = 1.0  # Marquer comme "a des données HuMess"
 
-# log1p + z-score par condition (sur gènes présents uniquement, extrapolé à 0 ailleurs)
+# Transformation log1p + z-score par condition.
+# log1p : compresse les valeurs extrêmes (l'importance brute peut varier
+#   sur plusieurs ordres de grandeur).
+# z-score : centre et réduit, calculé UNIQUEMENT sur les gènes présents
+#   dans le modèle métabolique (mask). Les gènes absents restent à 0.
+# Cela évite que les gènes sans données HuMess (la majorité) polluent
+# la moyenne et l'écart-type du z-score.
 def _log1p_zscore(arr, mask):
+    """log1p + z-score sur les éléments masqués ; les autres restent à 0."""
     out = np.zeros_like(arr)
     if mask.sum() < 2:
         return out
@@ -590,9 +913,15 @@ def _log1p_zscore(arr, mask):
     out[mask.astype(bool)] = (vals - mu) / sd
     return out
 
+# imp_P4_z, imp_P16_z : importance métabolique z-scorée par condition
 imp_P4_z = _log1p_zscore(gene_importance["P4"], gene_in_model["P4"])
 imp_P16_z = _log1p_zscore(gene_importance["P16"], gene_in_model["P16"])
-imp_delta = imp_P16_z - imp_P4_z  # positif = plus important en P16
+# imp_delta : différence P16 - P4, positif = gène plus important métaboliquement
+# en sénescence. C'est un signal de REMODELAGE MÉTABOLIQUE.
+imp_delta = imp_P16_z - imp_P4_z
+# has_humess : masque binaire (1 si le gène apparaît dans le modèle métabolique
+# de P4 OU P16). Permet au GNN de distinguer "importance = 0 car absent du
+# modèle" vs "importance = 0 car gène peu important mais présent".
 has_humess = ((gene_in_model["P4"] + gene_in_model["P16"]) > 0).astype(np.float32)
 
 print(f"    importance  : P4={int(gene_in_model['P4'].sum())} gènes, "
@@ -600,16 +929,34 @@ print(f"    importance  : P4={int(gene_in_model['P4'].sum())} gènes, "
       f"has_humess={int(has_humess.sum())}/{n_genes}")
 
 # ── Finaliser les features de noeuds gene avec les degrés ────────────────────
+# Les features de degré (nombre de voisins) sont calculées APRÈS la
+# construction des arêtes. Elles capturent la "centralité" de chaque gène
+# dans les différents réseaux. Un gène hub PPI avec beaucoup d'interactions
+# protéine-protéine aura un ppi_degree élevé.
+# Feature 3 : ppi_degree — nombre de voisins PPI (normalisé par le max)
 ppi_degree = np.zeros(n_genes, dtype=np.float32)
 for idx in ppi_src:
     ppi_degree[idx] += 1
 ppi_degree_norm = ppi_degree / (ppi_degree.max() + 1e-8)
 
+# Feature 4 : reg_degree — nombre de liens de régulation (TF→cible + cible→TF)
+# On compte les deux directions : un TF qui régule 100 cibles aura un haut
+# degré, mais une cible régulée par 5 TFs aussi.
 reg_degree = np.zeros(n_genes, dtype=np.float32)
 for idx in reg_src + reg_dst:
     reg_degree[idx] += 1
 reg_degree_norm = reg_degree / (reg_degree.max() + 1e-8)
 
+# ASSEMBLAGE FINAL DES FEATURES DE NOEUDS "gene" — 8 dimensions :
+# [0] is_tf            : facteur de transcription (binaire)
+# [1] variance_norm    : variabilité d'expression inter-groupes (0-1)
+# [2] ppi_degree_norm  : degré PPI normalisé (0-1)
+# [3] reg_degree_norm  : degré de régulation normalisé (0-1)
+# [4] imp_P4_z         : importance métabolique en P4 (z-score)
+# [5] imp_P16_z        : importance métabolique en P16 (z-score)
+# [6] imp_delta         : delta d'importance P16-P4 (remodelage métabolique)
+# [7] has_humess        : masque HuMess (binaire, 1 si données disponibles)
+# AUCUNE de ces features ne contient log2FC, padj, ou delta_pct.
 gene_features = torch.tensor(
     np.column_stack([
         is_tf, variance_norm, ppi_degree_norm, reg_degree_norm,
@@ -625,32 +972,59 @@ print(f"    PAS de log2FC, padj, delta_pct (circularité supprimée)")
 # =============================================================================
 # 7. ASSEMBLAGE DU GRAPHE HÉTÉROGÈNE
 # =============================================================================
+# On assemble tous les noeuds et arêtes dans un objet HeteroData de PyG.
+# HeteroData est le format standard de PyTorch Geometric pour les graphes
+# hétérogènes (plusieurs types de noeuds et d'arêtes). Chaque type d'arête
+# est identifié par un triplet (source_type, relation, dest_type).
+#
+# Structure finale du graphe :
+#   Noeuds :
+#     "gene"       : n_genes noeuds, 8 features topologiques
+#     "cell_group" : 5 noeuds (P4 + 4 clusters P16), 3 features
+#   Arêtes (jusqu'à 8 types) :
+#     cell_group → gene (expresses) : 5 × n_genes, 7 features
+#     gene → cell_group (expressed_in) : reverse, mêmes features
+#     gene ↔ gene (ppi) : STRING high-confidence, 1 feature
+#     gene ↔ gene (same_pathway) : REACTOME, pas de features
+#     gene → gene (regulates) : pySCENIC TF→cible, 1 feature
+#     gene → gene (regulated_by) : reverse de regulates, mêmes features
+#     gene ↔ gene (coexpression) : GRNBoost2 top 2%, 1 feature
+#     gene ↔ gene (metabolic_cocatalysis) : HuMess GPR, 2 features
 print("\n" + "=" * 70)
 print("7. Assemblage du graphe hétérogène")
 print("=" * 70)
 
+# HeteroData stocke les features et arêtes indexées par type
 data = HeteroData()
 
-data["gene"].x = gene_features
+# --- Noeuds ---
+data["gene"].x = gene_features            # (n_genes, 8)
 data["gene"].num_nodes = n_genes
-data["cell_group"].x = cell_group_features
+data["cell_group"].x = cell_group_features  # (5, 3)
 data["cell_group"].num_nodes = len(CELL_GROUPS)
 
+# --- Arêtes bipartites cell_group ↔ gene ---
+# "expresses" : cell_group → gene (le groupe cellulaire exprime le gène)
 data["cell_group", "expresses", "gene"].edge_index = edge_index_expresses
 data["cell_group", "expresses", "gene"].edge_attr = edge_attr_expresses
+# "expressed_in" : gene → cell_group (reverse, mêmes features)
+# Permet au gène de recevoir l'information de ses groupes cellulaires
 data["gene", "expressed_in", "cell_group"].edge_index = torch.stack([
-    edge_index_expresses[1], edge_index_expresses[0]
+    edge_index_expresses[1], edge_index_expresses[0]  # Inverse src/dst
 ])
 data["gene", "expressed_in", "cell_group"].edge_attr = edge_attr_expresses
 
+# --- Arêtes gene ↔ gene ---
 data["gene", "ppi", "gene"].edge_index = edge_index_ppi
 data["gene", "ppi", "gene"].edge_attr = edge_attr_ppi
 data["gene", "same_pathway", "gene"].edge_index = edge_index_pathway
+# same_pathway n'a pas d'edge_attr (existence binaire suffit)
 data["gene", "regulates", "gene"].edge_index = edge_index_regulates
 data["gene", "regulates", "gene"].edge_attr = edge_attr_regulates
 data["gene", "regulated_by", "gene"].edge_index = edge_index_regulated_by
-data["gene", "regulated_by", "gene"].edge_attr = edge_attr_regulates
+data["gene", "regulated_by", "gene"].edge_attr = edge_attr_regulates  # Mêmes poids
 
+# Arêtes conditionnelles (peuvent être vides si pas de données)
 if edge_index_coexpr.numel() > 0:
     data["gene", "coexpression", "gene"].edge_index = edge_index_coexpr
     data["gene", "coexpression", "gene"].edge_attr = coexpr_w_tensor
@@ -667,21 +1041,33 @@ print(f"  Arêtes regulates  : {edge_index_regulates.shape[1]}")
 print(f"  Arêtes coexpr     : {edge_index_coexpr.shape[1] if edge_index_coexpr.numel() > 0 else 0}")
 print(f"  Arêtes cocat      : {edge_index_cocat.shape[1] if edge_index_cocat.numel() > 0 else 0}")
 
+# Sauvegarde du graphe complet pour réutilisation (perturbations, etc.)
 torch.save(data, os.path.join(OUT_DIR, "hetero_graph_vgae.pt"))
 
 # =============================================================================
 # 8. MODÈLE VGAE
 # =============================================================================
-# Le VGAE a deux composants :
-#   1. Encoder (HeteroGNN) : produit μ et log(σ²) pour chaque noeud gene
-#      → z = μ + ε·σ (reparametrization trick)
-#   2. Decoder (inner product) : P(arête i↔j) = σ(z_i · z_j)
-#      → pas de paramètres, juste un produit scalaire
+# Le VGAE (Variational Graph AutoEncoder) est un modèle génératif qui apprend
+# des représentations (embeddings) de gènes en reconstruisant la structure
+# du graphe. Il a deux composants :
 #
-# Loss = reconstruction_loss (BCE sur les arêtes) + β·KL_divergence
-#   - reconstruction_loss : le VGAE doit prédire quelles paires de gènes
-#     sont connectées (positifs) vs non connectées (négatifs)
-#   - KL_divergence : régularise l'espace latent vers N(0,I)
+#   1. ENCODER (HeteroGNN → μ, log(σ²)) :
+#      Empile N couches de GATConv (Graph Attention Network) sur le graphe
+#      hétérogène. Chaque couche agrège les messages des voisins avec un
+#      mécanisme d'attention appris. Après N couches, chaque gène a un
+#      vecteur h ∈ R^hidden qui encode son contexte local dans le graphe.
+#      Deux têtes linéaires projettent h vers μ ∈ R^latent et log(σ²) ∈ R^latent.
+#
+#   2. DECODER (cosine similarity → probabilité d'arête) :
+#      Prédit P(arête i↔j) = σ(τ · cos(z_i, z_j)), où z est échantillonné
+#      du posterior q(z|x) = N(μ, diag(σ²)). Le décodeur est NON paramétrique
+#      (pas de poids appris, seulement le scalaire τ).
+#
+#   LOSS = reconstruction_loss + β · KL_divergence
+#      - Reconstruction : BCE entre les logits du décodeur et les labels
+#        (1 pour les arêtes réelles, 0 pour les paires non connectées)
+#      - KL : D_KL(q(z|x) || N(0,I)) régularise l'espace latent
+#      - β : coefficient d'annealing (0 → KL_BETA_MAX)
 # =============================================================================
 print("\n" + "=" * 70)
 print("8. Modèle VGAE")
@@ -690,45 +1076,92 @@ print("=" * 70)
 
 class HeteroEncoder(nn.Module):
     """
-    Encoder hétérogène pour le VGAE.
+    Encoder hétérogène multi-couches pour le VGAE.
 
-    Produit μ et log(σ²) pour chaque noeud gene via message passing
-    sur le graphe hétérogène. Les noeuds cell_group participent au
-    message passing mais ne sont pas encodés dans l'espace latent
-    (seuls les gènes nous intéressent pour la priorisation).
+    Architecture :
+      1. Projection linéaire : features brutes (8 dim gene, 3 dim cell_group)
+         → espace caché commun (hidden dim). Nécessaire car les deux types de
+         noeuds ont des dimensions d'entrée différentes.
+      2. N couches de message passing hétérogène (HeteroConv + GATConv) :
+         - HeteroConv : wrapper qui applique un GATConv INDÉPENDANT par type
+           d'arête, puis SOMME les messages pour chaque noeud destination.
+           Ainsi, un gène reçoit des messages séparés de ses voisins PPI,
+           de ses co-membres de pathway, de son TF régulateur, etc., et
+           ces messages sont combinés par sommation.
+         - GATConv : Graph Attention Network avec multi-head attention.
+           Pour chaque arête (i, j), le modèle apprend un score d'attention
+           α_ij qui pondère le message de j vers i. Un gène "important"
+           dans le voisinage aura un α élevé.
+         - BatchNorm + ReLU + Dropout + Résiduel : stabilisent l'entraînement.
+           La connexion résiduelle (x_new = x_new + x_prev) empêche la
+           disparition du signal dans les couches profondes.
+      3. Deux têtes linéaires : hidden → latent pour μ et log(σ²).
+
+    Les noeuds cell_group participent au message passing (ils envoient et
+    reçoivent des messages via les arêtes "expresses"/"expressed_in") mais
+    SEULS les gènes sont projetés dans l'espace latent (μ, log(σ²)).
     """
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
                  n_heads=4, dropout=0.2):
         super().__init__()
         self.n_layers = n_layers
+        # Chaque tête d'attention travaille en dimension head_dim = hidden/n_heads.
+        # Les résultats des n_heads têtes sont concaténés → sortie = hidden.
         head_dim = hidden // n_heads
 
-        self.gene_proj = nn.Linear(gene_in, hidden)
-        self.cell_proj = nn.Linear(cell_in, hidden)
+        # Couches de projection : amènent les features d'entrée (dimensions
+        # différentes pour gene et cell_group) dans un espace commun de
+        # dimension hidden. Sans ça, le message passing ne pourrait pas
+        # sommer les représentations de types de noeuds différents.
+        self.gene_proj = nn.Linear(gene_in, hidden)   # 8 → 128
+        self.cell_proj = nn.Linear(cell_in, hidden)   # 3 → 128
 
-        self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
+        self.convs = nn.ModuleList()   # N couches de convolution hétérogène
+        self.norms = nn.ModuleList()   # N couches de BatchNorm par type de noeud
 
-        edge_types = [
-            ("gene", "ppi", "gene"),
-            ("gene", "same_pathway", "gene"),
-            ("gene", "regulates", "gene"),
-            ("gene", "regulated_by", "gene"),
-            ("cell_group", "expresses", "gene"),
-            ("gene", "expressed_in", "cell_group"),
-            ("gene", "coexpression", "gene"),
-            ("gene", "metabolic_cocatalysis", "gene"),
+        # Les 8 types d'arêtes du graphe. Chacun aura son propre GATConv
+        # avec ses propres poids — le modèle apprend des "langages" de
+        # message passing différents pour chaque type de relation biologique.
+        # EDGE_DIMS : nombre de features d'arête par type (None = pas d'edge_attr).
+        # Passé à GATConv via edge_dim → l'attention intègre les features d'arête
+        # (mean_expr, pct, tf_activity, ppi_score, etc.), pas seulement la topologie.
+        edge_types_dims = [
+            (("gene", "ppi", "gene"), 1),
+            (("gene", "same_pathway", "gene"), None),
+            (("gene", "regulates", "gene"), 1),
+            (("gene", "regulated_by", "gene"), 1),
+            (("cell_group", "expresses", "gene"), 7),
+            (("gene", "expressed_in", "cell_group"), 7),
+            (("gene", "coexpression", "gene"), 1),
+            (("gene", "metabolic_cocatalysis", "gene"), 2),
         ]
+        self.edge_dims = {et: dim for et, dim in edge_types_dims}
 
         for _ in range(n_layers):
             conv_dict = {}
-            for et in edge_types:
-                conv_dict[et] = GATConv(
-                    hidden, head_dim, heads=n_heads,
-                    concat=True, dropout=dropout, add_self_loops=False,
-                )
+            for et, ed in edge_types_dims:
+                # Chaque type d'arête a son propre GATConv indépendant.
+                # GATConv(in_channels, out_channels, heads, ...) :
+                #   - in = hidden (dimension commune après projection)
+                #   - out = head_dim (par tête)
+                #   - concat=True : les n_heads têtes sont concaténées → hidden
+                #   - add_self_loops=False : pas de self-loop car c'est géré
+                #     par la connexion résiduelle
+                #   - edge_dim=ed : active l'attention sur les features d'arête
+                conv_kwargs = dict(heads=n_heads, concat=True,
+                                   dropout=dropout, add_self_loops=False)
+                if ed is not None:
+                    conv_kwargs["edge_dim"] = ed
+                conv_dict[et] = GATConv(hidden, head_dim, **conv_kwargs)
+            # HeteroConv : applique chaque GATConv sur son type d'arête,
+            # puis agrège (aggr="sum") les résultats pour chaque noeud.
+            # Un gène qui a des voisins PPI ET des voisins pathway recevra
+            # la somme des messages PPI + la somme des messages pathway.
             self.convs.append(HeteroConv(conv_dict, aggr="sum"))
+            # BatchNorm par type de noeud : normalise les activations pour
+            # stabiliser l'entraînement. Chaque type a sa propre statistique
+            # car gene et cell_group ont des distributions différentes.
             self.norms.append(nn.ModuleDict({
                 "gene": nn.BatchNorm1d(hidden),
                 "cell_group": nn.BatchNorm1d(hidden),
@@ -736,71 +1169,158 @@ class HeteroEncoder(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-        # Deux têtes pour la partie variationnelle : μ et log(σ²)
+        # Deux têtes linéaires pour la partie variationnelle :
+        #   mu_head : hidden → latent (moyenne du posterior gaussien)
+        #   logvar_head : hidden → latent (log-variance du posterior)
+        # On prédit log(σ²) plutôt que σ² directement car :
+        #   1. log(σ²) peut être négatif (σ² < 1) ou positif (σ² > 1)
+        #   2. Pas besoin de contrainte de positivité
+        #   3. Numériquement plus stable
         self.mu_head = nn.Linear(hidden, latent)
         self.logvar_head = nn.Linear(hidden, latent)
 
-    def forward(self, x_dict, edge_index_dict):
+    def forward(self, x_dict, edge_index_dict, edge_attr_dict=None):
+        """
+        Forward pass de l'encoder.
+
+        Étapes :
+          1. Projection des features brutes → espace caché commun (hidden)
+          2. N couches de message passing hétérogène avec résiduel
+          3. Extraction de μ et log(σ²) pour les gènes uniquement
+
+        Args:
+            x_dict : {"gene": (n_genes, gene_in), "cell_group": (5, cell_in)}
+            edge_index_dict : {(src_type, rel, dst_type): (2, n_edges), ...}
+            edge_attr_dict : optionnel, {(src,rel,dst): (n_edges, edge_dim), ...}
+                             Passé à chaque GATConv pour l'attention pondérée
+                             par les features d'arête.
+
+        Returns:
+            mu : (n_genes, latent) — moyenne du posterior
+            logvar : (n_genes, latent) — log-variance du posterior
+        """
+        # Étape 1 : projection + ReLU → les deux types de noeuds sont
+        # maintenant dans le même espace de dimension hidden.
         x_dict = {
             "gene": F.relu(self.gene_proj(x_dict["gene"])),
             "cell_group": F.relu(self.cell_proj(x_dict["cell_group"])),
         }
 
+        # Étape 2 : N couches de message passing
         for i in range(self.n_layers):
+            # Sauvegarder l'état précédent pour la connexion résiduelle.
+            # .clone() est nécessaire car la convolution modifie x_dict in-place.
             x_prev = {k: v.clone() for k, v in x_dict.items()}
+            # Filtrer les types d'arêtes vides (ex : coexpression peut être vide
+            # si COEXPR_TOP_QUANTILE est trop restrictif)
             active_edges = {k: v for k, v in edge_index_dict.items() if v.numel() > 0}
-            x_dict = self.convs[i](x_dict, active_edges)
+            # Message passing hétérogène : chaque type d'arête a son GATConv,
+            # les résultats sont sommés par noeud destination.
+            if edge_attr_dict is not None:
+                # HeteroConv accepte un edge_attr_dict keyé par edge_type ;
+                # il passe edge_attr_dict[et] comme kwarg edge_attr à chaque
+                # GATConv. On ne garde que les types réellement présents ET
+                # dont le GATConv attend un edge_dim (skip same_pathway).
+                active_attrs = {
+                    k: edge_attr_dict[k]
+                    for k in active_edges
+                    if k in edge_attr_dict and self.edge_dims.get(k) is not None
+                }
+                x_dict = self.convs[i](x_dict, active_edges,
+                                       edge_attr_dict=active_attrs)
+            else:
+                x_dict = self.convs[i](x_dict, active_edges)
 
             for key in x_dict:
+                # BatchNorm : normalise les activations (mean=0, var=1)
                 x_dict[key] = self.norms[i][key](x_dict[key])
+                # ReLU : non-linéarité (permet au réseau d'apprendre des
+                # fonctions complexes, pas juste des combinaisons linéaires)
                 x_dict[key] = F.relu(x_dict[key])
+                # Dropout : régularisation (éteint 20% des neurones aléatoirement)
                 x_dict[key] = self.dropout(x_dict[key])
+                # CONNEXION RÉSIDUELLE : x_new = x_new + x_prev
+                # Empêche la disparition du gradient dans les couches profondes.
+                # Aussi, garantit que l'information des features originales n'est
+                # pas complètement perdue après 3 couches de message passing.
                 x_dict[key] = x_dict[key] + x_prev[key]
 
-        gene_h = x_dict["gene"]
-        mu = self.mu_head(gene_h)
-        logvar = self.logvar_head(gene_h)
+        # Étape 3 : seuls les gènes sont projetés dans l'espace latent.
+        # Les cell_groups ont servi de "relais" d'information mais ne nous
+        # intéressent pas pour le ranking final.
+        gene_h = x_dict["gene"]  # (n_genes, hidden)
+        mu = self.mu_head(gene_h)          # (n_genes, latent)
+        logvar = self.logvar_head(gene_h)  # (n_genes, latent)
 
         return mu, logvar
 
 
 class VGAE(nn.Module):
     """
-    Variational Graph AutoEncoder.
+    Variational Graph AutoEncoder — le modèle complet.
 
-    Encoder : HeteroGNN → μ, log(σ²)
-    Reparametrization : z = μ + ε·exp(0.5·log(σ²)), ε ~ N(0,I)
-    Decoder : P(arête i↔j) = σ(τ · cos(z_i, z_j))  (cosine similarity)
+    Combine l'encoder (HeteroGNN), le reparametrization trick, et le
+    décodeur cosinus pour reconstruire le graphe.
 
-    Le décodeur utilise la similarité cosinus au lieu du produit scalaire brut.
-    Cela découple la DIRECTION des embeddings (utilisée pour la reconstruction)
-    de leur NORME (contrôlée par la KL). Sans ça, la KL pousse μ→0, ce qui
-    écrase les inner products vers 0 et cause le collapse (AUC→0.5).
-    τ (température) est un paramètre appris qui contrôle la dynamique des logits.
+    ARCHITECTURE :
+      Encoder : HeteroGNN → μ, log(σ²)      [paramétrique, appris]
+      Sampling : z = μ + ε·σ, ε ~ N(0,I)    [reparametrization trick]
+      Decoder : logit = τ · cos(z_i, z_j)   [quasi-paramétrique, seul τ est appris]
+
+    POURQUOI LE DÉCODEUR COSINUS (et pas le produit scalaire classique) ?
+      Dans un VGAE classique, le décodeur est σ(z_i^T z_j) = produit scalaire.
+      Le problème : la KL divergence pousse μ → 0 (vers la prior N(0,I)).
+      Quand ||μ|| diminue, les produits scalaires z_i^T z_j → 0 aussi,
+      et les probabilités d'arête → σ(0) = 0.5 → AUC = 0.5 (collapse).
+
+      Avec le cosinus : cos(z_i, z_j) = (z_i^T z_j) / (||z_i|| · ||z_j||)
+      → seule la DIRECTION compte, pas la norme. La KL peut réduire ||μ||
+      sans affecter la reconstruction. Le modèle n'a plus à "lutter" entre
+      reconstruire (besoin de grandes normes) et régulariser (besoin de petites normes).
+
+      τ (température apprise) contrôle la "confiance" des prédictions :
+      - τ petit → logits proches de 0 → prédictions molles (incertain)
+      - τ grand → logits extrêmes → prédictions tranchées (sur-confiant)
+      On clampe τ ≤ tau_max pour éviter le surapprentissage.
     """
 
     def __init__(self, encoder, tau_init=2.0, tau_max=3.0):
         super().__init__()
         self.encoder = encoder
-        # Température apprise pour le décodeur cosinus — initialisée à tau_init.
-        # τ est clampé à tau_max pour empêcher les logits trop grands
-        # qui causent des prédictions sur-confiantes → surapprentissage.
+        # τ est stocké comme log(τ) pour garantir τ > 0 (exp est toujours positif).
+        # Initialisé à τ = 2.0 (logits modérés).
+        # tau_max = 3.0 empêche la sur-confiance : au-delà, les logits sont
+        # trop grands et le modèle surapprent les arêtes d'entraînement.
         self.log_tau = nn.Parameter(torch.tensor(float(np.log(tau_init))))
         self.log_tau_max = np.log(tau_max)
 
     def reparametrize(self, mu, logvar):
-        """Reparametrization trick : z = μ + ε·σ"""
-        # Clamp logvar pour éviter l'explosion numérique (σ trop grand ou trop petit)
+        """
+        Reparametrization trick : z = μ + ε·σ, avec ε ~ N(0,I).
+
+        POURQUOI ? On veut échantillonner z ~ N(μ, σ²I) mais le sampling
+        n'est pas différentiable (on ne peut pas backpropager à travers
+        un échantillonnage aléatoire). Le trick : on écrit z = μ + ε·σ
+        avec ε fixe (tiré une fois). Le gradient passe par μ et σ (déterministes),
+        pas par ε (aléatoire). C'est la base de tous les VAE.
+
+        En ÉVALUATION (self.training=False) : on utilise directement μ
+        (la moyenne du posterior), sans bruit. C'est le "MAP estimate" —
+        le point le plus probable de la distribution apprise.
+        """
+        # Clamp logvar pour éviter les explosions numériques :
+        # logvar < -10 → σ ≈ 0.007 (trop petit, gradient vanish)
+        # logvar > 10  → σ ≈ 148 (trop grand, instabilité)
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return mu + eps * std
-        # En évaluation, on utilise directement μ (pas d'aléa)
+            std = torch.exp(0.5 * logvar)  # σ = exp(log(σ²)/2) = exp(logvar/2)
+            eps = torch.randn_like(std)     # ε ~ N(0, I), même shape que std
+            return mu + eps * std            # z ~ N(μ, σ²I)
+        # En évaluation : pas de bruit, on utilise μ directement
         return mu
 
-    def encode(self, x_dict, edge_index_dict):
-        mu, logvar = self.encoder(x_dict, edge_index_dict)
+    def encode(self, x_dict, edge_index_dict, edge_attr_dict=None):
+        mu, logvar = self.encoder(x_dict, edge_index_dict, edge_attr_dict)
         z = self.reparametrize(mu, logvar)
         return z, mu, logvar
 
@@ -825,30 +1345,52 @@ class VGAE(nn.Module):
         """
         KL divergence avec free bits : D_KL(q(z|x) || p(z)), p(z) = N(0,I).
 
-        Free bits : on calcule la KL par dimension latente et on impose un
-        minimum de `free_bits` nats. Les dimensions sous ce seuil ne sont pas
-        pénalisées, ce qui force le modèle à utiliser l'espace latent plutôt
-        que de le collapser vers la prior.
+        Formule analytique de la KL pour deux gaussiennes :
+          D_KL = -0.5 × Σ_d (1 + log(σ²_d) - μ²_d - σ²_d)
+        où d indexe les dimensions latentes.
+
+        FREE BITS — mécanisme anti-KL-collapse :
+          Sans free bits, la KL peut pousser TOUTES les dimensions vers la
+          prior N(0,1), ce qui donne des embeddings identiques (collapse).
+          Avec free bits = λ nats, on impose un MINIMUM de λ nats de KL
+          par dimension. Si une dimension a KL < λ, elle n'est PAS pénalisée
+          (le gradient de la KL est 0 pour cette dimension).
+          Résultat : le modèle est FORCÉ d'utiliser au moins λ nats
+          d'information par dimension latente, ce qui garantit que l'espace
+          latent encode de l'information utile.
+
+        Args:
+            mu : (n_genes, latent) — moyenne du posterior
+            logvar : (n_genes, latent) — log-variance du posterior
+            free_bits : minimum de KL par dimension (en nats)
+
+        Returns:
+            KL totale (scalaire) sommée sur les dimensions latentes
         """
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
-        # KL par dimension : shape (n_genes, latent_dim)
+        # KL par gène par dimension : shape (n_genes, latent_dim)
         kl_per_dim = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-        # Moyenne sur les gènes, garde les dimensions : shape (latent_dim,)
+        # Moyenne sur les gènes → une valeur par dimension latente : shape (latent_dim,)
         kl_per_dim_mean = kl_per_dim.mean(dim=0)
-        # Free bits : clamp chaque dimension au minimum
+        # Free bits : si KL d'une dimension < free_bits, on la remonte à free_bits
+        # (pas de pénalisation → le modèle peut librement encoder de l'info)
         kl_clamped = torch.clamp(kl_per_dim_mean, min=free_bits)
+        # Somme sur toutes les dimensions latentes → scalaire unique
         return kl_clamped.sum()
 
 
-# Instanciation
+# --- Instanciation du modèle ---
+# L'encoder prend les features brutes (8 dim gene, 3 dim cell_group) et
+# produit μ, log(σ²) en dimension latent=64 pour chaque gène.
+# Le VGAE enveloppe l'encoder + le décodeur cosinus avec τ.
 encoder = HeteroEncoder(
-    gene_in=gene_features.shape[1],
-    cell_in=cell_group_features.shape[1],
-    hidden=HIDDEN_DIM,
-    latent=LATENT_DIM,
-    n_layers=N_LAYERS,
-    n_heads=N_HEADS,
-    dropout=DROPOUT,
+    gene_in=gene_features.shape[1],       # 8 features topologiques
+    cell_in=cell_group_features.shape[1],  # 3 features de groupe
+    hidden=HIDDEN_DIM,                     # 128 (dimension cachée)
+    latent=LATENT_DIM,                     # 64 (dimension de l'espace latent)
+    n_layers=N_LAYERS,                     # 3 couches de message passing
+    n_heads=N_HEADS,                       # 4 têtes d'attention
+    dropout=DROPOUT,                       # 0.2
 )
 model = VGAE(encoder)
 
@@ -859,19 +1401,30 @@ print(f"  Paramètres : {total_params:,}")
 # =============================================================================
 # 9. PRÉPARATION DES ARÊTES POUR L'ENTRAÎNEMENT
 # =============================================================================
-# Le VGAE s'entraîne sur la reconstruction d'arêtes gene↔gene.
-# On combine TOUTES les arêtes gene↔gene (PPI + pathway + régulation + coexpr)
-# en un seul ensemble, puis on split train/test.
+# Le VGAE apprend à reconstruire le graphe : étant donné des embeddings z,
+# le décodeur prédit quelles paires (i, j) sont connectées. Pour évaluer
+# la qualité de cette reconstruction, on a besoin d'un split train/test :
+#   - TRAIN : arêtes utilisées pour calculer la loss (le modèle voit ces arêtes)
+#   - TEST : arêtes masquées pendant l'entraînement (le modèle doit les prédire)
+# L'AUC sur le test mesure la capacité de généralisation du modèle.
+#
+# IMPORTANT : on combine TOUS les types d'arêtes gene↔gene (PPI, pathway,
+# régulation, coexpression, cocatalyse) en un seul pool. Le décodeur ne
+# distingue pas les types d'arêtes — il prédit simplement "arête ou pas".
+# Les types d'arêtes restent SÉPARÉS dans le graphe d'entrée de l'encoder
+# (chaque type a son GATConv), mais la supervision est sur le pool combiné.
 print("\n" + "=" * 70)
 print("9. Préparation des arêtes d'entraînement")
 print("=" * 70)
 
-# Collecter toutes les arêtes gene↔gene (non dirigées, dédupliquées)
+# Collecter toutes les arêtes gene↔gene (non dirigées, dédupliquées).
+# On stocke chaque arête comme (min(i,j), max(i,j)) pour dédupliquer
+# les arêtes bidirectionnelles (i→j et j→i comptent comme une seule paire).
 all_gene_edges = set()
 for src_list, dst_list in [
     (ppi_src, ppi_dst),
     (react_src, react_dst),
-    (reg_src, reg_dst), (reg_dst, reg_src),
+    (reg_src, reg_dst), (reg_dst, reg_src),  # Regulates + regulated_by
     (coexpr_src, coexpr_dst),
 ]:
     for s, d in zip(src_list, dst_list):
@@ -882,19 +1435,23 @@ all_edges = np.array(list(all_gene_edges))
 n_edges = len(all_edges)
 print(f"  Arêtes gene↔gene uniques : {n_edges}")
 
-# Split train/test (on masque des arêtes que le VGAE devra reconstruire)
+# Split train/test aléatoire (seed=42 pour reproductibilité).
+# EDGE_SAMPLE_RATIO = 10% des arêtes sont réservées pour le test.
+# Ce split est fait au niveau des paires non dirigées (pas des arêtes bidirectionnelles).
 np.random.seed(42)
 perm = np.random.permutation(n_edges)
 n_test = max(1, int(n_edges * EDGE_SAMPLE_RATIO))
-test_edge_idx = perm[:n_test]
-train_edge_idx = perm[n_test:]
+test_edge_idx = perm[:n_test]      # Premiers 10% → test
+train_edge_idx = perm[n_test:]     # 90% restants → train
 
 test_edges = all_edges[test_edge_idx]
 train_edges = all_edges[train_edge_idx]
 
-# Arêtes positives (format PyG : [2, n_edges])
+# Conversion en format PyG : tenseur [2, n_edges] avec src en ligne 0, dst en ligne 1.
 pos_train = torch.tensor(train_edges.T, dtype=torch.long)
-# Rendre bidirectionnel
+# Rendre bidirectionnel : pour chaque paire (i, j) du train, on ajoute (j, i).
+# .flip(0) inverse les lignes src/dst → transforme (i→j) en (j→i).
+# Concaténation → le tenseur contient (i→j) ET (j→i) pour chaque paire.
 pos_train_bidir = torch.cat([pos_train, pos_train.flip(0)], dim=1)
 
 pos_test = torch.tensor(test_edges.T, dtype=torch.long)
@@ -906,14 +1463,35 @@ print(f"  Test  : {len(test_edges)} arêtes positives")
 # =============================================================================
 # 10. ENTRAÎNEMENT DU VGAE
 # =============================================================================
+# Boucle d'entraînement standard PyTorch avec quelques spécificités VGAE :
+#   1. Negative sampling : à chaque epoch, on échantillonne des paires NON
+#      connectées (négatifs) pour équilibrer la loss. Sans ça, le modèle
+#      apprendrait juste à prédire "arête partout" (AUC = 0.5).
+#   2. KL annealing : β augmente linéairement de 0 à KL_BETA_MAX. Au début
+#      de l'entraînement (β ≈ 0), le modèle apprend UNIQUEMENT à reconstruire.
+#      La KL entre progressivement pour régulariser l'espace latent.
+#   3. Free bits : minimum de KL par dimension (empêche le collapse).
+#   4. Early stopping : on arrête si l'AUC test ne s'améliore plus.
+#   5. Gradient clipping : empêche les explosions de gradient.
 print("\n" + "=" * 70)
 print("10. Entraînement du VGAE")
 print("=" * 70)
 
+# Adam avec weight_decay = 1e-4 (L2 regularization sur les poids).
+# Le weight_decay empêche les poids de devenir trop grands, ce qui
+# complémente la KL (qui régularise l'espace latent, pas les poids).
 optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
 
+# Préparer les dictionnaires de features et d'arêtes pour l'encoder.
+# x_dict : features des noeuds par type
+# edge_index_dict : arêtes par type (pour le message passing de l'encoder)
+# NOTE : l'encoder voit TOUTES les arêtes du graphe (y compris les arêtes test).
+# Seul le DÉCODEUR est évalué sur les arêtes test. C'est la convention standard
+# des VGAE : l'encoder a accès au graphe complet pour le message passing,
+# mais la supervision (loss) est calculée uniquement sur les arêtes train/test.
 x_dict = {"gene": data["gene"].x, "cell_group": data["cell_group"].x}
 edge_index_dict = {}
+edge_attr_dict = {}   # features d'arête passées aux GATConv via edge_dim
 for et_key in [
     ("cell_group", "expresses", "gene"),
     ("gene", "expressed_in", "cell_group"),
@@ -923,101 +1501,144 @@ for et_key in [
     ("gene", "regulated_by", "gene"),
 ]:
     edge_index_dict[et_key] = data[et_key].edge_index
+    if "edge_attr" in data[et_key] and data[et_key].edge_attr is not None:
+        edge_attr_dict[et_key] = data[et_key].edge_attr
+# Les arêtes optionnelles (coexpression, cocatalyse) ne sont ajoutées que
+# si elles existent dans le graphe (elles peuvent être vides).
 if ("gene", "coexpression", "gene") in data.edge_types:
     edge_index_dict[("gene", "coexpression", "gene")] = \
         data["gene", "coexpression", "gene"].edge_index
+    if data["gene", "coexpression", "gene"].edge_attr is not None:
+        edge_attr_dict[("gene", "coexpression", "gene")] = \
+            data["gene", "coexpression", "gene"].edge_attr
 if ("gene", "metabolic_cocatalysis", "gene") in data.edge_types:
     edge_index_dict[("gene", "metabolic_cocatalysis", "gene")] = \
         data["gene", "metabolic_cocatalysis", "gene"].edge_index
+    if data["gene", "metabolic_cocatalysis", "gene"].edge_attr is not None:
+        edge_attr_dict[("gene", "metabolic_cocatalysis", "gene")] = \
+            data["gene", "metabolic_cocatalysis", "gene"].edge_attr
 
-train_losses = []
-test_aucs = []
-eval_epochs = []  # Epochs où on évalue (pour le plot)
-best_test_auc = 0.0
-best_epoch = 0
-PATIENCE = 80             # Early stopping : patience modérée, le pic est typiquement autour de epoch 30-50
-GRAD_CLIP_NORM = 1.0     # Gradient clipping pour la stabilité
+# Historique pour les plots
+train_losses = []      # Loss totale à chaque epoch
+test_aucs = []         # AUC test (évaluée toutes les 10 epochs)
+eval_epochs = []       # Numéros d'epoch où on a évalué
+best_test_auc = 0.0    # Meilleure AUC test observée
+best_epoch = 0         # Epoch correspondante
+# PATIENCE = 80 epochs : si l'AUC ne s'améliore pas pendant 80 epochs
+# (= 8 évaluations), on arrête. Le pic est typiquement autour de epoch 30-50.
+PATIENCE = 80
+# GRAD_CLIP_NORM = 1.0 : on clamp la norme du gradient total à 1.0.
+# Empêche les mises à jour explosives (ex : quand τ change brusquement).
+GRAD_CLIP_NORM = 1.0
 patience_counter = 0
 
-model.train()
+model.train()  # Mode entraînement (active dropout + BatchNorm en mode train)
 for epoch in range(N_EPOCHS):
-    optimizer.zero_grad()
+    optimizer.zero_grad()  # Remet les gradients à zéro
 
-    z, mu, logvar = model.encode(x_dict, edge_index_dict)
+    # --- Forward pass de l'encoder ---
+    # z = échantillon du posterior q(z|x) via reparametrization trick
+    # mu, logvar = paramètres du posterior (pour la KL loss)
+    z, mu, logvar = model.encode(x_dict, edge_index_dict, edge_attr_dict)
 
-    # Arêtes négatives (paires de gènes NON connectés)
+    # --- Negative sampling ---
+    # Pour chaque arête positive (vraie connexion), on tire une arête
+    # négative (paire non connectée). Le ratio 1:1 donne des classes
+    # équilibrées. Les négatifs sont RE-ÉCHANTILLONNÉS à chaque epoch
+    # pour que le modèle voie des négatifs variés (pas toujours les mêmes).
     neg_train = negative_sampling(
         pos_train_bidir, num_nodes=n_genes,
         num_neg_samples=pos_train_bidir.shape[1],
     )
 
-    # Loss de reconstruction
-    pos_scores = model.decode(z, pos_train_bidir)
-    neg_scores = model.decode(z, neg_train)
+    # --- Loss de reconstruction (BCE) ---
+    # Le décodeur produit des logits (τ · cos) pour chaque paire.
+    # binary_cross_entropy_with_logits applique sigmoid + BCE en une seule
+    # opération (numériquement plus stable que sigmoid séparé).
+    pos_scores = model.decode(z, pos_train_bidir)   # Logits pour les vrais voisins
+    neg_scores = model.decode(z, neg_train)          # Logits pour les non-voisins
 
+    # pos_loss : on veut que les logits des vrais voisins soient HAUTS (label=1)
     pos_loss = F.binary_cross_entropy_with_logits(
         pos_scores, torch.ones_like(pos_scores)
     )
+    # neg_loss : on veut que les logits des non-voisins soient BAS (label=0)
     neg_loss = F.binary_cross_entropy_with_logits(
         neg_scores, torch.zeros_like(neg_scores)
     )
     recon_loss = pos_loss + neg_loss
 
-    # KL divergence avec annealing + free bits
-    # β augmente linéairement de 0 à KL_BETA_MAX pendant les KL_WARMUP_EPOCHS
-    # premières epochs. Cela permet au modèle d'apprendre d'abord à bien
-    # reconstruire les arêtes avant que la régularisation KL ne s'applique.
+    # --- KL divergence avec annealing + free bits ---
+    # KL ANNEALING : β augmente linéairement de 0 à KL_BETA_MAX pendant
+    # les KL_WARMUP_EPOCHS premières epochs. Calendrier :
+    #   epoch 0   → β = 0        (pas de KL, reconstruction pure)
+    #   epoch 25  → β = KL_BETA_MAX/2  (KL progressive)
+    #   epoch 50+ → β = KL_BETA_MAX    (régularisation complète)
+    # Cela permet au modèle de d'abord apprendre à bien reconstruire les
+    # arêtes (encoder des embeddings informatifs), PUIS d'introduire la
+    # régularisation KL qui va lisser et structurer l'espace latent.
     kl_beta = min(KL_BETA_MAX, KL_BETA_MAX * epoch / max(1, KL_WARMUP_EPOCHS))
     kl_loss = model.kl_loss(mu, logvar, free_bits=FREE_BITS)
 
+    # Loss totale = reconstruction + β × KL
     loss = recon_loss + kl_beta * kl_loss
     loss.backward()
-    # Gradient clipping — empêche les mises à jour explosives qui
-    # pourraient déstabiliser l'encodeur ou la température τ
+    # Gradient clipping : empêche les mises à jour explosives
     torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
     optimizer.step()
     train_losses.append(loss.item())
 
-    # Évaluation sur les arêtes test
+    # --- Évaluation sur les arêtes test (toutes les 10 epochs) ---
+    # On évalue sur des arêtes que le modèle n'a PAS vues dans la loss.
+    # L'AUC mesure la capacité du modèle à distinguer les vraies arêtes
+    # (positifs) des paires non connectées (négatifs).
     if (epoch + 1) % 10 == 0 or epoch == 0:
-        model.eval()
-        with torch.no_grad():
-            z_eval, mu_eval, _ = model.encode(x_dict, edge_index_dict)
+        model.eval()  # Mode évaluation (désactive dropout, BatchNorm en mode eval)
+        with torch.no_grad():  # Pas de calcul de gradient (économie mémoire + vitesse)
+            z_eval, mu_eval, _ = model.encode(x_dict, edge_index_dict, edge_attr_dict)
 
+            # Scores pour les arêtes test positives (vraies)
             pos_test_scores = torch.sigmoid(model.decode(z_eval, pos_test_bidir))
+            # Négatifs test : nouvelles paires non connectées
             neg_test = negative_sampling(
                 pos_test_bidir, num_nodes=n_genes,
                 num_neg_samples=pos_test_bidir.shape[1],
             )
             neg_test_scores = torch.sigmoid(model.decode(z_eval, neg_test))
 
+            # Labels : 1 pour positifs, 0 pour négatifs
             test_labels = torch.cat([
                 torch.ones(pos_test_scores.shape[0]),
                 torch.zeros(neg_test_scores.shape[0]),
             ])
             test_scores = torch.cat([pos_test_scores, neg_test_scores])
 
+            # AUC-ROC et Average Precision (AP)
+            # AUC = 0.5 → modèle aléatoire (collapse)
+            # AUC > 0.9 → le modèle reconstruit bien le graphe
             try:
                 auc = roc_auc_score(test_labels.numpy(), test_scores.numpy())
                 ap = average_precision_score(test_labels.numpy(), test_scores.numpy())
             except ValueError:
-                auc, ap = 0.5, 0.5
+                auc, ap = 0.5, 0.5  # Fallback si toutes les prédictions sont identiques
 
             test_aucs.append(auc)
             eval_epochs.append(epoch)
 
+            # Sauvegarder le meilleur modèle (par AUC test)
             if auc > best_test_auc:
                 best_test_auc = auc
                 best_epoch = epoch
-                patience_counter = 0
+                patience_counter = 0  # Reset du compteur de patience
                 torch.save(model.state_dict(), os.path.join(OUT_DIR, "best_vgae.pt"))
             else:
-                patience_counter += 10  # On évalue toutes les 10 epochs
+                patience_counter += 10  # +10 car on évalue toutes les 10 epochs
 
-        model.train()
+        model.train()  # Retour en mode entraînement
 
+        # Log détaillé toutes les 50 epochs
         if (epoch + 1) % 50 == 0:
-            tau_val = np.exp(model.log_tau.item())
+            tau_val = np.exp(model.log_tau.item())  # τ actuel
             print(f"    Epoch {epoch+1:3d}/{N_EPOCHS} — "
                   f"Loss: {loss.item():.4f} (recon={recon_loss.item():.4f} "
                   f"kl={kl_loss.item():.4f} β={kl_beta:.5f} τ={tau_val:.2f}) — "
@@ -1032,20 +1653,39 @@ for epoch in range(N_EPOCHS):
 
 print(f"\n  Meilleur modèle : epoch {best_epoch+1}, AUC = {best_test_auc:.4f}")
 
-# Charger le meilleur modèle
+# Charger le meilleur modèle (celui avec la meilleure AUC test).
+# weights_only=True : sécurité PyTorch — ne charge que les tenseurs, pas
+# d'objets Python arbitraires (évite les attaques de sérialisation).
 model.load_state_dict(torch.load(os.path.join(OUT_DIR, "best_vgae.pt"), weights_only=True))
 
 # =============================================================================
 # 11. EXTRACTION DES EMBEDDINGS ET SCORE D'IMPORTANCE ÉMERGENT
 # =============================================================================
+# C'est la section la plus importante du pipeline : on extrait les embeddings
+# du VGAE entraîné et on calcule un SCORE D'IMPORTANCE COMPOSITE à 5
+# composantes. Ce score est "émergent" car il n'est PAS défini a priori
+# (contrairement au log2FC qui est un test statistique). Il ÉMERGE de
+# l'espace latent appris par le VGAE à partir de la topologie du graphe.
+#
+# Les 5 composantes capturent 5 aspects différents de l'"importance" :
+#   1. emb_norm (norme de μ) : remarquabilité topologique
+#   2. density (k-NN cosinus) : centralité dans l'espace latent
+#   3. recon_fidelity (1 - erreur) : fiabilité de la reconstruction
+#   4. certainty (1 - σ) : stabilité/confiance du modèle
+#   5. specificity (entropie de Shannon) : spécificité d'expression
+#
+# Score final = moyenne des 5 composantes (pas de poids arbitraires).
 print("\n" + "=" * 70)
 print("11. Score d'importance émergent")
 print("=" * 70)
 
+# Extraire les embeddings du meilleur modèle (mode évaluation → pas de bruit).
+# On utilise μ (la moyenne du posterior) comme embedding final, pas z
+# (échantillon bruité). μ est déterministe et plus stable pour le ranking.
 model.eval()
 with torch.no_grad():
-    z_final, mu_final, logvar_final = model.encode(x_dict, edge_index_dict)
-    gene_emb = mu_final.numpy()  # On utilise μ (pas z bruité)
+    z_final, mu_final, logvar_final = model.encode(x_dict, edge_index_dict, edge_attr_dict)
+    gene_emb = mu_final.numpy()  # (n_genes, latent_dim=64)
 
 # ── Score 1 : Excentricité dans l'espace latent ────────────────────────────────
 # La norme L2 de μ mesure à quel point un gène est "excentrique" par rapport
@@ -1172,20 +1812,30 @@ n_silenced = int((total_expr < silent_threshold).sum())
 print(f"    Gènes silencieux filtrés : {n_silenced} (expression totale < {silent_threshold:.4f})")
 
 # ── Score composite (combinaison non pondérée, 5 composantes) ───────────────
-# Pas de poids arbitraires — on laisse le score émerger de la moyenne
-# des différentes perspectives. Chaque composante capture un aspect différent :
-#   norme       = remarquabilité topologique
-#   densité     = centralité dans l'espace latent (corrigée anti-paquets)
-#   recon       = fiabilité de la reconstruction
-#   certitude   = stabilité (faible σ)
-#   spécificité = signal d'expression concentré sur certains groupes
+# POURQUOI PAS DE POIDS ? Chaque composante capture un aspect ORTHOGONAL
+# de l'importance. Pondérer reviendrait à décider a priori que la norme est
+# "plus importante" que la densité, ce qui serait arbitraire. La moyenne
+# simple laisse le score émerger de l'espace latent sans biais humain.
+#
+# Ce que chaque composante capture :
+#   emb_norm_score        : remarquabilité topologique (le gène est "loin du centre")
+#   density_score         : centralité latente (hub dans l'espace des embeddings)
+#   1 - recon_error_score : fiabilité (le VGAE reconstruit bien ses arêtes)
+#   1 - uncertainty_score : certitude (σ faible = le modèle est confiant)
+#   specificity_score     : spécificité d'expression (concentré sur certains groupes)
+#
+# Les composantes "inversées" (1 - x) transforment des scores "plus haut = pire"
+# en scores "plus haut = mieux" :
+#   - recon_error haute = mauvaise reconstruction → on veut l'inverse
+#   - uncertainty haute = grande σ = modèle incertain → on veut l'inverse
 importance_score = (
     emb_norm_score
     + density_score
-    + (1 - recon_error_score)
-    + (1 - uncertainty_score)
+    + (1 - recon_error_score)    # Fiabilité = 1 - erreur
+    + (1 - uncertainty_score)    # Certitude = 1 - incertitude
     + specificity_score
 ) / 5.0
+# Normalisation finale dans [0, 1]
 importance_score = importance_score / (importance_score.max() + 1e-8)
 
 print(f"  Composantes du score :")
@@ -1206,6 +1856,13 @@ for idx in top_idx:
           f"{specificity_score[idx]:.4f}")
 
 # ── Clustering des embeddings ────────────────────────────────────────────────
+# K-means sur les embeddings μ pour identifier des groupes fonctionnels
+# de gènes. Les gènes d'un même cluster ont des embeddings proches →
+# ils occupent un rôle similaire dans le graphe biologique.
+# Le silhouette score mesure la qualité du clustering :
+#   > 0.3 = structure claire, < 0.1 = pas de structure nette.
+# n_init=10 : K-means est lancé 10 fois avec des initialisations différentes
+# et le meilleur résultat (inertie minimale) est retenu.
 print(f"\n  Clustering K-means (k={N_CLUSTERS})...")
 kmeans = KMeans(n_clusters=N_CLUSTERS, random_state=42, n_init=10)
 gene_clusters = kmeans.fit_predict(gene_emb)
@@ -1220,43 +1877,62 @@ for c in range(N_CLUSTERS):
 # =============================================================================
 # 12. BASELINE MLP (même features, pas de graphe)
 # =============================================================================
-# Le MLP utilise les mêmes features que le VGAE mais SANS message passing.
-# Il sert à mesurer l'apport de la topologie du graphe.
-# On l'entraîne sur la même tâche : reconstruire les arêtes gene↔gene
-# à partir des features concaténées de chaque paire.
+# OBJECTIF DE CETTE BASELINE : mesurer l'apport de la TOPOLOGIE du graphe.
+# Le MLP utilise les MÊMES features que le VGAE (is_tf, variance, degree, etc.)
+# mais NE fait PAS de message passing. Il prédit directement si une arête
+# existe entre deux gènes en concaténant leurs features.
+#
+# Si VGAE AUC >> MLP AUC → la structure du graphe (qui est voisin de qui)
+# apporte de l'information au-delà des features brutes.
+# Si VGAE AUC ≈ MLP AUC → les features seules suffisent, le graphe n'aide pas.
+#
+# C'est un test d'ABLATION : on retire le graphe et on regarde si le modèle
+# perd en performance. Si oui, le message passing est utile.
 print("\n" + "=" * 70)
 print("12. Baseline MLP (sans graphe)")
 print("=" * 70)
 
 
 class MLPBaseline(nn.Module):
-    """MLP qui prédit l'existence d'une arête à partir des features concaténées."""
+    """
+    MLP baseline pour la prédiction de liens (sans graphe).
+
+    Pour prédire si une arête (i, j) existe :
+      1. On concatène les features de i et j : h = [x_i ; x_j]  (dim = 2×gene_in)
+      2. On passe h dans un MLP à 3 couches : 2×gene_in → hidden → hidden/2 → 1
+      3. La sortie est un logit (pas de sigmoid, appliquée dans la loss)
+
+    Le MLP n'a AUCUNE notion de voisinage ou de graphe : il ne voit que
+    les features des deux gènes. Pas de message passing.
+    """
 
     def __init__(self, in_dim, hidden_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim * 2, hidden_dim),
+            nn.Linear(in_dim * 2, hidden_dim),   # Concaténation → hidden
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim, hidden_dim // 2),  # hidden → hidden/2
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(hidden_dim // 2, 1),       # hidden/2 → 1 logit
         )
 
     def forward(self, x, edge_index):
         src, dst = edge_index
-        h = torch.cat([x[src], x[dst]], dim=1)
-        return self.net(h).squeeze(-1)
+        # Concaténation des features des deux gènes de chaque paire
+        h = torch.cat([x[src], x[dst]], dim=1)  # (n_pairs, 2×in_dim)
+        return self.net(h).squeeze(-1)  # (n_pairs,) logits
 
 
 mlp = MLPBaseline(gene_features.shape[1], MLP_HIDDEN)
 mlp_optimizer = torch.optim.Adam(mlp.parameters(), lr=MLP_LR)
 
+# Entraînement du MLP — même loss et même split que le VGAE
 mlp.train()
 for epoch in range(MLP_EPOCHS):
     mlp_optimizer.zero_grad()
 
-    # Positifs
+    # Mêmes arêtes positives et négatifs que le VGAE
     pos_scores = mlp(gene_features, pos_train_bidir)
     neg_edges = negative_sampling(pos_train_bidir, num_nodes=n_genes,
                                   num_neg_samples=pos_train_bidir.shape[1])
@@ -1267,7 +1943,7 @@ for epoch in range(MLP_EPOCHS):
     loss.backward()
     mlp_optimizer.step()
 
-# Évaluation MLP
+# Évaluation MLP sur les mêmes arêtes test que le VGAE
 mlp.eval()
 with torch.no_grad():
     pos_s = torch.sigmoid(mlp(gene_features, pos_test_bidir))
@@ -1288,25 +1964,65 @@ if best_test_auc > mlp_auc:
 else:
     print(f"  → Le MLP fait aussi bien/mieux — la topologie n'aide pas ici")
 
+# --- Score MLP par gène (analogue de vgae_recon_fidelity) -------------------
+# Pour chaque gène, on prend la PROBABILITÉ MOYENNE que ses vraies arêtes
+# soient correctement prédites par le MLP. C'est la version sans-graphe
+# de `recon_fidelity` : un gène est "important MLP" si ses interactions
+# sont prédictibles uniquement à partir des features concaténées des deux
+# gènes, sans message passing. Utile comme 2e baseline pour voir ce que
+# le message passing apporte vraiment au scoring (pas juste à l'AUC).
+mlp.eval()
+with torch.no_grad():
+    all_pos = torch.cat([pos_train_bidir, pos_test_bidir], dim=1)
+    pos_scores_all = torch.sigmoid(mlp(gene_features, all_pos)).numpy()
+src_np = all_pos[0].numpy()
+dst_np = all_pos[1].numpy()
+mlp_score_sum = np.zeros(n_genes, dtype=np.float32)
+mlp_edge_cnt = np.zeros(n_genes, dtype=np.float32)
+np.add.at(mlp_score_sum, src_np, pos_scores_all)
+np.add.at(mlp_score_sum, dst_np, pos_scores_all)
+np.add.at(mlp_edge_cnt, src_np, 1.0)
+np.add.at(mlp_edge_cnt, dst_np, 1.0)
+mlp_gene_score = np.where(mlp_edge_cnt > 0,
+                          mlp_score_sum / np.maximum(mlp_edge_cnt, 1.0),
+                          0.0).astype(np.float32)
+# Normalisation [0, 1] pour comparer aux autres scores.
+mlp_gene_score = mlp_gene_score / (mlp_gene_score.max() + 1e-8)
+print(f"  Score MLP par gène : mean={mlp_gene_score.mean():.4f}, "
+      f"gènes couverts={int((mlp_edge_cnt > 0).sum())}/{n_genes}")
+top_mlp = np.argsort(mlp_gene_score)[::-1][:10]
+print(f"  Top 10 gènes (baseline MLP) :")
+for idx in top_mlp:
+    print(f"    {gene_symbols[idx]:15s} score={mlp_gene_score[idx]:.4f}")
+
 # =============================================================================
-# 13. BASELINE STATISTIQUE (ranking par log2FC)
+# 13. BASELINE STATISTIQUE (ranking par expression différentielle)
 # =============================================================================
-# Pour comparer avec une approche sans ML : on rank les gènes par leur
-# |log2FC| moyen entre P4 et les clusters P16.
+# OBJECTIF : comparer le VGAE avec la méthode la plus simple possible —
+# ranger les gènes par leur différence d'expression absolue entre P4 et P16.
+# C'est un proxy de |log2FC| (sans test statistique formel car n=1 par condition).
+#
+# Si le VGAE identifie des gènes à haut score qui ont un BAS score statistique
+# → ce sont des "candidats de découverte" : des gènes qui ne changeraient pas
+# d'expression de manière dramatique mais qui ont un rôle important dans le
+# réseau biologique (hubs, régulateurs, etc.). C'est la plus-value du VGAE.
 print("\n" + "=" * 70)
 print("13. Baseline statistique (ranking expression)")
 print("=" * 70)
 
-# Calculer un proxy de log2FC à partir des données normalisées (sans DEGs)
+# Pseudo log2FC : |mean_P16 - mean_P4| sur les données LogNormalize.
+# Sur des données LogNormalize de Seurat, la différence de moyennes
+# approxime le log2 fold change (car LogNormalize ≈ log1p(CPM/100)).
+# On prend la moyenne des 4 clusters P16 comme "P16 global".
 p4_mean = group_stats["P4"]["mean_expression"]
 p16_means = np.array([
     group_stats[f"P16_cluster_{c}"]["mean_expression"] for c in range(4)
 ])
-p16_global_mean = p16_means.mean(axis=0)
+p16_global_mean = p16_means.mean(axis=0)  # Moyenne sur les 4 clusters P16
 
-# Pseudo log2FC (sur données LogNormalize, c'est une différence de logs)
+# Valeur absolue car on s'intéresse aux gènes dérégulés (up OU down)
 pseudo_lfc = np.abs(p16_global_mean - p4_mean).astype(np.float32)
-stat_score = pseudo_lfc / (pseudo_lfc.max() + 1e-8)
+stat_score = pseudo_lfc / (pseudo_lfc.max() + 1e-8)  # Normalisation [0, 1]
 
 print(f"  Score statistique (|ΔExpr P16-P4|) : mean={stat_score.mean():.4f}")
 top_stat = np.argsort(stat_score)[::-1][:10]
@@ -1315,8 +2031,203 @@ for idx in top_stat:
     print(f"    {gene_symbols[idx]:15s} score={stat_score[idx]:.4f}")
 
 # =============================================================================
+# 13bis. BASELINE GRAPHE SANS VAE — DeepWalk (random walks + skip-gram)
+# =============================================================================
+# OBJECTIF : isoler la contribution du VAE par rapport à la pure topologie
+# du graphe. On apprend des embeddings de gènes via des random walks
+# uniformes + skip-gram (word2vec) — on utilise la STRUCTURE du graphe mais :
+#   - pas de features de noeud (ignore gene_features)
+#   - pas de reconstruction probabiliste (pas de μ, pas de σ)
+#   - pas d'hétérogénéité de types d'arêtes (on aplatit tout)
+#
+# Si le ranking VGAE ≈ ranking DeepWalk → le VGAE n'apporte que la topologie,
+# pas le VAE (et pas les features). Si VGAE ≠ DeepWalk → le VAE + features
+# apportent quelque chose qu'on peut défendre en soutenance.
+#
+# NOTE : implémentation self-contained en pur PyTorch (pas de dépendance
+# torch-cluster, qui fournit normalement le C++ des random walks dans
+# PyG.Node2Vec). Walks uniformes = DeepWalk = Node2Vec(p=1, q=1).
+print("\n" + "=" * 70)
+print("13bis. Baseline DeepWalk (graphe sans VAE, sans features)")
+print("=" * 70)
+
+# Concaténer toutes les arêtes gène↔gène en un graphe homogène non orienté.
+_gene_edges_list = []
+for et in data.edge_types:
+    if et[0] == "gene" and et[2] == "gene":
+        ei = data[et].edge_index
+        if ei.numel() > 0:
+            _gene_edges_list.append(ei)
+_all_gene_ei = (torch.cat(_gene_edges_list, dim=1) if _gene_edges_list
+                else torch.zeros((2, 0), dtype=torch.long))
+# Symétrisation (random walks sur graphe non orienté)
+_all_gene_ei = torch.cat([_all_gene_ei, _all_gene_ei.flip(0)], dim=1)
+# Dédoublonnage des arêtes
+_u = torch.unique(_all_gene_ei.t(), dim=0).t()
+
+# --- Adjacence en format CSR pour échantillonner des voisins en vectoriel ---
+# adj_flat   : (E,) IDs des voisins, concaténés par noeud source
+# adj_offset : (n+1,) décalages → les voisins du noeud i sont
+#              adj_flat[adj_offset[i] : adj_offset[i+1]]
+# degrees    : (n,) nombre de voisins par noeud
+_src = _u[0].cpu().numpy()
+_dst = _u[1].cpu().numpy()
+# Tri par source pour construire CSR
+_sort_idx = np.argsort(_src, kind="stable")
+_src = _src[_sort_idx]
+_dst = _dst[_sort_idx]
+degrees = np.bincount(_src, minlength=n_genes).astype(np.int64)
+adj_offset = np.concatenate([[0], np.cumsum(degrees)]).astype(np.int64)
+adj_flat = torch.as_tensor(_dst, dtype=torch.long)
+adj_offset_t = torch.as_tensor(adj_offset, dtype=torch.long)
+degrees_t = torch.as_tensor(degrees, dtype=torch.long)
+n_isolated = int((degrees_t == 0).sum())
+print(f"  Graphe gène↔gène homogène : {n_genes} noeuds, "
+      f"{_u.shape[1]} arêtes (dédupliquées), {n_isolated} isolés")
+
+
+def _random_walk_step(current, adj_flat, adj_offset_t, degrees_t):
+    """Un pas de marche aléatoire uniforme, vectorisé.
+
+    Pour chaque noeud courant :
+      - si deg > 0 : tirer un voisin uniformément parmi adj
+      - si deg = 0 : rester sur place (pas de voisin disponible)
+    """
+    deg = degrees_t[current]                           # (B,)
+    rand = torch.rand(current.shape[0])                # (B,) ∈ [0,1)
+    # Index d'un voisin dans adj_flat = offset[node] + ⌊rand × deg⌋
+    safe_deg = deg.clamp(min=1)                         # évite div par 0
+    idx = (rand * safe_deg.float()).long().clamp(max=safe_deg - 1)
+    neighbor = adj_flat[adj_offset_t[current] + idx]   # (B,)
+    return torch.where(deg > 0, neighbor, current)
+
+
+def _random_walks(start_nodes, walk_length):
+    walks = torch.zeros(start_nodes.shape[0], walk_length, dtype=torch.long)
+    walks[:, 0] = start_nodes
+    for step in range(1, walk_length):
+        walks[:, step] = _random_walk_step(
+            walks[:, step - 1], adj_flat, adj_offset_t, degrees_t)
+    return walks
+
+
+# --- Hyperparamètres du skip-gram ---
+WALKS_PER_NODE = 10
+WALK_LENGTH = 20
+WINDOW = 5           # context_size=10 → fenêtre 5 de chaque côté
+NUM_NEG = 5          # négatifs tirés par paire positive
+N2V_EPOCHS = 5
+N2V_BATCH = 128
+N2V_LR = 0.01
+
+# --- Table des embeddings (une seule matrice, partagée center/context) ---
+n2v_emb_param = nn.Embedding(n_genes, LATENT_DIM)
+nn.init.uniform_(n2v_emb_param.weight,
+                 a=-0.5 / LATENT_DIM, b=0.5 / LATENT_DIM)
+n2v_optim = torch.optim.Adam(n2v_emb_param.parameters(), lr=N2V_LR)
+
+# Pré-calcul des offsets pour extraire les paires (center, context) d'un walk.
+# Pour chaque décalage j ∈ [-WINDOW, WINDOW] \ {0}, on récupère
+# (walks[:, i], walks[:, i+j]) pour tout i valide.
+_pair_offsets = [j for j in range(-WINDOW, WINDOW + 1) if j != 0]
+
+n2v_emb_param.train()
+for epoch in range(N2V_EPOCHS):
+    # Tous les noeuds de départ (répétés WALKS_PER_NODE fois), mélangés.
+    all_starts = torch.arange(n_genes).repeat_interleave(WALKS_PER_NODE)
+    all_starts = all_starts[torch.randperm(all_starts.shape[0])]
+
+    loss_sum = 0.0
+    n_batches = 0
+    for b in range(0, all_starts.shape[0], N2V_BATCH):
+        batch_starts = all_starts[b:b + N2V_BATCH]
+        walks = _random_walks(batch_starts, WALK_LENGTH)     # (B, L)
+
+        centers, contexts = [], []
+        for j in _pair_offsets:
+            i_start = max(0, -j)
+            i_end = WALK_LENGTH - max(0, j)
+            centers.append(walks[:, i_start:i_end].flatten())
+            contexts.append(walks[:, i_start + j:i_end + j].flatten())
+        centers = torch.cat(centers)                          # (P,)
+        contexts = torch.cat(contexts)
+        n_pairs = centers.shape[0]
+        if n_pairs == 0:
+            continue
+
+        # Négatifs : tirage uniforme sur {0,…,n_genes-1}.
+        neg = torch.randint(0, n_genes, (n_pairs, NUM_NEG))
+
+        u = n2v_emb_param(centers)                            # (P, D)
+        v_pos = n2v_emb_param(contexts)                       # (P, D)
+        v_neg = n2v_emb_param(neg)                            # (P, K, D)
+
+        pos_score = (u * v_pos).sum(dim=1)                    # (P,)
+        neg_score = torch.bmm(v_neg, u.unsqueeze(2)).squeeze(2)  # (P, K)
+        pos_loss = -F.logsigmoid(pos_score).mean()
+        neg_loss = -F.logsigmoid(-neg_score).mean()
+        loss = pos_loss + neg_loss
+
+        n2v_optim.zero_grad()
+        loss.backward()
+        n2v_optim.step()
+        loss_sum += float(loss)
+        n_batches += 1
+
+    avg = loss_sum / max(1, n_batches)
+    print(f"  DeepWalk epoch {epoch+1}/{N2V_EPOCHS} — "
+          f"loss_mean={avg:.4f} ({n_batches} batches)")
+
+n2v_emb_param.eval()
+n2v_emb = n2v_emb_param.weight.detach().cpu().numpy()         # (n_genes, LATENT_DIM)
+
+# Score par gène : norme + densité k-NN, même structure que vgae_importance
+# mais sans recon_fidelity / certainty / specificity (ne s'appliquent pas à
+# un modèle non probabiliste sans features).
+n2v_norm_raw = np.linalg.norm(n2v_emb, axis=1)
+n2v_norm_score = (n2v_norm_raw / (n2v_norm_raw.max() + 1e-8)).astype(np.float32)
+
+n2v_emb_normed = n2v_emb / (np.linalg.norm(n2v_emb, axis=1, keepdims=True) + 1e-8)
+_k = min(20, n_genes - 1)
+_knn_n2v = NearestNeighbors(n_neighbors=_k + 1, metric="cosine")
+_knn_n2v.fit(n2v_emb_normed)
+_d_n2v, _ = _knn_n2v.kneighbors(n2v_emb_normed)
+_d_n2v = _d_n2v[:, 1:]
+n2v_density_raw = 1.0 / (_d_n2v.mean(axis=1) + 1e-8)
+n2v_density_score = (n2v_density_raw / (n2v_density_raw.max() + 1e-8)).astype(np.float32)
+
+node2vec_score = ((n2v_norm_score + n2v_density_score) / 2.0).astype(np.float32)
+node2vec_score = node2vec_score / (node2vec_score.max() + 1e-8)
+
+print(f"  Score Node2Vec : mean={node2vec_score.mean():.4f}")
+top_n2v = np.argsort(node2vec_score)[::-1][:10]
+print(f"  Top 10 gènes (baseline Node2Vec) :")
+for idx in top_n2v:
+    print(f"    {gene_symbols[idx]:15s} score={node2vec_score[idx]:.4f}")
+
+# =============================================================================
 # 14. VALIDATION POST-HOC (BDD externes)
 # =============================================================================
+# OBJECTIF : vérifier que les gènes à haut score VGAE sont enrichis dans des
+# bases de données INDÉPENDANTES de vieillissement/sénescence.
+#
+# POINT CRUCIAL : ces bases de données ne sont JAMAIS utilisées dans
+# l'entraînement du VGAE. Elles ne servent qu'à ÉVALUER après coup (post-hoc).
+# Si les gènes à haut score VGAE sont surreprésentés dans GenAge/CellAge/etc.,
+# cela valide que le score capture quelque chose de biologiquement pertinent
+# pour la sénescence — sans circularité.
+#
+# 5 bases de données de validation :
+#   1. GenAge : gènes humains associés au vieillissement (organisme entier)
+#   2. CellAge : gènes associés à la sénescence cellulaire spécifiquement
+#   3. MSigDB aging : gene sets Hallmark liés au vieillissement (MSigDB)
+#   4. AgeAnno : DEGs du vieillissement en scRNA-seq (multi-tissus)
+#   5. Aging local : base locale de gènes liés à l'âge (custom)
+#
+# Test statistique : Mann-Whitney U unilatéral.
+#   H0 : les gènes de la BDD n'ont pas un score plus élevé que les autres
+#   H1 : les gènes de la BDD ont un score significativement plus élevé
+#   p < 0.05 → enrichissement significatif → le score capture le signal
 print("\n" + "=" * 70)
 print("14. Validation post-hoc (GenAge, CellAge, MSigDB, AgeAnno)")
 print("   → PAS utilisées dans l'entraînement, uniquement pour évaluer")
@@ -1403,7 +2314,14 @@ aging_local_symbols = set(aging_local["Symbol"].dropna())
 # score significativement plus élevé que les autres ?
 
 def evaluate_ranking(scores, score_name, gene_syms, databases):
-    """Évalue un ranking par enrichissement dans les BDD externes."""
+    """
+    Évalue un ranking par enrichissement dans les BDD externes.
+
+    Pour chaque base de données, on compare les scores des gènes IN (dans la BDD)
+    vs OUT (pas dans la BDD) avec un test de Mann-Whitney U unilatéral.
+    Si p < 0.05, les gènes de la BDD ont un score significativement plus élevé
+    → le score capture un signal pertinent pour cette BDD.
+    """
     print(f"\n  [{score_name}]")
     print(f"    {'Base':20s} {'In_graph':>9s} {'MeanScore_in':>13s} "
           f"{'MeanScore_out':>14s} {'U_pvalue':>10s} {'Enrichi':>8s}")
@@ -1448,11 +2366,23 @@ stat_results = evaluate_ranking(stat_score, "Baseline statistique (|ΔExpr|)",
 # =============================================================================
 # 15. VISUALISATIONS
 # =============================================================================
+# 3 figures principales :
+#   15a. Courbes d'entraînement (loss + AUC au fil des epochs)
+#        → vérifie la convergence et l'absence de collapse
+#   15b. PCA des embeddings (3 vues : score, clusters, BDD sénescence)
+#        → visualise la structure de l'espace latent en 2D
+#   15c. VGAE vs baseline statistique (scatter + violin)
+#        → identifie les candidats de découverte (haut VGAE, bas stat)
 print("\n" + "=" * 70)
 print("15. Visualisations")
 print("=" * 70)
 
 # ── 15a. Loss et AUC d'entraînement ─────────────────────────────────────────
+# Panneau gauche : loss totale (reconstruction + KL) au fil des epochs.
+#   La loss devrait diminuer puis se stabiliser.
+# Panneau droit : AUC test au fil des epochs.
+#   AUC > 0.9 = bonne reconstruction, ~0.5 = collapse.
+#   La ligne verte (MLP baseline) montre le niveau atteignable sans graphe.
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
 axes[0].plot(train_losses, color="#3498DB", alpha=0.8)
@@ -1479,6 +2409,13 @@ plt.close(fig)
 print("  → vgae_training.png")
 
 # ── 15b. PCA des embeddings ─────────────────────────────────────────────────
+# PCA 2D sur les embeddings 64D pour visualisation.
+# Les embeddings sont dans un espace de haute dimension (latent_dim=64) —
+# la PCA projette sur les 2 axes de plus grande variance.
+# 3 sous-figures :
+#   Gauche : coloré par score d'importance → les gènes rouges sont les plus importants
+#   Centre : coloré par cluster K-means → structure fonctionnelle
+#   Droite : gènes des BDD de sénescence en rouge → vérification visuelle
 pca = PCA_sk(n_components=2)
 gene_pca = pca.fit_transform(gene_emb)
 
@@ -1525,12 +2462,22 @@ plt.close(fig)
 print("  → vgae_embeddings.png")
 
 # ── 15c. Comparaison des scores VGAE vs stat ────────────────────────────────
+# Figure clé pour identifier les "candidats de découverte".
+# Panneau gauche : scatter VGAE (y) vs stat (x).
+#   - Diagonale : gènes identifiés par les deux approches (concordance)
+#   - QUADRANT HAUT-GAUCHE : haut VGAE + bas stat → candidats de découverte
+#     Ce sont des gènes que l'approche statistique simple (|ΔExpr|) ne
+#     trouverait pas, mais que le VGAE identifie grâce à leur rôle dans
+#     le réseau biologique. C'est la plus-value principale du VGAE.
+#   - Quadrant bas-droite : haut stat + bas VGAE → gènes très dérégulés
+#     mais pas centraux dans le réseau (housekeeping dérégulés, etc.)
+# Panneau droit : violin plot du score VGAE par BDD de validation.
 fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-# Scatter VGAE vs stat
+# Scatter VGAE vs stat (tous les gènes en bleu)
 axes[0].scatter(stat_score, importance_score, s=5, alpha=0.3,
                 c="#3498DB", rasterized=True)
-# Marquer les gènes des BDD
+# Surligner les gènes des BDD de sénescence en rouge
 for g_idx in range(n_genes):
     if any(gene_symbols[g_idx] in db for _, db in databases):
         axes[0].scatter(stat_score[g_idx], importance_score[g_idx],
@@ -1540,11 +2487,16 @@ axes[0].set_ylabel("Score VGAE (émergent)")
 axes[0].set_title("VGAE vs Baseline statistique")
 axes[0].grid(True, alpha=0.3)
 
-# Les gènes intéressants = haut VGAE mais bas statistique (quadrant haut-gauche)
+# Définition des candidats de découverte :
+#   - haut VGAE = top 10% (percentile 90)
+#   - bas stat = bottom 50% (médiane)
+# Les gènes dans cette zone sont détectés par le VGAE MAIS PAS par la
+# méthode statistique simple → découvertes potentielles.
 high_vgae = importance_score > np.percentile(importance_score, 90)
 low_stat = stat_score < np.percentile(stat_score, 50)
 discovery_candidates = high_vgae & low_stat
 n_disc = discovery_candidates.sum()
+# Lignes pointillées délimitant le quadrant de découverte
 axes[0].axhline(np.percentile(importance_score, 90), color="red", ls=":", alpha=0.5)
 axes[0].axvline(np.percentile(stat_score, 50), color="red", ls=":", alpha=0.5)
 axes[0].annotate(f"Candidats de\ndécouverte\n(n={n_disc})",
@@ -1582,48 +2534,70 @@ print("  → vgae_vs_baseline.png")
 # =============================================================================
 # 16. EXPORT DES RÉSULTATS
 # =============================================================================
+# 3 fichiers de sortie principaux :
+#   1. gene_ranking_vgae.csv : tableau complet (1 ligne par gène) avec tous
+#      les scores, rangs, clusters, et annotations BDD. C'est le fichier
+#      principal utilisé par perturb_top_genes.py pour sélectionner les
+#      gènes à perturber in silico.
+#   2. gene_embeddings_vgae.csv : embeddings bruts μ (n_genes × latent_dim).
+#      Utilisés par gnn_perturbation.py pour charger le modèle et calculer
+#      les effets des perturbations.
+#   3. vgae_weights.pt : poids du modèle PyTorch (encoder + décodeur τ).
+#      Utilisés par gnn_perturbation.py pour reconstruire le modèle et
+#      simuler des perturbations (knockdown, knockout, overexpress).
 print("\n" + "=" * 70)
 print("16. Export des résultats")
 print("=" * 70)
 
 results = pd.DataFrame({"gene": gene_symbols})
 
-# Scores
-results["vgae_importance"] = importance_score
-results["vgae_emb_norm"] = emb_norm_score
-results["vgae_density"] = density_score
-results["vgae_recon_fidelity"] = 1 - recon_error_score
-results["vgae_certainty"] = 1 - uncertainty_score
-results["vgae_specificity"] = specificity_score
-results["stat_score"] = stat_score
-results["cluster"] = gene_clusters
+# --- Scores (les 5 composantes + le composite + la baseline statistique) ---
+results["vgae_importance"] = importance_score       # Score composite final
+results["vgae_emb_norm"] = emb_norm_score           # Composante 1 : norme μ
+results["vgae_density"] = density_score             # Composante 2 : densité k-NN
+results["vgae_recon_fidelity"] = 1 - recon_error_score  # Composante 3 : 1-erreur
+results["vgae_certainty"] = 1 - uncertainty_score   # Composante 4 : 1-σ
+results["vgae_specificity"] = specificity_score     # Composante 5 : spécificité
+results["stat_score"] = stat_score                  # Baseline 1 : |ΔExpr P16-P4|
+results["mlp_score"] = mlp_gene_score               # Baseline 2 : MLP sans graphe (features only)
+results["node2vec_score"] = node2vec_score          # Baseline 3 : Node2Vec (graphe sans VAE, sans features)
+results["cluster"] = gene_clusters                  # Cluster K-means (0 à N_CLUSTERS-1)
 
-# Rang
+# --- Rangs (pour faciliter les comparaisons entre runs) ---
 results["rank_vgae"] = results["vgae_importance"].rank(ascending=False).astype(int)
 results["rank_stat"] = results["stat_score"].rank(ascending=False).astype(int)
+results["rank_mlp"] = results["mlp_score"].rank(ascending=False).astype(int)
+results["rank_node2vec"] = results["node2vec_score"].rank(ascending=False).astype(int)
 
-# Candidats de découverte (haut VGAE, bas statistique)
+# --- Candidats de découverte (haut VGAE, bas statistique) ---
+# Flag binaire : 1 si le gène est dans le quadrant haut-gauche du scatter
 results["discovery_candidate"] = discovery_candidates.astype(int)
 
-# BDD
+# --- Annotations BDD de validation (binaire, 0 ou 1) ---
+# Permet de vérifier rapidement si un gène du top ranking est déjà connu
+# dans les bases de sénescence/vieillissement.
 results["in_genage"] = [1 if g in genage_symbols else 0 for g in gene_symbols]
 results["in_cellage"] = [1 if g in cellage_symbols else 0 for g in gene_symbols]
 results["in_msigdb_aging"] = [1 if g in msigdb_aging_genes else 0 for g in gene_symbols]
 results["in_ageanno"] = [1 if g in ageanno_genes else 0 for g in gene_symbols]
 results["in_aging_local"] = [1 if g in aging_local_symbols else 0 for g in gene_symbols]
+# n_databases : nombre de BDD dans lesquelles le gène apparaît (0-5)
+# Un gène dans 5/5 BDD est un gène de sénescence "classique" bien validé.
+# Un gène dans 0/5 BDD mais avec un haut score VGAE est une découverte potentielle.
 results["n_databases"] = results[["in_genage", "in_cellage", "in_msigdb_aging",
                                    "in_ageanno", "in_aging_local"]].sum(axis=1)
 
+# Tri par score d'importance décroissant (les gènes les plus importants en premier)
 results = results.sort_values("vgae_importance", ascending=False)
 results.to_csv(os.path.join(OUT_DIR, "gene_ranking_vgae.csv"), index=False)
 print(f"  → gene_ranking_vgae.csv ({len(results)} gènes)")
 
-# Embeddings
+# Embeddings bruts (matrice n_genes × latent_dim) — index = symboles de gènes
 emb_df = pd.DataFrame(gene_emb, index=gene_symbols)
 emb_df.to_csv(os.path.join(OUT_DIR, "gene_embeddings_vgae.csv"))
 print(f"  → gene_embeddings_vgae.csv ({gene_emb.shape})")
 
-# Modèle
+# Poids du modèle PyTorch (pour réutilisation dans les perturbations)
 torch.save(model.state_dict(), os.path.join(OUT_DIR, "vgae_weights.pt"))
 print("  → vgae_weights.pt")
 
