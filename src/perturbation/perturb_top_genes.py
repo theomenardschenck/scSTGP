@@ -97,6 +97,12 @@ def flatten_summary(target_type: str, target: str,
     list-valued fields (top5_delta_pathways, targets_missing) with ';'.
     """
     shift = summary.get("cell_group_shift_relative", {}) or {}
+    shift_gw = summary.get("cell_group_shift_gene_weighted", {}) or {}
+    shift_gw_norm = summary.get("cell_group_shift_gene_weighted_norm", {}) or {}
+    shift_gw_diff = summary.get("cell_group_shift_gene_differential", {}) or {}
+    shift_gw_direct = summary.get("cell_group_shift_gene_direct_target", {}) or {}
+    proj_global = summary.get("cell_group_shift_projected_global", {}) or {}
+    proj_cluster = summary.get("cell_group_shift_projected_cluster", {}) or {}
     row = {
         "target_type": target_type,
         "target": target,
@@ -116,11 +122,39 @@ def flatten_summary(target_type: str, target: str,
         "n_sig_delta_pathways": summary.get("n_sig_delta_pathways"),
         "top5_delta_pathways": ";".join(
             summary.get("top5_delta_pathways", []) or []),
+        # Ancienne méthode (cell_group hidden).
         "max_shift_group": summary.get("max_shift_group"),
         "max_shift_relative": summary.get("max_shift_relative"),
+        # Nouvelle méthode (gene-weighted). L'indicateur principal est
+        # max_shift_gene_differential* : c'est le groupe le plus
+        # spécifiquement affecté par la perturbation, après retrait du biais
+        # housekeeping.
+        "max_shift_gene_differential_group":
+            summary.get("max_shift_gene_differential_group"),
+        "max_shift_gene_differential":
+            summary.get("max_shift_gene_differential"),
+        # Option 2 : shift SIGNÉ (projection sur axe sénescence).
+        "max_proj_signed_diff_group": summary.get("max_proj_signed_diff_group"),
+        "max_proj_signed_diff": summary.get("max_proj_signed_diff"),
     }
     for grp in CELL_GROUPS:
         row[f"shift_{grp}"] = shift.get(grp)
+        row[f"shift_gene_weighted_{grp}"] = shift_gw.get(grp)
+        row[f"shift_gene_weighted_norm_{grp}"] = shift_gw_norm.get(grp)
+        row[f"shift_gene_differential_{grp}"] = shift_gw_diff.get(grp)
+        row[f"shift_gene_direct_target_{grp}"] = shift_gw_direct.get(grp)
+        # Projections globales (un seul axe global pour tous les groupes).
+        if grp in proj_global:
+            proj_data = proj_global[grp]
+            row[f"proj_signed_global_{grp}"] = proj_data.get("proj_signed")
+            row[f"proj_signed_norm_global_{grp}"] = proj_data.get("proj_signed_norm")
+            row[f"proj_signed_diff_global_{grp}"] = proj_data.get("proj_signed_diff")
+        # Projections par cluster P16 (ignorées pour P4).
+        if grp in proj_cluster:
+            proj_data = proj_cluster[grp]
+            row[f"proj_signed_cluster_{grp}"] = proj_data.get("proj_signed")
+            row[f"proj_signed_norm_cluster_{grp}"] = proj_data.get("proj_signed_norm")
+            row[f"proj_signed_diff_cluster_{grp}"] = proj_data.get("proj_signed_diff")
     return row
 
 
@@ -133,23 +167,27 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
     """
     # Local import — gnn_perturbation needs torch + PyG which are heavy.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from gnn_perturbation import (  # noqa: E402
+    from gnn_huvec.src.gnn.gnn_perturbation import (  # noqa: E402
         load_run, prepare_baseline,
         load_reactome_gmt as _load_gmt,
         load_background as _load_bg,
     )
-    data, model, gene_symbols, gene_to_idx, baseline = load_run(
+    data, model, gene_symbols, gene_to_idx, baseline, group_expr = load_run(
         run_dir, hidden, latent, n_layers, n_heads)
-    spec, base_imp, base_rank, z_cg_base = prepare_baseline(
-        model, data, baseline, gene_symbols)
+    spec, base_imp, base_rank, z_cg_base, mu_base, axis_global, axes_cluster = prepare_baseline(
+        model, data, baseline, gene_symbols, group_expr)
     reactome = _load_gmt()
     background = _load_bg()
-    print(f"Loaded run ({len(gene_symbols)} genes); baseline computed.")
+    print(f"Loaded run ({len(gene_symbols)} genes); baseline computed; "
+          f"group_expression={'OK' if group_expr is not None else 'absent'}; "
+          f"axes={'OK' if axis_global is not None else 'absent'}.")
     return {
         "data": data, "model": model,
         "gene_symbols": gene_symbols, "gene_to_idx": gene_to_idx,
         "spec": spec, "base_imp": base_imp,
         "base_rank": base_rank, "z_cg_base": z_cg_base,
+        "mu_base": mu_base, "group_expr": group_expr,
+        "axis_global": axis_global, "axes_cluster": axes_cluster,
         "reactome": reactome, "background": background,
     }
 
@@ -158,7 +196,7 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                   top_k: int, fdr: float, out_tsv: Path,
                   reactome_for_pw: dict | None = None) -> None:
     """Perturb every gene in the graph, every mode, into a single TSV."""
-    from gnn_perturbation import run_perturbation_once  # local import
+    from gnn_huvec.src.gnn.gnn_perturbation import run_perturbation_once  # local import
     gene_symbols = ctx["gene_symbols"]
     n_total = len(gene_symbols) * len(modes)
     print(f"\n[ALL GENES] {len(gene_symbols)} genes × {len(modes)} modes "
@@ -173,10 +211,12 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                 ctx["model"], ctx["data"],
                 gene_symbols, ctx["gene_to_idx"],
                 ctx["spec"], ctx["base_imp"],
-                ctx["base_rank"], ctx["z_cg_base"],
+                ctx["base_rank"], ctx["z_cg_base"], ctx["mu_base"],
                 targets=[str(gene)], mode=mode, factor=factor,
                 top_k=top_k, fdr=fdr,
                 reactome=ctx["reactome"], background=ctx["background"],
+                group_expr=ctx["group_expr"],
+                axis_global=ctx["axis_global"], axes_cluster=ctx["axes_cluster"],
                 out_dir=None)
             if summary is None:
                 continue
@@ -196,7 +236,7 @@ def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
                      top_k: int, fdr: float, out_tsv: Path,
                      pw_min_size: int, pw_max_size: int) -> None:
     """Perturb every REACTOME pathway (within size bounds) in a single TSV."""
-    from gnn_perturbation import run_perturbation_once
+    from gnn_huvec.src.gnn.gnn_perturbation import run_perturbation_once
     reactome = ctx["reactome"]
     pathways = [
         (name, sorted(members))
@@ -218,10 +258,12 @@ def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
                 ctx["model"], ctx["data"],
                 ctx["gene_symbols"], ctx["gene_to_idx"],
                 ctx["spec"], ctx["base_imp"],
-                ctx["base_rank"], ctx["z_cg_base"],
+                ctx["base_rank"], ctx["z_cg_base"], ctx["mu_base"],
                 targets=list(members), mode=mode, factor=factor,
                 top_k=top_k, fdr=fdr,
                 reactome=ctx["reactome"], background=ctx["background"],
+                group_expr=ctx["group_expr"],
+                axis_global=ctx["axis_global"], axes_cluster=ctx["axes_cluster"],
                 out_dir=None)
             if summary is None:
                 continue

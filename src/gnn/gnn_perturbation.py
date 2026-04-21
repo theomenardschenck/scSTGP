@@ -260,6 +260,8 @@ def compute_importance(model, data, baseline_specificity):
         "density": density_score.astype(np.float32),
         "recon_fidelity": (1.0 - recon_err_score).astype(np.float32),
         "certainty": (1.0 - uncertainty_score).astype(np.float32),
+        "mu": mu_np.astype(np.float32),   # (n_genes, latent_dim) — requis par
+                                           # cell_group_shift_gene_weighted()
     }
 
 
@@ -339,6 +341,247 @@ def cell_group_shift(z_base: torch.Tensor,
 
 
 # --------------------------------------------------------------------------- #
+# Shift au niveau gène, pondéré par l'expression (nouvelle méthode).
+# --------------------------------------------------------------------------- #
+def cell_group_shift_gene_weighted(mu_base: np.ndarray,
+                                    mu_pert: np.ndarray,
+                                    group_expr: pd.DataFrame,
+                                    gene_symbols: np.ndarray,
+                                    target_idx: torch.Tensor,
+                                    group_names=CELL_GROUPS) -> pd.DataFrame:
+    """Shift par cell_group mesuré au niveau GÈNE, pondéré par l'expression.
+
+    Pour chaque groupe c, on calcule :
+
+        shift_weighted[c]       = Σᵢ∉T  expr_c[i] · ‖Δzᵢ‖₂
+        shift_weighted_norm[c]  = shift_weighted[c] / Σᵢ∉T expr_c[i]
+        shift_differential[c]   = Σᵢ∉T  max(0, expr_c[i] − meanₘ expr_m[i]) · ‖Δzᵢ‖₂
+        direct_target_contrib[c]= Σᵢ∈T  expr_c[i] · ‖Δzᵢ‖₂   (sanity)
+
+    où T = gènes cibles (exclus pour ne pas noyer le signal, risque 1), Δzᵢ = mu_base[i] − mu_pert[i].
+
+    Pourquoi ces 4 colonnes :
+      - shift_weighted       : magnitude brute — dépend du voisinage de la cible.
+      - shift_weighted_norm  : comparable entre KO de gènes différents (risque 4).
+      - shift_differential   : isole ce qui est spécifique au groupe (risque 2 :
+                               gomme l'effet housekeeping en soustrayant la
+                               moyenne inter-groupe ; clippé à 0 pour rester positif).
+      - direct_target_contrib: trace la contribution de la cible elle-même,
+                               utile pour vérifier qu'elle ne domine pas.
+
+    Args:
+        mu_base    : (n_genes, latent) embedding baseline.
+        mu_pert    : (n_genes, latent) embedding post-perturbation.
+        group_expr : DataFrame avec colonnes 'gene' + 'mean_<group>' pour chaque
+                     group_name. Chargé depuis group_expression.tsv.
+        gene_symbols : (n_genes,) symboles, ordre = nodes du graphe.
+        target_idx : tensor des indices des gènes cibles (à exclure).
+
+    Returns:
+        DataFrame (1 ligne par groupe) avec les 4 métriques + baseline_expr_sum
+        (somme totale d'expression dans le groupe, hors cibles — dénominateur
+        utilisé pour shift_weighted_norm).
+    """
+    assert mu_base.shape == mu_pert.shape, (mu_base.shape, mu_pert.shape)
+    n_genes = mu_base.shape[0]
+    # Ré-aligner group_expr sur l'ordre des gene_symbols du graphe.
+    expr_by_gene = group_expr.set_index("gene")
+    missing = [g for g in gene_symbols if g not in expr_by_gene.index]
+    if missing:
+        print(f"[warn] {len(missing)} gene(s) absent de group_expression.tsv "
+              f"— leur expression sera 0 : {missing[:5]}...")
+    expr_by_gene = expr_by_gene.reindex(gene_symbols).fillna(0.0)
+
+    # Matrice (n_genes, n_groups) des moyennes d'expression brutes.
+    expr = np.stack([
+        expr_by_gene[f"mean_{g}"].to_numpy().astype(np.float32)
+        for g in group_names
+    ], axis=1)
+
+    # Expression différentielle : expr_c[i] − moyenne_sur_groupes(expr[i]),
+    # clippée à 0 (risque 2 : un gène moins exprimé qu'ailleurs dans le
+    # groupe c ne doit PAS pondérer négativement, on l'ignore simplement).
+    expr_mean_over_groups = expr.mean(axis=1, keepdims=True)
+    expr_diff = np.clip(expr - expr_mean_over_groups, 0.0, None)
+
+    delta_z = np.linalg.norm(mu_base - mu_pert, axis=1).astype(np.float32)
+
+    # Masque non-cible (risque 1 : exclure la cible pour ne pas noyer le signal).
+    mask_non_target = np.ones(n_genes, dtype=bool)
+    t_np = target_idx.cpu().numpy() if isinstance(target_idx, torch.Tensor) else np.asarray(target_idx)
+    if t_np.size > 0:
+        mask_non_target[t_np] = False
+
+    rows = []
+    for c_idx, grp in enumerate(group_names):
+        w = expr[:, c_idx]
+        w_diff = expr_diff[:, c_idx]
+        w_nt = w[mask_non_target]
+        dz_nt = delta_z[mask_non_target]
+
+        shift_w = float((w_nt * dz_nt).sum())
+        total_w = float(w_nt.sum())
+        shift_w_norm = shift_w / (total_w + 1e-8)
+        shift_diff = float((w_diff[mask_non_target] * dz_nt).sum())
+        direct = float((w[~mask_non_target] * delta_z[~mask_non_target]).sum())
+
+        rows.append({
+            "group": grp,
+            "shift_weighted": shift_w,
+            "shift_weighted_norm": shift_w_norm,
+            "shift_differential": shift_diff,
+            "direct_target_contrib": direct,
+            "baseline_expr_sum": total_w,
+        })
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
+# Axes sénescence (option 2 : projection signée P4 -> P16).
+# --------------------------------------------------------------------------- #
+def compute_senescence_axes(mu_base: np.ndarray,
+                             group_expr: pd.DataFrame,
+                             gene_symbols: np.ndarray,
+                             p4_group: str = "P4",
+                             p16_groups=("P16_cluster_0", "P16_cluster_1",
+                                         "P16_cluster_2", "P16_cluster_3")):
+    """Axes P4 -> P16 dans l'espace latent des gènes (unitaires).
+
+    Centroïdes pondérés par l'expression :
+        c_g = Σᵢ expr_g[i] · μ_base[i]  /  Σᵢ expr_g[i]
+
+    Axes :
+        axis_global           = unit( mean_k c_{P16_k}  −  c_{P4} )
+        axes_cluster[P16_k]   = unit( c_{P16_k}  −  c_{P4} )          pour chaque k
+
+    L'axe global est plus robuste (moyenne sur 4 clusters) ; les axes par
+    cluster capturent des directions spécifiques à chaque sous-état sénescent.
+
+    Returns:
+        axis_global  : (latent_dim,) unit vector
+        axes_cluster : dict[cluster_name -> (latent_dim,) unit vector]
+        centers      : dict[group_name -> (latent_dim,)] pour inspection
+    """
+    expr_by_gene = group_expr.set_index("gene").reindex(gene_symbols).fillna(0.0)
+    centers: dict[str, np.ndarray] = {}
+    for g in [p4_group, *p16_groups]:
+        w = expr_by_gene[f"mean_{g}"].to_numpy().astype(np.float32)
+        w_sum = float(w.sum()) + 1e-8
+        centers[g] = (w[:, None] * mu_base).sum(axis=0) / w_sum
+
+    def unit(v: np.ndarray, name: str) -> np.ndarray:
+        n = float(np.linalg.norm(v))
+        if n < 1e-6:
+            print(f"[warn] axis '{name}' almost zero (‖·‖={n:.2e}) — "
+                  "P4 et P16 confondus dans le latent ? Projection peu fiable.")
+        return (v / (n + 1e-8)).astype(np.float32)
+
+    p16_mean = np.mean(np.stack([centers[g] for g in p16_groups]), axis=0)
+    axis_global = unit(p16_mean - centers[p4_group], "global")
+    axes_cluster = {
+        g: unit(centers[g] - centers[p4_group], g) for g in p16_groups
+    }
+    return axis_global, axes_cluster, centers
+
+
+def cell_group_shift_projected(mu_base: np.ndarray,
+                                mu_pert: np.ndarray,
+                                group_expr: pd.DataFrame,
+                                gene_symbols: np.ndarray,
+                                target_idx: torch.Tensor,
+                                axis_global: np.ndarray,
+                                axes_cluster: dict,
+                                group_names=CELL_GROUPS) -> pd.DataFrame:
+    """Shift SIGNÉ : projection de Δzᵢ sur les axes sénescence P4 -> P16.
+
+    Δzᵢ = μ_pert[i] − μ_base[i].
+
+    Pour chaque groupe c et chaque axe u ∈ {axis_global, axis_cluster_k (si k=c)} :
+
+        proj_signed[c, u]        = Σᵢ∉T  expr_c[i] · (Δzᵢ · u)
+        proj_signed_norm[c, u]   = proj_signed / Σᵢ∉T expr_c[i]
+        proj_signed_diff[c, u]   = Σᵢ∉T  max(0, expr_c[i] − meanₘ expr_m[i]) · (Δzᵢ · u)
+        proj_direct_target[c, u] = Σᵢ∈T  expr_c[i] · (Δzᵢ · u)    (sanity)
+
+    Convention de signe :
+      * proj > 0  → la perturbation pousse les gènes VERS P16 (pro-sénescent).
+                    Cible = frein levé → accélération de la sénescence.
+      * proj < 0  → pousse VERS P4 (anti-sénescent).
+                    Cible = moteur supprimé → reversion partielle.
+      * |proj| ≈ 0 → pas de déplacement net dans cette direction.
+
+    Colonnes renvoyées : 'group', 'axis_type' ∈ {global, cluster}, et
+    les 4 métriques + baseline_expr_sum. L'axe 'cluster' n'est défini que
+    pour les clusters P16 (pas de ligne axis_type='cluster' pour P4).
+
+    Args:
+        axis_global  : sortie de compute_senescence_axes().
+        axes_cluster : idem (dict par cluster P16).
+    """
+    assert mu_base.shape == mu_pert.shape, (mu_base.shape, mu_pert.shape)
+    delta_z_vec = (mu_pert - mu_base).astype(np.float32)   # (n_genes, latent)
+
+    expr_by_gene = group_expr.set_index("gene").reindex(gene_symbols).fillna(0.0)
+    expr = np.stack([
+        expr_by_gene[f"mean_{g}"].to_numpy().astype(np.float32)
+        for g in group_names
+    ], axis=1)
+    expr_mean_over_groups = expr.mean(axis=1, keepdims=True)
+    expr_diff = np.clip(expr - expr_mean_over_groups, 0.0, None)
+
+    n_genes = mu_base.shape[0]
+    mask_non_target = np.ones(n_genes, dtype=bool)
+    t_np = target_idx.cpu().numpy() if isinstance(target_idx, torch.Tensor) else np.asarray(target_idx)
+    if t_np.size > 0:
+        mask_non_target[t_np] = False
+
+    rows = []
+
+    # --- Axe global : même u pour tous les groupes, mais pondération par expr_c.
+    proj_global = delta_z_vec @ axis_global     # (n_genes,)
+    for c_idx, grp in enumerate(group_names):
+        w = expr[:, c_idx]
+        w_diff = expr_diff[:, c_idx]
+        w_nt = w[mask_non_target]
+        p_nt = proj_global[mask_non_target]
+        total_w = float(w_nt.sum())
+        rows.append({
+            "group": grp,
+            "axis_type": "global",
+            "proj_signed":             float((w_nt * p_nt).sum()),
+            "proj_signed_norm":        float((w_nt * p_nt).sum()) / (total_w + 1e-8),
+            "proj_signed_differential": float((w_diff[mask_non_target] * p_nt).sum()),
+            "proj_direct_target":      float((w[~mask_non_target] *
+                                              proj_global[~mask_non_target]).sum()),
+            "baseline_expr_sum":       total_w,
+        })
+
+    # --- Axe par cluster : u_k pour chaque cluster P16, pondéré par expr_{cluster_k}.
+    for cluster_name, axis_k in axes_cluster.items():
+        if cluster_name not in group_names:
+            continue
+        c_idx = group_names.index(cluster_name)
+        proj_k = delta_z_vec @ axis_k
+        w = expr[:, c_idx]
+        w_diff = expr_diff[:, c_idx]
+        w_nt = w[mask_non_target]
+        p_nt = proj_k[mask_non_target]
+        total_w = float(w_nt.sum())
+        rows.append({
+            "group": cluster_name,
+            "axis_type": "cluster",
+            "proj_signed":              float((w_nt * p_nt).sum()),
+            "proj_signed_norm":         float((w_nt * p_nt).sum()) / (total_w + 1e-8),
+            "proj_signed_differential": float((w_diff[mask_non_target] * p_nt).sum()),
+            "proj_direct_target":       float((w[~mask_non_target] *
+                                               proj_k[~mask_non_target]).sum()),
+            "baseline_expr_sum":        total_w,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
 # Run loader.
 # --------------------------------------------------------------------------- #
 def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
@@ -347,6 +590,16 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
     emb_df = pd.read_csv(run_dir / "gene_embeddings_vgae.csv", index_col=0)
     gene_symbols = np.array(emb_df.index.astype(str))
     gene_to_idx = {g: i for i, g in enumerate(gene_symbols)}
+
+    # Expression par groupe (optionnel — requis pour le shift gene-weighted).
+    # Si absent (runs pré-V3.3), on fallback : le shift gene-weighted sera sauté.
+    group_expr_path = run_dir / "group_expression.tsv"
+    if group_expr_path.exists():
+        group_expr = pd.read_csv(group_expr_path, sep="\t")
+    else:
+        print(f"[warn] {group_expr_path.name} absent — le shift gene-weighted "
+              "sera sauté (relancer gnn_vgae.py pour le régénérer).")
+        group_expr = None
 
     encoder = HeteroEncoder(
         gene_in=data["gene"].x.shape[1],
@@ -359,20 +612,23 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
         state_path = run_dir / "vgae_weights.pt"
     model.load_state_dict(torch.load(state_path, weights_only=True))
     model.eval()
-    return data, model, gene_symbols, gene_to_idx, baseline
+    return data, model, gene_symbols, gene_to_idx, baseline, group_expr
 
 
 # --------------------------------------------------------------------------- #
 # Reusable API — called both by main() and by perturb_top_genes.py (--all-*).
 # --------------------------------------------------------------------------- #
-def prepare_baseline(model, data, baseline_df, gene_symbols):
+def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None):
     """Compute the baseline once; reused across many perturbations.
 
     Returns:
-        spec       : (n_genes,) baseline vgae_specificity aligned on node idx.
-        base_imp   : (n_genes,) composite baseline importance.
-        base_rank  : (n_genes,) ordinal rank of base_imp (1 = best).
-        z_cg_base  : (5, hidden) cell_group hidden states from the baseline pass.
+        spec         : (n_genes,) baseline vgae_specificity aligned on node idx.
+        base_imp     : (n_genes,) composite baseline importance.
+        base_rank    : (n_genes,) ordinal rank of base_imp (1 = best).
+        z_cg_base    : (5, hidden) cell_group hidden states from the baseline pass.
+        mu_base      : (n_genes, latent) embedding baseline — shift gene-weighted.
+        axis_global  : (latent,) axe sénescence P4 -> mean(P16). None si group_expr absent.
+        axes_cluster : dict[P16_cluster_k -> (latent,)] axes par cluster. None idem.
     """
     spec_map = dict(zip(baseline_df["gene"].astype(str),
                         baseline_df["vgae_specificity"].astype(float)))
@@ -382,13 +638,26 @@ def prepare_baseline(model, data, baseline_df, gene_symbols):
     base_imp = base["importance"]
     base_rank = rankdata(-base_imp, method="ordinal").astype(int)
     z_cg_base = model.encoder.last_cell_group_h.clone()
-    return spec, base_imp, base_rank, z_cg_base
+    mu_base = base["mu"]
+
+    # Axes sénescence (option 2). Invariants sur toutes les perturbations —
+    # calculés une fois à partir de mu_base + expression par groupe.
+    if group_expr is not None:
+        axis_global, axes_cluster, _centers = compute_senescence_axes(
+            mu_base, group_expr, gene_symbols)
+        print(f"  axis_global ‖·‖ pre-unit = {np.linalg.norm(axis_global):.4f} "
+              f"(1.0 attendu post-normalisation)")
+    else:
+        axis_global, axes_cluster = None, None
+
+    return spec, base_imp, base_rank, z_cg_base, mu_base, axis_global, axes_cluster
 
 
 def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
-                          spec, base_imp, base_rank, z_cg_base,
+                          spec, base_imp, base_rank, z_cg_base, mu_base,
                           targets, mode, factor, top_k, fdr,
-                          reactome, background,
+                          reactome, background, group_expr=None,
+                          axis_global=None, axes_cluster=None,
                           out_dir=None, write_full=True):
     """Run a single perturbation and return its summary dict.
 
@@ -396,10 +665,14 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
         targets     : list[str] gene symbols to perturb (pre-dedup).
         mode        : "knockdown" | "knockout" | "overexpress".
         factor      : multiplier for overexpress (ignored otherwise).
+        mu_base     : (n_genes, latent) embedding baseline (from prepare_baseline).
+        group_expr  : DataFrame loaded from group_expression.tsv, or None.
+                      Requis pour le shift gene-weighted ; si None → sauté.
         out_dir     : if None, write nothing (in-memory only).
                       if set, always write summary.json.
         write_full  : if True AND out_dir set, also write delta_ranking.csv,
-                      delta_ora_top_up_reactome.tsv, cell_group_shift.tsv.
+                      delta_ora_top_up_reactome.tsv, cell_group_shift.tsv,
+                      and (when group_expr disponible) cell_group_shift_gene.tsv.
 
     Returns:
         summary (dict) or None if no target is present in the graph.
@@ -416,10 +689,30 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
     pert_imp = pert["importance"]
     pert_rank = rankdata(-pert_imp, method="ordinal").astype(int)
     z_cg_pert = model.encoder.last_cell_group_h.clone()
+    mu_pert = pert["mu"]
 
+    # --- Ancienne méthode : shift sur le hidden cell_group (conservée en
+    # comparaison méthodologique). Signal dilué par l'agrégation + BatchNorm.
     shift_df = cell_group_shift(z_cg_base, z_cg_pert)
     shift_map = dict(zip(shift_df["group"], shift_df["shift_relative"]))
     max_shift_row = shift_df.loc[shift_df["shift_relative"].idxmax()]
+
+    # --- Nouvelle méthode : shift au niveau gène pondéré par expression.
+    # Attendu : signal ×100-×1000, discrimine mieux les groupes.
+    shift_gene_df = None
+    if group_expr is not None:
+        shift_gene_df = cell_group_shift_gene_weighted(
+            mu_base, mu_pert, group_expr, gene_symbols, target_idx)
+
+    # --- Option 2 : shift SIGNÉ par projection sur l'axe P4 -> P16.
+    # Magnitude + direction (pro / anti-sénescence). Deux axes : global
+    # (moyenne P16) et par cluster (spécifique à chaque sous-état P16).
+    shift_proj_df = None
+    if (group_expr is not None and axis_global is not None
+            and axes_cluster is not None):
+        shift_proj_df = cell_group_shift_projected(
+            mu_base, mu_pert, group_expr, gene_symbols, target_idx,
+            axis_global, axes_cluster)
 
     delta_rank = base_rank - pert_rank
     delta_imp = pert_imp - base_imp
@@ -463,10 +756,71 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
         "n_sig_delta_pathways": sig,
         "fdr_threshold": fdr,
         "top5_delta_pathways": [r.pathway for r in rows[:5]],
+        # --- Ancienne méthode (shift sur hidden cell_group) : conservée en
+        # comparaison méthodologique. Typiquement ~0.001 de magnitude, faible
+        # discrimination inter-groupe à cause de l'agrégation + BatchNorm.
         "cell_group_shift_relative": {k: float(v) for k, v in shift_map.items()},
         "max_shift_group": str(max_shift_row["group"]),
         "max_shift_relative": float(max_shift_row["shift_relative"]),
     }
+
+    # --- Nouvelle méthode (shift gene-weighted) : 4 métriques par groupe.
+    if shift_gene_df is not None:
+        _gw = shift_gene_df.set_index("group")
+        summary["cell_group_shift_gene_weighted"] = {
+            g: float(_gw.loc[g, "shift_weighted"]) for g in _gw.index
+        }
+        summary["cell_group_shift_gene_weighted_norm"] = {
+            g: float(_gw.loc[g, "shift_weighted_norm"]) for g in _gw.index
+        }
+        summary["cell_group_shift_gene_differential"] = {
+            g: float(_gw.loc[g, "shift_differential"]) for g in _gw.index
+        }
+        summary["cell_group_shift_gene_direct_target"] = {
+            g: float(_gw.loc[g, "direct_target_contrib"]) for g in _gw.index
+        }
+        # Groupe maximal — on utilise 'shift_differential' car c'est la
+        # métrique qui isole le signal group-specific (risque 2 atténué).
+        max_gw_group = _gw["shift_differential"].idxmax()
+        summary["max_shift_gene_differential_group"] = str(max_gw_group)
+        summary["max_shift_gene_differential"] = float(
+            _gw.loc[max_gw_group, "shift_differential"])
+
+    # --- Option 2 : shift SIGNÉ (projection sur axe sénescence).
+    # Deux axes : global (moyenne P16) et par cluster P16.
+    if shift_proj_df is not None:
+        # Structure : group, axis_type, proj_signed, proj_signed_norm,
+        # proj_signed_diff, proj_direct_target, baseline_expr_sum.
+        # Résumé : on agrège par axis_type (global + cluster axe) et
+        # on rapporte les max/min de proj_signed_diff (le plus informatif).
+        _proj_global = shift_proj_df[shift_proj_df["axis_type"] == "global"]
+        _proj_cluster = shift_proj_df[shift_proj_df["axis_type"] == "cluster"]
+        
+        summary["cell_group_shift_projected_global"] = {
+            row["group"]: {
+                "proj_signed": float(row["proj_signed"]),
+                "proj_signed_norm": float(row["proj_signed_norm"]),
+                "proj_signed_diff": float(row["proj_signed_diff"]),
+            }
+            for _, row in _proj_global.iterrows()
+        }
+        if len(_proj_cluster) > 0:
+            summary["cell_group_shift_projected_cluster"] = {
+                row["group"]: {
+                    "proj_signed": float(row["proj_signed"]),
+                    "proj_signed_norm": float(row["proj_signed_norm"]),
+                    "proj_signed_diff": float(row["proj_signed_diff"]),
+                }
+                for _, row in _proj_cluster.iterrows()
+            }
+        
+        # Indicateurs max/min basés sur proj_signed_diff (avec direction).
+        all_proj = pd.concat([_proj_global, _proj_cluster], ignore_index=True)
+        if len(all_proj) > 0:
+            max_idx = all_proj["proj_signed_diff"].abs().idxmax()
+            max_row = all_proj.loc[max_idx]
+            summary["max_proj_signed_diff_group"] = f"{max_row['group']}/{max_row['axis_type']}"
+            summary["max_proj_signed_diff"] = float(max_row["proj_signed_diff"])
 
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -476,6 +830,14 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
             ranking.to_csv(out_dir / "delta_ranking.csv", index=False)
             shift_df.to_csv(out_dir / "cell_group_shift.tsv",
                             sep="\t", index=False)
+            if shift_gene_df is not None:
+                shift_gene_df.to_csv(
+                    out_dir / "cell_group_shift_gene.tsv",
+                    sep="\t", index=False)
+            if shift_proj_df is not None:
+                shift_proj_df.to_csv(
+                    out_dir / "cell_group_shift_projected.tsv",
+                    sep="\t", index=False)
             write_tsv(rows, out_dir / "delta_ora_top_up_reactome.tsv")
     return summary
 
@@ -521,10 +883,11 @@ def main():
     if not targets:
         ap.error("must supply --genes and/or --gene-list")
 
-    data, model, gene_symbols, gene_to_idx, baseline = load_run(
+    data, model, gene_symbols, gene_to_idx, baseline, group_expr = load_run(
         args.run_dir, args.hidden, args.latent, args.n_layers, args.n_heads)
     print(f"Run loaded: {len(gene_symbols)} genes, "
-          f"{len(data.edge_types)} edge types.")
+          f"{len(data.edge_types)} edge types, "
+          f"group_expression={'OK' if group_expr is not None else 'absent'}.")
 
     hit = [g for g in targets if g in gene_to_idx]
     miss = [g for g in targets if g not in gene_to_idx]
@@ -541,8 +904,8 @@ def main():
     print(f"Mode={args.mode} | targets in graph={len(hit)} | "
           f"tag={tag} | out={out_dir}")
 
-    spec, base_imp, base_rank, z_cg_base = prepare_baseline(
-        model, data, baseline, gene_symbols)
+    spec, base_imp, base_rank, z_cg_base, mu_base, axis_global, axes_cluster = prepare_baseline(
+        model, data, baseline, gene_symbols, group_expr)
 
     print("Loading REACTOME + background ...")
     reactome = load_reactome_gmt()
@@ -550,10 +913,12 @@ def main():
 
     summary = run_perturbation_once(
         model, data, gene_symbols, gene_to_idx,
-        spec, base_imp, base_rank, z_cg_base,
+        spec, base_imp, base_rank, z_cg_base, mu_base,
         targets=hit, mode=args.mode, factor=args.factor,
         top_k=args.top_k, fdr=args.fdr,
         reactome=reactome, background=background,
+        group_expr=group_expr,
+        axis_global=axis_global, axes_cluster=axes_cluster,
         out_dir=out_dir, write_full=not args.summary_only)
     summary["run_dir"] = str(args.run_dir)
 
@@ -564,6 +929,8 @@ def main():
         print(f"  {out_dir / 'delta_ranking.csv'}")
         print(f"  {out_dir / 'delta_ora_top_up_reactome.tsv'}")
         print(f"  {out_dir / 'cell_group_shift.tsv'}")
+        if group_expr is not None:
+            print(f"  {out_dir / 'cell_group_shift_gene.tsv'}")
 
 
 if __name__ == "__main__":
