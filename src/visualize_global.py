@@ -433,7 +433,9 @@ def fig_v2_vs_v3(out_dir: Path, top_n: int = 100) -> Path:
     v3_mean = v3.mean(axis=1).reindex(all_imp.index)
     rho, _ = spearmanr(v2_mean, v3_mean)
     ax.scatter(v2_mean, v3_mean, s=5, alpha=0.35, c="#4C72B0", linewidths=0)
-    lim = [0, max(v2_mean.max(), v3_mean.max()) * 1.02]
+    min_val = min(v2_mean.min(), v3_mean.min())
+    max_val = max(v2_mean.max(), v3_mean.max())
+    lim = [min_val * 0.98, max_val * 1.02]
     ax.plot(lim, lim, "--", c="grey", lw=1)
     # Annotate top movers (largest rank change)
     delta = v3_mean.rank() - v2_mean.rank()
@@ -627,6 +629,7 @@ def fig_consensus(out_dir: Path,
         top_a = means.nlargest(25)
         ax.barh(top_a.index[::-1], top_a.values[::-1],
                 color="#2ca02c", edgecolor="black")
+        ax.set_xlim(left=min(top_a.values) * 0.98)
         ax.set_xlabel("mean importance across seeds")
         ax.set_title(f"D — Tier A (all {n_runs} seeds) — top 25")
         ax.tick_params(axis="y", labelsize=7)
@@ -772,6 +775,7 @@ def fig_perturbation(out_dir: Path, top_k: int = 15) -> Path:
     colors = [MODE_COLORS[m] for m in top_up["mode"]]
     ax.barh(labels[::-1], top_up["max_up_delta_rank"].values[::-1],
             color=colors[::-1], edgecolor="black")
+    ax.set_xlim(left=min(top_up["max_up_delta_rank"].values) * 0.98)
     ax.set_xlabel("max_up_delta_rank")
     ax.set_title(f"D — Top-{top_k} strongest risers across all perturbations")
     ax.tick_params(axis="y", labelsize=7)
@@ -821,7 +825,9 @@ def fig_perturbation(out_dir: Path, top_k: int = 15) -> Path:
             ax.annotate(m_["gene"], (m_["baseline_rank"], m_["perturbed_rank"]),
                         fontsize=6.5, xytext=(3, 3),
                         textcoords="offset points")
-        lim = [0, max(d["baseline_rank"].max(), d["perturbed_rank"].max())]
+        min_val = min(d["baseline_rank"].min(), d["perturbed_rank"].min())
+        max_val = max(d["baseline_rank"].max(), d["perturbed_rank"].max())
+        lim = [min_val * 0.98, max_val * 1.02]
         ax.plot(lim, lim, "--", c="grey", lw=0.8)
         plt.colorbar(sc, ax=ax, fraction=0.04, pad=0.02, label="Δrank")
         ax.set_xlabel("baseline rank")
