@@ -79,6 +79,11 @@ DEFAULT_LATENT = 64
 DEFAULT_LAYERS = 3
 DEFAULT_HEADS = 4
 
+# Ordre FIXE des 5 noeuds cell_group, tel que construit dans gnn_vgae.py:468.
+# L'index dans ce tuple = l'index du noeud cell_group dans le HeteroData.
+CELL_GROUPS = ("P4", "P16_cluster_0", "P16_cluster_1",
+               "P16_cluster_2", "P16_cluster_3")
+
 
 # --------------------------------------------------------------------------- #
 # Model (duplicated from gnn_vgae.py to keep this tool self-contained).
@@ -92,25 +97,27 @@ class HeteroEncoder(nn.Module):
         self.gene_proj = nn.Linear(gene_in, hidden)
         self.cell_proj = nn.Linear(cell_in, hidden)
 
-        edge_types = [
-            ("gene", "ppi", "gene"),
-            ("gene", "same_pathway", "gene"),
-            ("gene", "regulates", "gene"),
-            ("gene", "regulated_by", "gene"),
-            ("cell_group", "expresses", "gene"),
-            ("gene", "expressed_in", "cell_group"),
-            ("gene", "coexpression", "gene"),
-            ("gene", "metabolic_cocatalysis", "gene"),
+        edge_types_dims = [
+            (("gene", "ppi", "gene"), 1),
+            (("gene", "same_pathway", "gene"), None),
+            (("gene", "regulates", "gene"), 1),
+            (("gene", "regulated_by", "gene"), 1),
+            (("cell_group", "expresses", "gene"), 7),
+            (("gene", "expressed_in", "cell_group"), 7),
+            (("gene", "coexpression", "gene"), 1),
+            (("gene", "metabolic_cocatalysis", "gene"), 2),
         ]
+        self.edge_dims = {et: dim for et, dim in edge_types_dims}
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         for _ in range(n_layers):
-            conv_dict = {
-                et: GATConv(hidden, head_dim, heads=n_heads,
-                            concat=True, dropout=dropout,
-                            add_self_loops=False)
-                for et in edge_types
-            }
+            conv_dict = {}
+            for et, ed in edge_types_dims:
+                conv_kwargs = dict(heads=n_heads, concat=True,
+                                   dropout=dropout, add_self_loops=False)
+                if ed is not None:
+                    conv_kwargs["edge_dim"] = ed
+                conv_dict[et] = GATConv(hidden, head_dim, **conv_kwargs)
             self.convs.append(HeteroConv(conv_dict, aggr="sum"))
             self.norms.append(nn.ModuleDict({
                 "gene": nn.BatchNorm1d(hidden),
@@ -119,8 +126,12 @@ class HeteroEncoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.mu_head = nn.Linear(hidden, latent)
         self.logvar_head = nn.Linear(hidden, latent)
+        # Stash du hidden cell_group après le dernier forward. Utilisé par
+        # l'option A (shift per cell_group après perturbation) sans changer
+        # la signature de forward() / VGAE.encode() / compute_importance().
+        self.last_cell_group_h: torch.Tensor | None = None
 
-    def forward(self, x_dict, edge_index_dict):
+    def forward(self, x_dict, edge_index_dict, edge_attr_dict=None):
         x_dict = {
             "gene": F.relu(self.gene_proj(x_dict["gene"])),
             "cell_group": F.relu(self.cell_proj(x_dict["cell_group"])),
@@ -128,12 +139,22 @@ class HeteroEncoder(nn.Module):
         for i in range(self.n_layers):
             x_prev = {k: v.clone() for k, v in x_dict.items()}
             active = {k: v for k, v in edge_index_dict.items() if v.numel() > 0}
-            x_dict = self.convs[i](x_dict, active)
+            if edge_attr_dict is not None:
+                active_attrs = {
+                    k: edge_attr_dict[k]
+                    for k in active
+                    if k in edge_attr_dict and self.edge_dims.get(k) is not None
+                }
+                x_dict = self.convs[i](x_dict, active,
+                                       edge_attr_dict=active_attrs)
+            else:
+                x_dict = self.convs[i](x_dict, active)
             for key in x_dict:
                 x_dict[key] = self.norms[i][key](x_dict[key])
                 x_dict[key] = F.relu(x_dict[key])
                 x_dict[key] = self.dropout(x_dict[key])
                 x_dict[key] = x_dict[key] + x_prev[key]
+        self.last_cell_group_h = x_dict["cell_group"].detach().clone()
         return self.mu_head(x_dict["gene"]), self.logvar_head(x_dict["gene"])
 
 
@@ -144,8 +165,8 @@ class VGAE(nn.Module):
         self.log_tau = nn.Parameter(torch.tensor(float(np.log(tau_init))))
         self.log_tau_max = np.log(tau_max)
 
-    def encode(self, x_dict, edge_index_dict):
-        mu, logvar = self.encoder(x_dict, edge_index_dict)
+    def encode(self, x_dict, edge_index_dict, edge_attr_dict=None):
+        mu, logvar = self.encoder(x_dict, edge_index_dict, edge_attr_dict)
         return mu, logvar
 
     def decode(self, z, edge_index):
@@ -164,9 +185,14 @@ def compute_importance(model, data, baseline_specificity):
     model.eval()
     x_dict = {"gene": data["gene"].x, "cell_group": data["cell_group"].x}
     edge_index_dict = {k: data[k].edge_index for k in data.edge_types}
+    edge_attr_dict = {
+        k: data[k].edge_attr
+        for k in data.edge_types
+        if "edge_attr" in data[k] and data[k].edge_attr is not None
+    }
 
     with torch.no_grad():
-        mu, logvar = model.encode(x_dict, edge_index_dict)
+        mu, logvar = model.encode(x_dict, edge_index_dict, edge_attr_dict)
 
     mu_np = mu.cpu().numpy()
     n_nodes = mu_np.shape[0]
@@ -270,6 +296,49 @@ def apply_perturbation(data, target_idx: torch.Tensor, mode: str, factor: float)
 
 
 # --------------------------------------------------------------------------- #
+# Shift des cell_group après perturbation.
+# --------------------------------------------------------------------------- #
+def cell_group_shift(z_base: torch.Tensor,
+                     z_pert: torch.Tensor,
+                     group_names=CELL_GROUPS) -> pd.DataFrame:
+    """Compare les embeddings cell_group avant vs après perturbation.
+
+    Pour chaque noeud cell_group, on rapporte :
+      * baseline_norm      : ‖z_base‖₂
+      * perturbed_norm     : ‖z_pert‖₂
+      * shift_L2           : ‖z_pert − z_base‖₂   (amplitude absolue du déplacement)
+      * shift_relative     : shift_L2 / ‖z_base‖  (amplitude relative)
+      * cosine_similarity  : cos(z_base, z_pert)  (direction conservée ?)
+
+    Interprétation :
+      - shift_L2 grand sur P4 → le gène perturbé est important pour P4.
+      - shift_L2 grand sur P16_cluster_X → important pour ce sous-état sénescent.
+      - Si le shift est concentré sur 1-2 groupes → gène spécifique de ces états.
+      - Si réparti uniformément → gène housekeeping / hub global.
+    """
+    zb = z_base.cpu().numpy()
+    zp = z_pert.cpu().numpy()
+    assert zb.shape == zp.shape, (zb.shape, zp.shape)
+    base_norm = np.linalg.norm(zb, axis=1)
+    pert_norm = np.linalg.norm(zp, axis=1)
+    shift_l2 = np.linalg.norm(zp - zb, axis=1)
+    shift_rel = shift_l2 / (base_norm + 1e-8)
+    cos = (zb * zp).sum(axis=1) / (base_norm * pert_norm + 1e-8)
+    n = zb.shape[0]
+    # Si le nombre de noeuds ne matche pas CELL_GROUPS, on retombe sur un
+    # index numérique — évite un crash silencieux sur un run atypique.
+    names = list(group_names) if n == len(group_names) else [f"group_{i}" for i in range(n)]
+    return pd.DataFrame({
+        "group": names,
+        "baseline_norm": base_norm,
+        "perturbed_norm": pert_norm,
+        "shift_L2": shift_l2,
+        "shift_relative": shift_rel,
+        "cosine_similarity": cos,
+    })
+
+
+# --------------------------------------------------------------------------- #
 # Run loader.
 # --------------------------------------------------------------------------- #
 def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
@@ -291,6 +360,124 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
     model.load_state_dict(torch.load(state_path, weights_only=True))
     model.eval()
     return data, model, gene_symbols, gene_to_idx, baseline
+
+
+# --------------------------------------------------------------------------- #
+# Reusable API — called both by main() and by perturb_top_genes.py (--all-*).
+# --------------------------------------------------------------------------- #
+def prepare_baseline(model, data, baseline_df, gene_symbols):
+    """Compute the baseline once; reused across many perturbations.
+
+    Returns:
+        spec       : (n_genes,) baseline vgae_specificity aligned on node idx.
+        base_imp   : (n_genes,) composite baseline importance.
+        base_rank  : (n_genes,) ordinal rank of base_imp (1 = best).
+        z_cg_base  : (5, hidden) cell_group hidden states from the baseline pass.
+    """
+    spec_map = dict(zip(baseline_df["gene"].astype(str),
+                        baseline_df["vgae_specificity"].astype(float)))
+    spec = np.array([spec_map.get(g, 0.0) for g in gene_symbols],
+                    dtype=np.float32)
+    base = compute_importance(model, data, spec)
+    base_imp = base["importance"]
+    base_rank = rankdata(-base_imp, method="ordinal").astype(int)
+    z_cg_base = model.encoder.last_cell_group_h.clone()
+    return spec, base_imp, base_rank, z_cg_base
+
+
+def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
+                          spec, base_imp, base_rank, z_cg_base,
+                          targets, mode, factor, top_k, fdr,
+                          reactome, background,
+                          out_dir=None, write_full=True):
+    """Run a single perturbation and return its summary dict.
+
+    Args:
+        targets     : list[str] gene symbols to perturb (pre-dedup).
+        mode        : "knockdown" | "knockout" | "overexpress".
+        factor      : multiplier for overexpress (ignored otherwise).
+        out_dir     : if None, write nothing (in-memory only).
+                      if set, always write summary.json.
+        write_full  : if True AND out_dir set, also write delta_ranking.csv,
+                      delta_ora_top_up_reactome.tsv, cell_group_shift.tsv.
+
+    Returns:
+        summary (dict) or None if no target is present in the graph.
+    """
+    n_genes = len(gene_symbols)
+    hit = [g for g in targets if g in gene_to_idx]
+    miss = [g for g in targets if g not in gene_to_idx]
+    if not hit:
+        return None
+    target_idx = torch.tensor([gene_to_idx[g] for g in hit], dtype=torch.long)
+
+    pert_data = apply_perturbation(data, target_idx, mode, factor)
+    pert = compute_importance(model, pert_data, spec)
+    pert_imp = pert["importance"]
+    pert_rank = rankdata(-pert_imp, method="ordinal").astype(int)
+    z_cg_pert = model.encoder.last_cell_group_h.clone()
+
+    shift_df = cell_group_shift(z_cg_base, z_cg_pert)
+    shift_map = dict(zip(shift_df["group"], shift_df["shift_relative"]))
+    max_shift_row = shift_df.loc[shift_df["shift_relative"].idxmax()]
+
+    delta_rank = base_rank - pert_rank
+    delta_imp = pert_imp - base_imp
+
+    ranking = pd.DataFrame({
+        "gene": gene_symbols,
+        "baseline_importance": base_imp,
+        "perturbed_importance": pert_imp,
+        "delta_importance": delta_imp,
+        "baseline_rank": base_rank,
+        "perturbed_rank": pert_rank,
+        "delta_rank": delta_rank,
+        "is_target": np.isin(np.arange(n_genes),
+                             target_idx.cpu().numpy()).astype(int),
+    }).sort_values("delta_rank", ascending=False).reset_index(drop=True)
+
+    non_target = ranking[ranking["is_target"] == 0]
+    top_up = non_target.head(top_k)
+    top_down = non_target.sort_values("delta_rank").head(top_k)
+
+    gl = set(top_up["gene"].astype(str))
+    rows = run_ora(gl, background, reactome)
+    sig = sum(1 for r in rows if r.p_adj < fdr)
+
+    summary = {
+        "mode": mode,
+        "factor": factor if mode == "overexpress" else None,
+        "n_targets_in_graph": len(hit),
+        "targets_in_graph": hit,
+        "targets_missing": miss,
+        "top_k": top_k,
+        "n_rising": int((ranking["delta_rank"] > 0).sum()),
+        "n_falling": int((ranking["delta_rank"] < 0).sum()),
+        "median_abs_delta_rank": float(np.median(np.abs(delta_rank))),
+        "max_up_gene": top_up.iloc[0]["gene"] if len(top_up) else None,
+        "max_up_delta_rank": (int(top_up.iloc[0]["delta_rank"])
+                              if len(top_up) else None),
+        "max_down_gene": top_down.iloc[0]["gene"] if len(top_down) else None,
+        "max_down_delta_rank": (int(top_down.iloc[0]["delta_rank"])
+                                if len(top_down) else None),
+        "n_sig_delta_pathways": sig,
+        "fdr_threshold": fdr,
+        "top5_delta_pathways": [r.pathway for r in rows[:5]],
+        "cell_group_shift_relative": {k: float(v) for k, v in shift_map.items()},
+        "max_shift_group": str(max_shift_row["group"]),
+        "max_shift_relative": float(max_shift_row["shift_relative"]),
+    }
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+        if write_full:
+            ranking.to_csv(out_dir / "delta_ranking.csv", index=False)
+            shift_df.to_csv(out_dir / "cell_group_shift.tsv",
+                            sep="\t", index=False)
+            write_tsv(rows, out_dir / "delta_ora_top_up_reactome.tsv")
+    return summary
 
 
 # --------------------------------------------------------------------------- #
@@ -317,6 +504,9 @@ def main():
     ap.add_argument("--out-dir", type=Path, default=None,
                     help="Output directory (default: run-dir/perturbation/<tag>).")
     ap.add_argument("--fdr", type=float, default=0.05)
+    ap.add_argument("--summary-only", action="store_true",
+                    help="Skip writing delta_ranking.csv / cell_group_shift.tsv "
+                         "/ delta_ora_*.tsv. Only summary.json is written.")
     args = ap.parse_args()
 
     targets: list[str] = []
@@ -333,8 +523,8 @@ def main():
 
     data, model, gene_symbols, gene_to_idx, baseline = load_run(
         args.run_dir, args.hidden, args.latent, args.n_layers, args.n_heads)
-    n_genes = len(gene_symbols)
-    print(f"Run loaded: {n_genes} genes, {len(data.edge_types)} edge types.")
+    print(f"Run loaded: {len(gene_symbols)} genes, "
+          f"{len(data.edge_types)} edge types.")
 
     hit = [g for g in targets if g in gene_to_idx]
     miss = [g for g in targets if g not in gene_to_idx]
@@ -344,89 +534,36 @@ def main():
     if not hit:
         print("No target present in the graph. Aborting.")
         return
-    target_idx = torch.tensor([gene_to_idx[g] for g in hit], dtype=torch.long)
 
     tag = (f"{args.mode}_{'_'.join(hit[:3])}"
            f"{'_etc' if len(hit) > 3 else ''}")
     out_dir = args.out_dir or (args.run_dir / "perturbation" / tag)
-    out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Mode={args.mode} | targets in graph={len(hit)} | "
           f"tag={tag} | out={out_dir}")
 
-    # Reorder baseline specificity into node index order.
-    spec_map = dict(zip(baseline["gene"].astype(str),
-                        baseline["vgae_specificity"].astype(float)))
-    spec = np.array([spec_map.get(g, 0.0) for g in gene_symbols],
-                    dtype=np.float32)
+    spec, base_imp, base_rank, z_cg_base = prepare_baseline(
+        model, data, baseline, gene_symbols)
 
-    # Baseline pass (sanity: reproduces the saved ranking up to rank method).
-    base = compute_importance(model, data, spec)
-    base_imp = base["importance"]
-    base_rank = rankdata(-base_imp, method="ordinal").astype(int)
-
-    # Perturbed pass.
-    pert_data = apply_perturbation(data, target_idx, args.mode, args.factor)
-    pert = compute_importance(model, pert_data, spec)
-    pert_imp = pert["importance"]
-    pert_rank = rankdata(-pert_imp, method="ordinal").astype(int)
-
-    delta_rank = base_rank - pert_rank          # > 0  => moved UP after perturbation
-    delta_imp = pert_imp - base_imp
-
-    out = pd.DataFrame({
-        "gene": gene_symbols,
-        "baseline_importance": base_imp,
-        "perturbed_importance": pert_imp,
-        "delta_importance": delta_imp,
-        "baseline_rank": base_rank,
-        "perturbed_rank": pert_rank,
-        "delta_rank": delta_rank,
-        "is_target": np.isin(np.arange(n_genes),
-                             target_idx.cpu().numpy()).astype(int),
-    }).sort_values("delta_rank", ascending=False).reset_index(drop=True)
-    out.to_csv(out_dir / "delta_ranking.csv", index=False)
-
-    non_target = out[out["is_target"] == 0]
-    top_up = non_target.head(args.top_k)
-    top_down = non_target.sort_values("delta_rank").head(args.top_k)
-
-    print(f"Running delta-ORA on top {len(top_up)} rising genes ...")
+    print("Loading REACTOME + background ...")
     reactome = load_reactome_gmt()
     background = load_background()
-    gl = set(top_up["gene"].astype(str))
-    rows = run_ora(gl, background, reactome)
-    write_tsv(rows, out_dir / "delta_ora_top_up_reactome.tsv")
-    sig = sum(1 for r in rows if r.p_adj < args.fdr)
 
-    summary = {
-        "run_dir": str(args.run_dir),
-        "mode": args.mode,
-        "factor": args.factor if args.mode == "overexpress" else None,
-        "n_targets_in_graph": len(hit),
-        "targets_in_graph": hit,
-        "targets_missing": miss,
-        "top_k": args.top_k,
-        "n_rising": int((out["delta_rank"] > 0).sum()),
-        "n_falling": int((out["delta_rank"] < 0).sum()),
-        "median_abs_delta_rank": float(np.median(np.abs(delta_rank))),
-        "max_up_gene": top_up.iloc[0]["gene"] if len(top_up) else None,
-        "max_up_delta_rank": (int(top_up.iloc[0]["delta_rank"])
-                              if len(top_up) else None),
-        "max_down_gene": top_down.iloc[0]["gene"] if len(top_down) else None,
-        "max_down_delta_rank": (int(top_down.iloc[0]["delta_rank"])
-                                if len(top_down) else None),
-        "n_sig_delta_pathways": sig,
-        "fdr_threshold": args.fdr,
-        "top5_delta_pathways": [r.pathway for r in rows[:5]],
-    }
-    (out_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+    summary = run_perturbation_once(
+        model, data, gene_symbols, gene_to_idx,
+        spec, base_imp, base_rank, z_cg_base,
+        targets=hit, mode=args.mode, factor=args.factor,
+        top_k=args.top_k, fdr=args.fdr,
+        reactome=reactome, background=background,
+        out_dir=out_dir, write_full=not args.summary_only)
+    summary["run_dir"] = str(args.run_dir)
 
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     print("\nWrote:")
-    print(f"  {out_dir / 'delta_ranking.csv'}")
-    print(f"  {out_dir / 'delta_ora_top_up_reactome.tsv'}")
     print(f"  {out_dir / 'summary.json'}")
+    if not args.summary_only:
+        print(f"  {out_dir / 'delta_ranking.csv'}")
+        print(f"  {out_dir / 'delta_ora_top_up_reactome.tsv'}")
+        print(f"  {out_dir / 'cell_group_shift.tsv'}")
 
 
 if __name__ == "__main__":
