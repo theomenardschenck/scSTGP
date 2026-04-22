@@ -42,6 +42,9 @@ Outputs (inside <perturb-dir>/report/)
                                          after the baseline-importance filter
     overview_movers_<mode>.png        — filtered max-up / max-down per mode
     overview_updown_<mode>.png        — rising vs falling per mode
+    shift_gene_weighted_<mode>.png    — Option 1: max shift at gene level (amplified)
+    projection_signed_<mode>.png      — Option 2: signed direction on senescence axis
+                                         (red = pro-senescence, green = anti-senescence)
     pathway_heatmap_<mode>.png        — top pathways × perturbation (-log10 p.adj)
     top_risers_overlap_<mode>.png     — Jaccard matrix (ordered + hierarchical)
     top_risers_clustermap_<mode>.png  — clustered Jaccard with dendrograms
@@ -112,6 +115,37 @@ def _load_delta(run: Path) -> pd.DataFrame:
     df = pd.read_csv(fp, usecols=["gene", "baseline_importance",
                                    "delta_rank", "is_target"])
     return df[df["is_target"] == 0].copy()
+
+
+def load_projections(run: Path) -> dict:
+    """Load proj_signed_diff from summary.json for global + cluster axes.
+    
+    Returns dict with keys: 'global', 'cluster' (dict[cluster_name, value]).
+    """
+    summary_path = run / "summary.json"
+    if not summary_path.exists():
+        return {}
+    with open(summary_path) as f:
+        s = json.load(f)
+    proj = {}
+    
+    # Global projections (P4 + all P16 clusters)
+    global_data = s.get("cell_group_shift_projected_global", {})
+    if global_data:
+        proj["global"] = {
+            group: data.get("proj_signed_diff", 0.0)
+            for group, data in global_data.items()
+        }
+    
+    # Cluster-specific projections (only P16 clusters)
+    cluster_data = s.get("cell_group_shift_projected_cluster", {})
+    if cluster_data:
+        proj["cluster"] = {
+            group: data.get("proj_signed_diff", 0.0)
+            for group, data in cluster_data.items()
+        }
+    
+    return proj
 
 
 def _apply_filters(df: pd.DataFrame,
@@ -406,6 +440,238 @@ def cluster_signatures(runs: list[Path],
     return pd.DataFrame(rows)
 
 
+def fig_shift_gene_weighted(table: pd.DataFrame, out: Path, title: str):
+    """Visualize max_shift_gene_differential (Option 1: amplified signal)."""
+    if table.empty or "max_shift_gene_differential" not in table.columns:
+        return
+    # Filter out NaN/zero entries for cleaner viz
+    tab = table.dropna(subset=["max_shift_gene_differential"])
+    if tab.empty:
+        return
+    fig, ax = plt.subplots(figsize=(max(7, 0.35 * len(tab)), 5))
+    x = np.arange(len(tab))
+    bars = ax.bar(x, tab["max_shift_gene_differential"],
+                  color="#6a3d7d", alpha=0.8, edgecolor="black", linewidth=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(tab["tag"], rotation=90, fontsize=7)
+    ax.set_ylabel("max shift (gene-weighted, differential)")
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def fig_projection_signed(table: pd.DataFrame, out: Path, title: str):
+    """Visualize max_proj_signed_diff (Option 2: signed direction on senescence axis).
+    
+    Positive = pro-sénescence (KO is a brake → acceleration)
+    Negative = anti-sénescence (KO is a motor → reversion)
+    """
+    if table.empty or "max_proj_signed_diff" not in table.columns:
+        return
+    tab = table.dropna(subset=["max_proj_signed_diff"])
+    if tab.empty:
+        return
+    fig, ax = plt.subplots(figsize=(max(7, 0.35 * len(tab)), 5))
+    x = np.arange(len(tab))
+    colors = ["#e76f51" if v > 0 else "#2a9d8f" for v in tab["max_proj_signed_diff"]]
+    bars = ax.bar(x, tab["max_proj_signed_diff"],
+                  color=colors, alpha=0.8, edgecolor="black", linewidth=0.5)
+    ax.axhline(0, color="k", lw=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels(tab["tag"], rotation=90, fontsize=7)
+    ax.set_ylabel("max proj_signed_diff (senescence axis)")
+    ax.set_title(title)
+    ax.text(0.02, 0.98, "red=pro-senescence | green=anti-senescence",
+            transform=ax.transAxes, fontsize=8, verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def fig_scatter_global_vs_cluster(runs: list[Path], out: Path, title: str):
+    """2D scatter: global projection vs cluster-specific projection divergence.
+    
+    Each point is a perturbation. X = mean(proj_signed_diff over all P16 clusters).
+    Y = cluster_0 proj_signed_diff (the outlier cluster).
+    Distance from diagonal = cluster_0 divergence from others.
+    """
+    if not runs:
+        return
+    data = []
+    for run in runs:
+        proj = load_projections(run)
+        if not proj or "cluster" not in proj:
+            continue
+        cluster_proj = proj["cluster"]
+        if "P16_cluster_0" not in cluster_proj:
+            continue
+        # Mean of clusters 1,2,3 vs cluster_0
+        other_clusters = [v for k, v in cluster_proj.items() 
+                         if k != "P16_cluster_0"]
+        if not other_clusters:
+            continue
+        mean_others = np.mean(other_clusters)
+        cluster_0_val = cluster_proj["P16_cluster_0"]
+        data.append({
+            "tag": run.name,
+            "cluster_0": cluster_0_val,
+            "mean_others": mean_others,
+            "divergence": cluster_0_val - mean_others,
+        })
+    
+    if not data:
+        return
+    df = pd.DataFrame(data)
+    
+    fig, ax = plt.subplots(figsize=(9, 8))
+    
+    # Scatter with color = divergence (red for large positive/negative, blue for low)
+    divergence = df["divergence"].abs()
+    scatter = ax.scatter(df["mean_others"], df["cluster_0"], 
+                        c=divergence, cmap="RdYlBu_r", s=100, 
+                        alpha=0.7, edgecolor="black", linewidth=0.5)
+    
+    # Diagonal line (where cluster_0 = mean_others)
+    lims = [
+        np.min([ax.get_xlim(), ax.get_ylim()]),
+        np.max([ax.get_xlim(), ax.get_ylim()]),
+    ]
+    ax.plot(lims, lims, 'k-', alpha=0.3, zorder=0, label="cluster_0 = mean(others)")
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+    
+    # Labels & colorbar
+    ax.set_xlabel("Mean proj_signed_diff (clusters 1,2,3)")
+    ax.set_ylabel("proj_signed_diff (cluster_0)")
+    ax.set_title(title)
+    cbar = plt.colorbar(scatter, ax=ax)
+    cbar.set_label("|divergence|")
+    ax.grid(True, alpha=0.3)
+    
+    # Annotate a few outliers
+    for _, row in df.nlargest(3, "divergence").iterrows():
+        ax.annotate(row["tag"].split("_", 1)[-1][:20], 
+                   (row["mean_others"], row["cluster_0"]),
+                   fontsize=7, alpha=0.7)
+    
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def fig_heatmap_projections_cluster(runs: list[Path], out: Path, title: str,
+                                    max_runs: int = 50):
+    """Heatmap: perturbations × P16_clusters, color = proj_signed_diff.
+    
+    Hierarchical clustering to group similar perturbations/clusters.
+    Reveals if cluster_0 is systematically different.
+    """
+    if not runs:
+        return
+    
+    cluster_names = ["P16_cluster_0", "P16_cluster_1", "P16_cluster_2", "P16_cluster_3"]
+    data = []
+    tags = []
+    
+    for run in runs[:max_runs]:
+        proj = load_projections(run)
+        if not proj or "cluster" not in proj:
+            continue
+        cluster_proj = proj["cluster"]
+        row = [cluster_proj.get(c, np.nan) for c in cluster_names]
+        if any(np.isnan(row)):
+            continue
+        data.append(row)
+        tags.append(run.name.split("_", 1)[-1][:30])
+    
+    if not data or not tags:
+        return
+    
+    mat = np.array(data)
+    df = pd.DataFrame(mat, columns=cluster_names, index=tags)
+    
+    # Hierarchical clustering
+    from scipy.cluster.hierarchy import dendrogram, linkage
+    from scipy.spatial.distance import pdist
+    
+    fig = plt.figure(figsize=(max(8, 0.3 * len(cluster_names)), 
+                              max(8, 0.15 * len(tags))))
+    
+    sns.clustermap(df, cmap="RdBu_r", center=0,
+                   method="average", metric="euclidean",
+                   figsize=(max(8, 0.3 * len(cluster_names)), 
+                           max(8, 0.15 * len(tags))),
+                   cbar_kws={"label": "proj_signed_diff"},
+                   linewidths=0.2, linecolor="white",
+                   yticklabels=True, xticklabels=True)
+    
+    plt.suptitle(title, y=1.00)
+    plt.tight_layout()
+    plt.savefig(out)
+    plt.close()
+
+
+def fig_violin_projections_by_cluster(runs: list[Path], out: Path, title: str):
+    """Violin plot: distribution of proj_signed_diff per cluster across all runs.
+    
+    Shows if cluster_0 is statistically different from others.
+    """
+    if not runs:
+        return
+    
+    cluster_names = ["P16_cluster_0", "P16_cluster_1", "P16_cluster_2", "P16_cluster_3"]
+    data_by_cluster = {c: [] for c in cluster_names}
+    
+    for run in runs:
+        proj = load_projections(run)
+        if not proj or "cluster" not in proj:
+            continue
+        cluster_proj = proj["cluster"]
+        for c in cluster_names:
+            if c in cluster_proj:
+                data_by_cluster[c].append(cluster_proj[c])
+    
+    # Filter empty clusters
+    data_by_cluster = {c: v for c, v in data_by_cluster.items() if v}
+    if not data_by_cluster:
+        return
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    positions = range(1, len(data_by_cluster) + 1)
+    parts = ax.violinplot([data_by_cluster[c] for c in data_by_cluster.keys()],
+                          positions=positions, showmedians=True, showmeans=True)
+    
+    # Highlight cluster_0 differently
+    for i, pc in enumerate(parts["bodies"]):
+        if list(data_by_cluster.keys())[i] == "P16_cluster_0":
+            pc.set_facecolor("#e74c3c")
+            pc.set_alpha(0.7)
+        else:
+            pc.set_facecolor("#3498db")
+            pc.set_alpha(0.7)
+    
+    ax.set_xticks(positions)
+    ax.set_xticklabels(data_by_cluster.keys(), rotation=45)
+    ax.axhline(0, color="k", lw=0.5, linestyle="--", alpha=0.5)
+    ax.set_ylabel("proj_signed_diff")
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.3)
+    
+    # Add text annotation
+    ax.text(0.02, 0.98, "red=cluster_0 | blue=other clusters",
+            transform=ax.transAxes, fontsize=9, verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+    
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+
 def fig_delta_dist(runs: list[Path], out: Path, title: str,
                    min_baseline_pct: float, blocklist: set[str],
                    max_runs: int = 30):
@@ -513,6 +779,12 @@ def main():
             "median_abs_delta_rank": s.get("median_abs_delta_rank", 0),
             "n_sig_delta_pathways": s.get("n_sig_delta_pathways", 0),
             "top1_pathway": top_pw[0] if top_pw else "",
+            # ---- Option 1 : gene-weighted shift (amplified signal) ----
+            "max_shift_gene_differential_group": s.get("max_shift_gene_differential_group", ""),
+            "max_shift_gene_differential": s.get("max_shift_gene_differential", 0.0),
+            # ---- Option 2 : signed projection on senescence axis ----
+            "max_proj_signed_diff_group": s.get("max_proj_signed_diff_group", ""),
+            "max_proj_signed_diff": s.get("max_proj_signed_diff", 0.0),
         }
         raw = dict(base)
         raw.update({
@@ -554,6 +826,12 @@ def main():
                    f"Top movers — {mode} (filtered pct≥{args.min_baseline_pct})")
         fig_updown(mode_tab, report_dir / f"overview_updown_{mode}.png",
                    f"Rising vs falling — {mode}")
+        fig_shift_gene_weighted(
+            mode_tab, report_dir / f"shift_gene_weighted_{mode}.png",
+            f"Gene-weighted shift (Option 1) — {mode}")
+        fig_projection_signed(
+            mode_tab, report_dir / f"projection_signed_{mode}.png",
+            f"Signed projection on senescence axis (Option 2) — {mode}")
         fig_pathway_heatmap(
             mode_runs, report_dir / f"pathway_heatmap_{mode}.png",
             f"Top pathways × perturbation — {mode} (-log10 p.adj)",
@@ -584,6 +862,18 @@ def main():
             f"|Δrank| distribution — {mode}",
             min_baseline_pct=args.min_baseline_pct,
             blocklist=bl)
+
+    # ---- cluster-specific analyses (across all modes) ----
+    all_runs = runs
+    fig_scatter_global_vs_cluster(
+        all_runs, report_dir / "scatter_cluster0_divergence.png",
+        "Cluster_0 divergence: proj_signed_diff(cluster_0) vs mean(others)")
+    fig_heatmap_projections_cluster(
+        all_runs, report_dir / "heatmap_projections_clusters.png",
+        "Senescence projection across clusters (hierarchical clustering)")
+    fig_violin_projections_by_cluster(
+        all_runs, report_dir / "violin_projections_by_cluster.png",
+        "Distribution of senescence projections per cluster\n(red=cluster_0, blue=clusters 1-3)")
 
     if cluster_frames:
         out_clusters = pd.concat(cluster_frames, ignore_index=True)
