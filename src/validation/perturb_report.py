@@ -183,29 +183,32 @@ def _row_to_summary(row: pd.Series) -> dict:
         "max_shift_gene_differential": float(g("max_shift_gene_differential", 0) or 0),
         "max_proj_signed_diff_group": g("max_proj_signed_diff_group", ""),
         "max_proj_signed_diff": float(g("max_proj_signed_diff", 0) or 0),
+        "max_proj_signed_norm_group": g("max_proj_signed_norm_group", ""),
+        "max_proj_signed_norm": float(g("max_proj_signed_norm", 0) or 0),
+        "max_proj_signed_amplitude_group": g("max_proj_signed_amplitude_group", ""),
+        "max_proj_signed_amplitude": float(g("max_proj_signed_amplitude", 0) or 0),
+        "max_proj_signed_extent_group": g("max_proj_signed_extent_group", ""),
+        "max_proj_signed_extent": float(g("max_proj_signed_extent", 0) or 0),
+        "max_proj_signed_degree_group": g("max_proj_signed_degree_group", ""),
+        "max_proj_signed_degree": float(g("max_proj_signed_degree", 0) or 0),
+        "max_proj_signed_cosine_group": g("max_proj_signed_cosine_group", ""),
+        "max_proj_signed_cosine": float(g("max_proj_signed_cosine", 0) or 0),
+        "target_ppi_degree": int(g("target_ppi_degree", 0) or 0),
     }
     # Reconstruct per-group projection dicts from flat columns.
+    # Toutes les métriques de proj_signed_* disponibles dans la flatten TSV.
+    _metric_keys = ("proj_signed", "proj_signed_diff", "proj_signed_norm",
+                    "proj_signed_amplitude", "proj_signed_extent",
+                    "proj_signed_degree", "proj_signed_cosine")
     proj_global = {}
     proj_cluster = {}
     for grp in CELL_GROUPS:
-        ps = g(f"proj_signed_global_{grp}")
-        pn = g(f"proj_signed_norm_global_{grp}")
-        pd_ = g(f"proj_signed_diff_global_{grp}")
-        if pd_ is not None:
-            proj_global[grp] = {
-                "proj_signed": float(ps or 0),
-                "proj_signed_norm": float(pn or 0),
-                "proj_signed_diff": float(pd_ or 0),
-            }
-        ps = g(f"proj_signed_cluster_{grp}")
-        pn = g(f"proj_signed_norm_cluster_{grp}")
-        pd_ = g(f"proj_signed_diff_cluster_{grp}")
-        if pd_ is not None:
-            proj_cluster[grp] = {
-                "proj_signed": float(ps or 0),
-                "proj_signed_norm": float(pn or 0),
-                "proj_signed_diff": float(pd_ or 0),
-            }
+        gdict = {k: g(f"{k}_global_{grp}") for k in _metric_keys}
+        if gdict["proj_signed_diff"] is not None:
+            proj_global[grp] = {k: float(v or 0) for k, v in gdict.items()}
+        cdict = {k: g(f"{k}_cluster_{grp}") for k in _metric_keys}
+        if cdict["proj_signed_diff"] is not None:
+            proj_cluster[grp] = {k: float(v or 0) for k, v in cdict.items()}
     if proj_global:
         summary["cell_group_shift_projected_global"] = proj_global
     if proj_cluster:
@@ -1045,6 +1048,317 @@ def fig_projection_hexbin(runs: list[Path], out: Path, title: str):
 
 
 # --------------------------------------------------------------------------- #
+# Cross-seed: optional figure filters + per-gene ranking aggregation.
+# --------------------------------------------------------------------------- #
+def apply_figure_filters(df: pd.DataFrame, args) -> pd.DataFrame:
+    """Apply optional CLI filters to the cross-seed DataFrame BEFORE figures.
+
+    All filters default to no-op (0 / False) so behaviour is unchanged
+    unless the user explicitly passes the flags. Filters operate on the
+    aggregated cross-seed metrics (avg_proj_signed_*) and on
+    target_ppi_degree / is_hub_inflated.
+    """
+    if df.empty:
+        return df
+    out = df.copy()
+    if args.min_abs_diff > 0 and "avg_proj_signed_diff" in out.columns:
+        out = out[out["avg_proj_signed_diff"].abs() >= args.min_abs_diff]
+    if args.min_abs_cosine > 0 and "avg_proj_signed_cosine" in out.columns:
+        out = out[out["avg_proj_signed_cosine"].abs() >= args.min_abs_cosine]
+    if args.min_abs_extent > 0 and "avg_proj_signed_extent" in out.columns:
+        out = out[out["avg_proj_signed_extent"].abs() >= args.min_abs_extent]
+    if args.min_abs_degree_metric > 0 and "avg_proj_signed_degree" in out.columns:
+        out = out[out["avg_proj_signed_degree"].abs() >= args.min_abs_degree_metric]
+    if args.min_ppi_degree > 0 and "target_ppi_degree" in out.columns:
+        out = out[out["target_ppi_degree"] >= args.min_ppi_degree]
+    if args.exclude_hubs and "is_hub_inflated" in out.columns:
+        out = out[~out["is_hub_inflated"].astype(bool)]
+    return out.reset_index(drop=True)
+
+
+def _gene_interpretation(canon_diff: float, canon_cos: float, ppi_deg: int,
+                         hub: bool, sign_cons: bool | None, n_modes: int,
+                         min_ppi_degree: int = 5,
+                         senescence_specificity: float | None = None,
+                         vgae_rank: int | None = None,
+                         is_de_significant: bool | None = None) -> str:
+    """One-line interpretation per gene.
+
+    Base verdict from canon_diff / canon_cos / sign-consistency, then
+    enriched by optional context: senescence-specificity (cluster), VGAE
+    centrality rank, DE-significance.
+    """
+    if hub:
+        return "hub-inflated (filter out)"
+    if ppi_deg < min_ppi_degree:
+        return f"low PPI degree (<{min_ppi_degree}, insufficient context)"
+    if sign_cons is False:
+        return "incoherent (OE and loss-of-function point same direction)"
+
+    direction_word = "pro-senescence" if canon_diff > 0 else "anti-senescence"
+    base = "weak / noise"
+    if n_modes >= 2 and sign_cons is True and abs(canon_cos) > 0.5:
+        if abs(canon_diff) > 50:
+            base = f"strong {direction_word} driver"
+        elif abs(canon_diff) > 20:
+            base = f"moderate {direction_word} driver"
+    elif n_modes == 1 and abs(canon_cos) > 0.5 and abs(canon_diff) > 50:
+        base = f"single-mode {direction_word} candidate"
+    elif abs(canon_cos) > 0.7 and abs(canon_diff) < 20:
+        base = "small but pure (potential marker / fine-tuned regulator)"
+
+    # Enrichments — only attach if base is a meaningful driver tag.
+    is_driver_tag = ("driver" in base) or ("candidate" in base)
+    suffixes = []
+
+    # Cluster specificity : senescence_specificity = cosine_senescent
+    # (P16_c1+c2+c3) − cosine_quiescent_like (P4+P16_c0). |val| > 0.3 → spécifique.
+    if senescence_specificity is not None and is_driver_tag:
+        if abs(senescence_specificity) > 0.3:
+            suffixes.append("senescence-cluster-specific")
+        elif abs(senescence_specificity) < 0.1:
+            suffixes.append("pan-cluster")
+
+    # VGAE centrality enrichment (vgae_rank in 1..N, lower = more central).
+    if vgae_rank is not None and vgae_rank > 0:
+        if is_driver_tag:
+            if vgae_rank <= 500:
+                suffixes.append("canonical (high VGAE centrality)")
+            elif vgae_rank > 1000:
+                suffixes.append("novel/peripheral (VGAE-specific finding)")
+        elif base == "weak / noise" and vgae_rank <= 100:
+            return "housekeeping hub (high VGAE centrality, no causal impact)"
+
+    # DE-significance enrichment (independent statistical evidence).
+    if is_de_significant is True and is_driver_tag:
+        suffixes.append("DE-significant (literature-aligned)")
+    elif is_de_significant is False and is_driver_tag:
+        suffixes.append("non-DE (graph-only finding)")
+
+    if suffixes:
+        return f"{base} [{' | '.join(suffixes)}]"
+    return base
+
+
+def _load_vgae_baselines(seed_paths: list[Path]) -> pd.DataFrame:
+    """Load + average gene_ranking_vgae.csv across seeds.
+
+    Returns DataFrame indexed by gene with cross-seed averaged columns:
+    vgae_importance, rank_vgae, stat_score, rank_stat, plus the
+    in_{genage,cellage,msigdb_aging,ageanno,aging_local} flags as max
+    (binary OR across seeds).
+    """
+    frames = []
+    for p in seed_paths:
+        rk = p / "gene_ranking_vgae.csv"
+        if not rk.exists():
+            continue
+        df = pd.read_csv(rk)
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    cat = pd.concat(frames, ignore_index=True)
+    num_cols = ["vgae_importance", "rank_vgae", "stat_score", "rank_stat"]
+    bool_cols = ["in_genage", "in_cellage", "in_msigdb_aging",
+                 "in_ageanno", "in_aging_local"]
+    num_cols = [c for c in num_cols if c in cat.columns]
+    bool_cols = [c for c in bool_cols if c in cat.columns]
+    agg = {c: "mean" for c in num_cols}
+    agg.update({c: "max" for c in bool_cols})
+    out = cat.groupby("gene").agg(agg).reset_index()
+    return out
+
+
+def build_gene_ranking(df: pd.DataFrame,
+                        min_robustness: float = 0.7,
+                        min_stability: float = 0.7,
+                        min_ppi_degree: int = 5,
+                        vgae_baseline: pd.DataFrame | None = None,
+                        de_top_n: int = 1000) -> pd.DataFrame:
+    """Per-gene cross-mode ranking (genes only).
+
+    For each gene, aggregates the up to 3 perturbation modes (KO/KD/OE)
+    into a single row, and enriches with optional baselines:
+      * vgae_baseline → vgae_importance, vgae_rank columns + interpretation
+        suffixes (canonical / novel / housekeeping).
+      * de_top_n → is_de_significant flag (rank_stat ≤ de_top_n).
+      * Cluster-level cosine: senescence_specificity = mean(c1,c2,c3) cos
+        − mean(P4,c0) cos. Reflects that c0 is quiescent-like.
+
+    Defaults filter to robustness ≥ 0.7, stability ≥ 0.7, NOT
+    hub-inflated. The min_ppi_degree only affects the interpretation
+    label (not a hard filter). Sort: max_abs_diff desc.
+    """
+    if df.empty:
+        return pd.DataFrame()
+    g = df[~df["is_pathway"]].copy()
+    if g.empty:
+        return pd.DataFrame()
+
+    # Build per-gene baseline lookup if provided.
+    vgae_lookup: dict[str, dict] = {}
+    if vgae_baseline is not None and not vgae_baseline.empty:
+        for _, r in vgae_baseline.iterrows():
+            vgae_lookup[str(r["gene"])] = r.to_dict()
+
+    rows = []
+    for target, sub in g.groupby("target"):
+        modes = {r["mode"]: r for _, r in sub.iterrows()}
+        oe = modes.get("overexpress")
+        ko = modes.get("knockout")
+        kd = modes.get("knockdown")
+        loss = ko if ko is not None else kd
+
+        n_modes = sum(1 for m in (oe, ko, kd) if m is not None)
+        # Sign-consistency: OE and loss-of-function should oppose each other
+        # for a real causal driver (gain pushes one way, loss the other).
+        sign_cons: bool | None = None
+        if oe is not None and loss is not None:
+            sign_cons = bool(np.sign(oe["avg_proj_signed_diff"])
+                              == -np.sign(loss["avg_proj_signed_diff"]))
+
+        # Magnitude metrics (max_abs across modes) — capture the strongest
+        # signal regardless of which mode triggered it.
+        max_abs_diff = float(sub["avg_proj_signed_diff"].abs().max())
+        max_abs_cos = float(sub["avg_proj_signed_cosine"].abs().max())
+        mean_extent = float(sub["avg_proj_signed_extent"].abs().mean())
+        mean_degree = float(sub["avg_proj_signed_degree"].abs().mean())
+        mean_robustness = float(sub["robustness_score"].mean())
+        mean_stability = float(sub["direction_stability"].mean())
+        ppi_degree = int(sub["target_ppi_degree"].iloc[0])
+        any_hub = bool(sub["is_hub_inflated"].any())
+
+        # Canonical direction = sign of OE (gain-of-function pushes the natural
+        # phenotypic direction the gene supports). If OE is absent, use
+        # −sign(loss) since loss reverses the gene's natural action.
+        if oe is not None:
+            canon_sign = float(np.sign(oe["avg_proj_signed_diff"]))
+            canon_diff = float(oe["avg_proj_signed_diff"])
+            canon_cos = float(oe["avg_proj_signed_cosine"])
+        elif loss is not None:
+            canon_sign = float(-np.sign(loss["avg_proj_signed_diff"]))
+            canon_diff = float(-loss["avg_proj_signed_diff"])
+            canon_cos = float(-loss["avg_proj_signed_cosine"])
+        else:
+            canon_sign = 0.0
+            canon_diff = 0.0
+            canon_cos = 0.0
+
+        if canon_sign > 0:
+            direction = "pro-senescence"
+        elif canon_sign < 0:
+            direction = "anti-senescence"
+        else:
+            direction = "neutral"
+        if sign_cons is False:
+            direction += " (mixed)"
+
+        # Cluster specificity (Q1.E) : P16_c0 est quiescent-like (proche de
+        # P4) — un vrai driver de sénescence devrait toucher c1/c2/c3 dans le
+        # même sens, et pas (P4, c0). On utilise les cosines OE-canonicalisés.
+        # Les colonnes <grp>_cosine viennent de aggregate_cross_seed.
+        def _grab_cluster_cos(mode_row, group: str) -> float | None:
+            if mode_row is None:
+                return None
+            v = mode_row.get(f"{group}_cosine")
+            if v is None or pd.isna(v):
+                return None
+            return float(v)
+
+        # Canonicalise par mode : prendre OE si présent, sinon −loss.
+        if oe is not None:
+            cluster_signer = 1.0
+            cluster_src = oe
+        elif loss is not None:
+            cluster_signer = -1.0
+            cluster_src = loss
+        else:
+            cluster_signer = 0.0
+            cluster_src = None
+
+        cos_p4 = _grab_cluster_cos(cluster_src, "P4")
+        cos_c0 = _grab_cluster_cos(cluster_src, "P16_cluster_0")
+        cos_c1 = _grab_cluster_cos(cluster_src, "P16_cluster_1")
+        cos_c2 = _grab_cluster_cos(cluster_src, "P16_cluster_2")
+        cos_c3 = _grab_cluster_cos(cluster_src, "P16_cluster_3")
+        senescence_specificity: float | None = None
+        cosine_quiescent: float | None = None
+        cosine_senescent: float | None = None
+        if cos_c1 is not None and cos_c2 is not None and cos_c3 is not None:
+            qvals = [v for v in (cos_p4, cos_c0) if v is not None]
+            if qvals:
+                cosine_quiescent = cluster_signer * float(np.mean(qvals))
+                cosine_senescent = cluster_signer * float(np.mean([cos_c1, cos_c2, cos_c3]))
+                senescence_specificity = cosine_senescent - cosine_quiescent
+
+        # Baseline VGAE / DE lookup (Q1.F + Q2).
+        vgae_row = vgae_lookup.get(target, {})
+        vgae_importance = vgae_row.get("vgae_importance")
+        vgae_rank_v = vgae_row.get("rank_vgae")
+        rank_stat_v = vgae_row.get("rank_stat")
+        is_de_significant: bool | None = None
+        if rank_stat_v is not None and not (isinstance(rank_stat_v, float) and np.isnan(rank_stat_v)):
+            is_de_significant = bool(int(rank_stat_v) <= de_top_n)
+        n_aging_dbs = sum(int(vgae_row.get(c, 0) or 0) for c in
+                           ("in_genage", "in_cellage", "in_msigdb_aging",
+                            "in_ageanno", "in_aging_local"))
+
+        interp = _gene_interpretation(
+            canon_diff, canon_cos, ppi_degree, any_hub, sign_cons, n_modes,
+            min_ppi_degree=min_ppi_degree,
+            senescence_specificity=senescence_specificity,
+            vgae_rank=int(vgae_rank_v) if vgae_rank_v is not None and not (
+                isinstance(vgae_rank_v, float) and np.isnan(vgae_rank_v)) else None,
+            is_de_significant=is_de_significant,
+        )
+
+        rec = {
+            "target": target,
+            "n_modes_present": n_modes,
+            "mean_robustness": round(mean_robustness, 2),
+            "mean_stability": round(mean_stability, 2),
+            # Canonical metrics (signed by OE if present, else by −loss).
+            "canon_diff": round(canon_diff, 1),
+            "canon_cosine": round(canon_cos, 3),
+            "max_abs_diff": round(max_abs_diff, 1),
+            "max_abs_cosine": round(max_abs_cos, 3),
+            "mean_abs_extent": round(mean_extent, 4),
+            "mean_abs_degree": round(mean_degree, 2),
+            "target_ppi_degree": ppi_degree,
+            # Cluster specificity (Q1.E)
+            "cosine_quiescent_like": round(cosine_quiescent, 3) if cosine_quiescent is not None else None,
+            "cosine_senescent": round(cosine_senescent, 3) if cosine_senescent is not None else None,
+            "senescence_specificity": round(senescence_specificity, 3) if senescence_specificity is not None else None,
+            # Baseline cross-checks
+            "vgae_importance": round(float(vgae_importance), 4) if vgae_importance is not None else None,
+            "vgae_rank": int(vgae_rank_v) if vgae_rank_v is not None and not (
+                isinstance(vgae_rank_v, float) and np.isnan(vgae_rank_v)) else None,
+            "is_de_significant": is_de_significant,
+            "n_aging_dbs": n_aging_dbs,
+            "sign_consistent": sign_cons if sign_cons is not None else "",
+            "is_hub_inflated": any_hub,
+            "direction": direction,
+            "interpretation": interp,
+            # Per-mode breakdown
+            "KO_diff": round(float(ko["avg_proj_signed_diff"]), 1) if ko is not None else None,
+            "KD_diff": round(float(kd["avg_proj_signed_diff"]), 1) if kd is not None else None,
+            "OE_diff": round(float(oe["avg_proj_signed_diff"]), 1) if oe is not None else None,
+            "KO_cos": round(float(ko["avg_proj_signed_cosine"]), 3) if ko is not None else None,
+            "KD_cos": round(float(kd["avg_proj_signed_cosine"]), 3) if kd is not None else None,
+            "OE_cos": round(float(oe["avg_proj_signed_cosine"]), 3) if oe is not None else None,
+        }
+        rows.append(rec)
+
+    out = pd.DataFrame(rows)
+    # Defaults: robustness ≥ X, stability ≥ X, NOT hub-inflated.
+    out = out[(out["mean_robustness"] >= min_robustness) &
+              (out["mean_stability"] >= min_stability) &
+              (~out["is_hub_inflated"])]
+    out = out.sort_values("max_abs_diff", ascending=False).reset_index(drop=True)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Cross-seed aggregation
 # --------------------------------------------------------------------------- #
 def aggregate_cross_seed(perturb_dirs: list[Path] | None = None,
@@ -1052,14 +1366,17 @@ def aggregate_cross_seed(perturb_dirs: list[Path] | None = None,
                          min_robustness: float = 0.5,
                          min_stability: float = 0.7
                          ) -> pd.DataFrame:
-    """Aggregate per-target robustness across seeds.
-
-    Accepts either `perturb_dirs` (each a perturbation/ directory walked for
-    summary.json) or pre-loaded `seed_summaries` (list of lists of
-    `(tag, summary_dict)` pairs — produced by _collect_seed_summaries). The
-    second path supports --all-mode TSV-backed seeds without materialisation.
+    """
+    Agrège les résultats de plusieurs seeds pour identifier les drivers robustes.
+    
+    Nouveautés de cette version :
+    1. Agrégation des projections par cluster (P4, P16_c0, etc.) pour fig_transitions_scatter.
+    2. Agrégation des métriques de shift (relative/gene_diff) pour fig_shift_methods_compare.
+    3. Gestion robuste des NaNs si une seed n'a pas calculé certains clusters.
     """
     from collections import Counter
+    
+    # 1. Collecte des données (si non fournies via --all)
     if seed_summaries is None:
         if not perturb_dirs:
             return pd.DataFrame()
@@ -1067,26 +1384,59 @@ def aggregate_cross_seed(perturb_dirs: list[Path] | None = None,
             [(run.name, load_summary(run)) for run in iter_runs(pdir, None)]
             for pdir in perturb_dirs
         ]
+
     total_seeds = len(seed_summaries)
     if total_seeds == 0:
         return pd.DataFrame()
 
-    # (mode, target) -> list[summary dicts]
+    # 2. Groupement par cible : (mode, target) -> list[summary_dicts]
     key_data: dict[tuple, list[dict]] = {}
     for seed in seed_summaries:
         for tag, s in seed:
             mode = s.get("mode") or infer_mode_from_tag(tag)
             if mode not in MODES:
                 continue
-            target = tag[len(mode) + 1:]
+            # On extrait le nom du gène/pathway sans le préfixe du mode
+            target = tag[len(mode) + 1:] if tag.startswith(f"{mode}_") else tag
             key_data.setdefault((mode, target), []).append(s)
 
     rows = []
-    for (mode, target), entries in key_data.items():
-        projs = [float(e.get("max_proj_signed_diff") or 0.0) for e in entries]
-        groups = [str(e.get("max_proj_signed_diff_group") or "") for e in entries]
-        n_present = len(entries)
+    # Toutes les variantes de projection à agréger en cross-seed.
+    _proj_variants = ("diff", "norm", "amplitude", "extent", "degree", "cosine")
 
+    # 3. Boucle d'agrégation statistique
+    for (mode, target), entries in key_data.items():
+        # --- Métriques de projection (Senescence Axis) ---
+        # On collecte les séries multi-seeds pour toutes les variantes.
+        projs_by_variant: dict[str, list[float]] = {
+            v: [float(e.get(f"max_proj_signed_{v}") or 0.0) for e in entries]
+            for v in _proj_variants
+        }
+        projs = projs_by_variant["diff"]   # réf. pour la stabilité de signe
+        degrees = [int(e.get("target_ppi_degree") or 0) for e in entries]
+
+        # --- Métriques de Shift (pour fig_shift_methods_compare) ---
+        shifts_diff = [float(e.get("max_shift_gene_differential") or 0.0) for e in entries]
+        shifts_rel = [float(e.get("max_shift_relative") or 0.0) for e in entries]
+
+        # --- Données par Cluster (pour fig_transitions_scatter / heatmap_global) ---
+        # On définit les groupes qu'on veut récupérer
+        target_groups = ["P4", "P16_cluster_0", "P16_cluster_1", "P16_cluster_2", "P16_cluster_3"]
+        cluster_vals = {grp: [] for grp in target_groups}
+        cluster_vals_cosine = {grp: [] for grp in target_groups}
+
+        for e in entries:
+            # On cherche dans le dictionnaire global du summary.json
+            g_data = e.get("cell_group_shift_projected_global", {})
+            for grp in target_groups:
+                val = g_data.get(grp, {}).get("proj_signed_diff")
+                if val is not None:
+                    cluster_vals[grp].append(float(val))
+                val_c = g_data.get(grp, {}).get("proj_signed_cosine")
+                if val_c is not None:
+                    cluster_vals_cosine[grp].append(float(val_c))
+
+        # Calcul de la stabilité du signe (basé sur proj_signed_diff, métrique de référence).
         signs = [np.sign(p) for p in projs if p != 0]
         if signs:
             pos = sum(1 for s in signs if s > 0)
@@ -1095,46 +1445,89 @@ def aggregate_cross_seed(perturb_dirs: list[Path] | None = None,
         else:
             stability = 0.0
 
+        # --- Construction du dictionnaire de résultats ---
+        n_present = len(entries)
         avg_proj = float(np.mean(projs))
-        std_proj = float(np.std(projs)) if len(projs) > 1 else 0.0
-        group_counts = Counter(g for g in groups if g)
-        consensus_group = group_counts.most_common(1)[0][0] if group_counts else ""
 
-        if avg_proj > 0:
-            direction = "pro-senescence"
-        elif avg_proj < 0:
-            direction = "anti-senescence"
-        else:
-            direction = "neutral"
-
-        rows.append({
+        res = {
             "target": target,
             "mode": mode,
             "is_pathway": is_pathway_tag(f"{mode}_{target}"),
+            # Tag reconstitué pour les figures qui l'attendent (shorten_tag, etc.)
+            "tag": f"{mode}_{target}",
             "n_seeds_present": n_present,
             "robustness_score": n_present / total_seeds,
             "direction_stability": stability,
+            # Moyennes pour les figures de barres et volcans (métrique principale).
             "avg_proj_signed_diff": avg_proj,
-            "std_proj_signed_diff": std_proj,
-            "min_proj_signed_diff": float(min(projs)),
-            "max_proj_signed_diff": float(max(projs)),
-            "consensus_group": consensus_group,
-            "direction": direction,
-        })
+            "std_proj_signed_diff": float(np.std(projs)) if n_present > 1 else 0.0,
+            "max_proj_signed_diff": avg_proj, # Alias pour compatibilité avec fonctions existantes
+            # Degré PPI moyen (utile pour figures correctives hub).
+            "target_ppi_degree": float(np.mean(degrees)) if degrees else 0.0,
+            # Moyennes des autres shifts (Option 1)
+            "max_shift_gene_differential": float(np.mean(shifts_diff)),
+            "max_shift_relative": float(np.mean(shifts_rel)),
+        }
+        # Variantes additionnelles (norm, amplitude, extent, degree, cosine) :
+        # moyennes + std. On expose aussi max_* = avg_* par convention
+        # (alias pour les figures existantes).
+        for v in _proj_variants:
+            if v == "diff":
+                continue
+            vs = projs_by_variant[v]
+            mean_v = float(np.mean(vs)) if vs else 0.0
+            std_v = float(np.std(vs)) if len(vs) > 1 else 0.0
+            res[f"avg_proj_signed_{v}"] = mean_v
+            res[f"std_proj_signed_{v}"] = std_v
+            res[f"max_proj_signed_{v}"] = mean_v
 
+        # Ajout des moyennes par cluster (pour les scatters de transition).
+        # Colonnes <grp> = proj_signed_diff (legacy), <grp>_cosine = cosine.
+        for grp, vals in cluster_vals.items():
+            res[grp] = float(np.mean(vals)) if vals else np.nan
+        for grp, vals in cluster_vals_cosine.items():
+            res[f"{grp}_cosine"] = float(np.mean(vals)) if vals else np.nan
+
+        # Consensus de la direction (pour le texte du TSV)
+        if avg_proj > 0:
+            res["direction"] = "pro-senescence"
+        elif avg_proj < 0:
+            res["direction"] = "anti-senescence"
+        else:
+            res["direction"] = "neutral"
+
+        # Hub-inflated flag : effet absolu fort mais cosine faible (cascade
+        # diffuse dominée par la connectivité PPI plutôt que la directionalité).
+        # Critère : |diff| > 50 et |cos| < 0.3 (seuils empiriques V3.3).
+        avg_cos = res.get("avg_proj_signed_cosine", 0.0)
+        res["is_hub_inflated"] = bool(abs(avg_proj) > 50.0 and abs(avg_cos) < 0.3)
+
+        rows.append(res)
+
+    # 4. Conversion en DataFrame et filtrage
     df = pd.DataFrame(rows)
     if df.empty:
         return df
+
+    # Application des seuils de rigueur
     df = df[(df["robustness_score"] >= min_robustness) &
             (df["direction_stability"] >= min_stability)].copy()
+
+    # Tri par importance absolue du signal moyen
     df["abs_avg"] = df["avg_proj_signed_diff"].abs()
     df = df.sort_values("abs_avg", ascending=False).drop(columns=["abs_avg"])
+    
     return df.reset_index(drop=True)
 
 
 def fig_cross_seed_top_bars(df: pd.DataFrame, out: Path, title: str,
                              n_per_side: int = 10):
-    """Top-n pro + top-n anti drivers with error bars = std across seeds."""
+    """Top-n pro + top-n anti drivers with bar height = avg_proj_signed_diff,
+    error = std across seeds. Bars are colored by direction (red=pro-,
+    green=anti-senescence) **and** alpha-modulated by |avg_proj_signed_cosine|
+    so hub-inflated drivers (low cosine) appear pale grey, real directional
+    drivers (cosine high) appear saturated. A grey overlay marks |cos|<0.3.
+    """
     if df.empty:
         return
     top = filter_top_polar(df, n_per_side, sort_col="avg_proj_signed_diff")
@@ -1142,59 +1535,272 @@ def fig_cross_seed_top_bars(df: pd.DataFrame, out: Path, title: str,
         return
     fig, ax = plt.subplots(figsize=(max(7, 0.35 * len(top)), 5))
     x = np.arange(len(top))
-    colors = ["#e76f51" if v > 0 else "#2a9d8f"
-              for v in top["avg_proj_signed_diff"]]
-    ax.bar(x, top["avg_proj_signed_diff"], color=colors, alpha=0.8,
-           edgecolor="black", linewidth=0.5,
-           yerr=top["std_proj_signed_diff"], capsize=3,
-           error_kw={"ecolor": "black", "elinewidth": 0.8, "alpha": 0.6})
+    has_cos = "avg_proj_signed_cosine" in top.columns
+    cos_abs = top["avg_proj_signed_cosine"].abs() if has_cos else np.full(len(top), 1.0)
+    # Alpha = 0.25 (hub-inflated, |cos|≤0.1) → 0.95 (pure directional, |cos|≥0.8).
+    alphas = np.clip(0.25 + 0.875 * cos_abs, 0.25, 0.95)
+    base_colors = ["#e76f51" if v > 0 else "#2a9d8f"
+                   for v in top["avg_proj_signed_diff"]]
+    for xi, h, c, a, e in zip(x,
+                              top["avg_proj_signed_diff"],
+                              base_colors,
+                              alphas,
+                              top["std_proj_signed_diff"]):
+        ax.bar(xi, h, color=c, alpha=a, edgecolor="black", linewidth=0.5,
+               yerr=e, capsize=3,
+               error_kw={"ecolor": "black", "elinewidth": 0.8, "alpha": 0.6})
+    # Grey overlay around hub-inflated bars.
+    if has_cos:
+        for xi, c in zip(x, cos_abs):
+            if c < 0.3:
+                ax.axvspan(xi - 0.45, xi + 0.45, color="lightgrey", alpha=0.3, zorder=0)
     ax.axhline(0, color="k", lw=0.8)
     ax.set_xticks(x)
     labels = [f"{shorten_mode(r['mode'])}_{r['target']}"
               if not r["is_pathway"] else shorten_tag(f"{r['mode']}_{r['target']}")
               for _, r in top.iterrows()]
     ax.set_xticklabels(labels, rotation=90, fontsize=7)
-    ax.set_ylabel("avg proj_signed_diff across seeds  (±std)")
+    ax.set_ylabel("avg proj_signed_diff  (±std)   |   alpha ∝ |cosine|")
     ax.set_title(title)
+    ax.text(0.01, 0.99,
+            "red=pro / green=anti  |  pale = hub-inflated (|cos|<0.3)\n"
+            "saturated = intrinsically directional",
+            transform=ax.transAxes, fontsize=7, verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.7))
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(out)
     plt.close(fig)
 
 
-def fig_cross_seed_volcano(df: pd.DataFrame, out: Path, title: str):
-    """Per-driver plot of |avg| (effect size) vs std (instability).
+PROJ_VARIANTS = ("diff", "norm", "amplitude", "extent", "degree", "cosine")
+PROJ_VARIANT_LABELS = {
+    "diff":      "diff (raw sum)",
+    "norm":      "norm (÷ Σw_diff)",
+    "amplitude": "amplitude (÷ weighted ‖Δz‖)",
+    "extent":    "extent (÷ n_affected)",
+    "degree":    "degree (÷ PPI degree)",
+    "cosine":    "cosine(Δz̄, axis)",
+}
 
-    Robust drivers cluster in the upper-left (high |avg|, low std).
+
+def _variant_cols(df: pd.DataFrame, prefix: str = "avg_proj_signed_") -> list[str]:
+    """Return the <prefix><v> columns that exist in df, in stable order.
+
+    `prefix` is typically 'avg_proj_signed_' (cross-seed) or
+    'max_proj_signed_' (single-seed).
     """
-    if df.empty:
+    return [f"{prefix}{v}" for v in PROJ_VARIANTS
+            if f"{prefix}{v}" in df.columns]
+
+
+def fig_cross_seed_metrics_matrix(df: pd.DataFrame, out: Path, title: str,
+                                   prefix: str = "avg_proj_signed_"):
+    """Spearman rank correlation matrix between the 6 projection variants.
+
+    Shows whether normalizations re-order drivers (low ρ with diff) or
+    just rescale them (ρ ≈ ±1 with diff → same ranking).
+
+    `prefix`: 'avg_proj_signed_' for cross-seed, 'max_proj_signed_' for
+    single-seed.
+    """
+    from scipy.stats import spearmanr
+    cols = _variant_cols(df, prefix)
+    if len(cols) < 2 or df.empty:
         return
-    fig, ax = plt.subplots(figsize=(9, 7))
-    abs_avg = df["avg_proj_signed_diff"].abs()
-    colors = ["#e76f51" if v > 0 else "#2a9d8f"
-              for v in df["avg_proj_signed_diff"]]
-    sizes = 10 + 60 * df["robustness_score"]
-    ax.scatter(df["std_proj_signed_diff"], abs_avg,
-               c=colors, s=sizes, alpha=0.6,
-               edgecolor="black", linewidth=0.3)
-    ax.set_xlabel("std proj_signed_diff (instability across seeds)")
-    ax.set_ylabel("|avg proj_signed_diff|  (effect size)")
+    M = np.full((len(cols), len(cols)), np.nan)
+    for i, ci in enumerate(cols):
+        for j, cj in enumerate(cols):
+            mask = np.isfinite(df[ci]) & np.isfinite(df[cj])
+            if mask.sum() < 3:
+                continue
+            rho, _ = spearmanr(df.loc[mask, ci], df.loc[mask, cj])
+            M[i, j] = rho
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(M, vmin=-1, vmax=1, cmap="RdBu_r")
+    ax.set_xticks(np.arange(len(cols)))
+    ax.set_yticks(np.arange(len(cols)))
+    labels = [PROJ_VARIANT_LABELS[c.replace(prefix, "")] for c in cols]
+    ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
+    ax.set_yticklabels(labels, fontsize=8)
+    for i in range(len(cols)):
+        for j in range(len(cols)):
+            v = M[i, j]
+            if np.isfinite(v):
+                ax.text(j, i, f"{v:+.2f}", ha="center", va="center",
+                        fontsize=8, color=("white" if abs(v) > 0.6 else "black"))
+    plt.colorbar(im, ax=ax, label="Spearman ρ")
     ax.set_title(title)
-    # Annotate the 8 most robust (high avg, low std) drivers
-    score = abs_avg / (df["std_proj_signed_diff"] + 0.1)
-    for idx in score.nlargest(8).index:
-        r = df.loc[idx]
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def fig_cross_seed_diff_vs_variants(df: pd.DataFrame, out: Path, title: str,
+                                     n_annotate: int = 10,
+                                     prefix: str = "avg_proj_signed_"):
+    """Scatter grid: diff vs each of the 5 normalization variants.
+
+    One subplot per variant. Each panel shows <prefix>diff on X and the
+    variant on Y, with Spearman ρ in the title. Points colored by sign
+    of diff. Annotates the top-n by |diff|.
+
+    `prefix`: 'avg_proj_signed_' for cross-seed, 'max_proj_signed_' for
+    single-seed (falls back to size=uniform if robustness_score absent).
+    """
+    from scipy.stats import spearmanr
+    cols = _variant_cols(df, prefix)
+    variants = [c.replace(prefix, "") for c in cols if c != f"{prefix}diff"]
+    if f"{prefix}diff" not in cols or not variants:
+        return
+    x = df[f"{prefix}diff"].to_numpy()
+    if "robustness_score" in df.columns:
+        sizes = 8 + 50 * df["robustness_score"].to_numpy()
+    else:
+        sizes = np.full(len(df), 24.0)
+    colors = ["#e76f51" if v > 0 else "#2a9d8f" for v in x]
+    # Layout: 2 rows × 3 cols (5 variants fit in 6 slots, last empty).
+    n = len(variants)
+    ncols = 3
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.3 * ncols, 4 * nrows),
+                              squeeze=False)
+    top_idx = df.assign(_a=df[f"{prefix}diff"].abs()).nlargest(n_annotate, "_a").index
+    for k, v in enumerate(variants):
+        r, c = divmod(k, ncols)
+        ax = axes[r][c]
+        y = df[f"{prefix}{v}"].to_numpy()
+        mask = np.isfinite(x) & np.isfinite(y)
+        ax.scatter(x[mask], y[mask], c=np.array(colors)[mask], s=sizes[mask],
+                   alpha=0.55, edgecolor="black", linewidth=0.3)
+        ax.axhline(0, color="k", lw=0.5, linestyle="--", alpha=0.5)
+        ax.axvline(0, color="k", lw=0.5, linestyle="--", alpha=0.5)
+        rho_txt = ""
+        try:
+            if mask.sum() >= 3:
+                rho, _ = spearmanr(x[mask], y[mask])
+                rho_txt = f"ρ = {rho:+.3f}"
+        except Exception:
+            pass
+        for idx in top_idx:
+            if idx not in df.index:
+                continue
+            row = df.loc[idx]
+            if "target" in row and "mode" in row:
+                lbl = (f"{shorten_mode(row['mode'])}_{row['target']}"
+                       if not row.get("is_pathway", False)
+                       else shorten_tag(f"{row['mode']}_{row['target']}"))
+            else:
+                lbl = shorten_tag(str(row.get("tag", "")))
+            ax.annotate(lbl, (row[f"{prefix}diff"],
+                              row[f"{prefix}{v}"]),
+                        fontsize=6, alpha=0.8,
+                        xytext=(3, 2), textcoords="offset points")
+        short_prefix = prefix.replace("_proj_signed_", " proj_signed_")
+        ax.set_xlabel(f"{short_prefix}diff")
+        ax.set_ylabel(f"{short_prefix}{v}")
+        ax.set_title(f"{PROJ_VARIANT_LABELS[v]}   {rho_txt}", fontsize=9)
+        ax.grid(alpha=0.3)
+    # Hide unused panels.
+    for k in range(len(variants), nrows * ncols):
+        r, c = divmod(k, ncols)
+        axes[r][c].axis("off")
+    fig.suptitle(title)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig_cross_seed_quadrant_diff_cosine(df: pd.DataFrame, out: Path, title: str,
+                                         n_annotate: int = 15):
+    """Quadrant scatter: avg_proj_signed_diff (X) vs avg_proj_signed_cosine (Y).
+
+    Reveals 4 driver categories at a glance:
+      * NE  (diff>0, cos>0)  — pro-senescence, coherent.
+      * SW  (diff<0, cos<0)  — anti-senescence, coherent.
+      * NW/SE (sign mismatch) — incoherent (rare; usually noise).
+      * Around X-axis (|cos|<0.3) — hub-inflated diffuse cascade.
+    The grey vertical band marks the hub-inflated zone (|cos|<0.3).
+    Marker color = sign of diff. Size ∝ robustness. Annotates the top
+    `n_annotate` by |diff|·|cos| (best compromise) plus the top-5 by |cos|
+    that aren't already in the diff·cos top.
+    """
+    if df.empty or "avg_proj_signed_cosine" not in df.columns:
+        return
+    fig, ax = plt.subplots(figsize=(10, 8))
+    diff = df["avg_proj_signed_diff"].to_numpy()
+    cos = df["avg_proj_signed_cosine"].to_numpy()
+    colors = ["#e76f51" if v > 0 else "#2a9d8f" for v in diff]
+    sizes = 10 + 60 * df["robustness_score"].to_numpy()
+    # Background shaded band: hub-inflated zone (|cos| < 0.3 — small purity).
+    ax.axhspan(-0.3, 0.3, color="lightgrey", alpha=0.25, zorder=0,
+               label="hub-inflated zone (|cos|<0.3)")
+    ax.scatter(diff, cos, c=colors, s=sizes, alpha=0.55,
+               edgecolor="black", linewidth=0.3, zorder=2)
+    ax.axhline(0, color="k", lw=0.6, linestyle="--", alpha=0.5)
+    ax.axvline(0, color="k", lw=0.6, linestyle="--", alpha=0.5)
+    ax.set_xlabel("avg proj_signed_diff  (effect amplitude, signed)")
+    ax.set_ylabel("avg proj_signed_cosine  (purity, ∈ [−1, +1])")
+    ax.set_title(title)
+    ax.set_ylim(-1.05, 1.05)
+    # Annotate top-N by |diff·cos| (compromise) + top-5 by |cos| not yet labeled.
+    score_combo = np.abs(diff) * np.abs(cos)
+    idx_combo = np.argsort(-score_combo)[:n_annotate]
+    seen = set(idx_combo.tolist())
+    score_pure = np.abs(cos)
+    idx_pure = [i for i in np.argsort(-score_pure) if i not in seen][:5]
+    for k in list(idx_combo) + list(idx_pure):
+        r = df.iloc[k]
         lbl = (f"{shorten_mode(r['mode'])}_{r['target']}" if not r["is_pathway"]
                else shorten_tag(f"{r['mode']}_{r['target']}"))
-        ax.annotate(lbl, (r["std_proj_signed_diff"], abs(r["avg_proj_signed_diff"])),
-                    fontsize=7, alpha=0.85,
+        ax.annotate(lbl, (diff[k], cos[k]),
+                    fontsize=7, alpha=0.9,
                     xytext=(4, 2), textcoords="offset points")
-    ax.text(0.02, 0.98,
-            "red=pro-senescence | green=anti-senescence\n"
-            "size ∝ robustness (fraction of seeds present)",
-            transform=ax.transAxes, fontsize=8, verticalalignment="top",
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+    # Quadrant text overlays (subtle).
+    ax.text(0.99, 0.99, "REAL pro-senescence drivers\n(high diff, high +cos)",
+            transform=ax.transAxes, fontsize=8, ha="right", va="top",
+            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.55))
+    ax.text(0.01, 0.01, "REAL anti-senescence drivers\n(low diff, low −cos)",
+            transform=ax.transAxes, fontsize=8, ha="left", va="bottom",
+            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.55))
+    ax.text(0.99, 0.5, "← diffuse cascade  →",
+            transform=ax.transAxes, fontsize=7, color="grey",
+            ha="right", va="center", alpha=0.85)
+    ax.legend(loc="upper left", fontsize=7)
     ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def fig_heatmap_projections_cosine_df(df: pd.DataFrame, out: Path, title: str,
+                                       n_per_side: int = 25):
+    """Per-cluster cosine heatmap. Colors are intrinsically bounded to
+    [−1, 1] so the figure is immune to hub-inflation issues that plague
+    the proj_signed_diff heatmap. Rows = top drivers (selected by |diff|
+    for direct comparability), columns = P4 + P16_cluster_0..3.
+    """
+    grp_cols = ["P4_cosine", "P16_cluster_0_cosine", "P16_cluster_1_cosine",
+                "P16_cluster_2_cosine", "P16_cluster_3_cosine"]
+    have_cos_cols = [c for c in grp_cols if c in df.columns]
+    if df.empty or not have_cos_cols:
+        return
+    top = filter_top_polar(df, n_per_side, sort_col="avg_proj_signed_diff")
+    if top.empty:
+        return
+    M = top[have_cos_cols].to_numpy(dtype=float)
+    fig, ax = plt.subplots(figsize=(6, max(4, 0.28 * len(top))))
+    im = ax.imshow(M, aspect="auto", cmap="RdBu_r", vmin=-1, vmax=1)
+    ax.set_xticks(np.arange(len(have_cos_cols)))
+    ax.set_xticklabels([c.replace("_cosine", "") for c in have_cos_cols],
+                       rotation=35, ha="right", fontsize=8)
+    labels = [f"{shorten_mode(r['mode'])}_{r['target']}"
+              if not r["is_pathway"] else shorten_tag(f"{r['mode']}_{r['target']}")
+              for _, r in top.iterrows()]
+    ax.set_yticks(np.arange(len(top)))
+    ax.set_yticklabels(labels, fontsize=6)
+    plt.colorbar(im, ax=ax, label="cosine(Δz̄, axis)  ∈ [−1, 1]")
+    ax.set_title(title)
     fig.tight_layout()
     fig.savefig(out)
     plt.close(fig)
@@ -1284,64 +1890,162 @@ def _collect_seed_summaries(p: Path) -> list[tuple[str, dict]]:
 
 
 def run_cross_seed(args) -> None:
-    """Handler for --cross-seed mode: aggregate across N seeds.
-
-    Accepts seed roots (e.g. V3.3/run1) or perturbation/ subdirs. Each is
-    probed for ALL-mode TSVs first, then per-target summary.json folders.
+    """
+    Handler principal pour le mode --cross-seed.
+    
+    Cette fonction pilote l'agrégation de N seeds (répétitions) et génère
+    un rapport de robustesse incluant les drivers stables, les analyses de 
+    transition et les comparaisons de méthodes de calcul de shift.
     """
     raw_paths = [Path(p) for p in args.cross_seed]
     seed_summaries: list[list[tuple[str, dict]]] = []
     kept_paths: list[Path] = []
+
+    # 1. Collecte des données à travers les différentes seeds
     print(f"[CROSS-SEED] Collecting summaries for {len(raw_paths)} seed(s):")
     for p in raw_paths:
+        # collect_seed_summaries cherche soit des dossiers individuels, soit des TSV --all
         sums = _collect_seed_summaries(p)
         if not sums:
-            print(f"  {p.name}: [skip] no summaries or TSVs found")
+            print(f" {p.name}: [skip] no summaries or TSVs found")
             continue
         seed_summaries.append(sums)
         kept_paths.append(p)
+
+    # Vérification du quorum (besoin d'au moins 2 seeds pour comparer)
     if len(seed_summaries) < 2:
-        print(f"Need ≥2 seeds with data; got {len(seed_summaries)}.")
+        print(f"Error: Need ≥2 seeds with data; got {len(seed_summaries)}.")
         return
 
+    # 2. Définition du répertoire de sortie
+    # Par défaut : un dossier 'cross_seed_report' au niveau parent des seeds
     out_dir = args.report_dir or (_common_seed_parent(kept_paths) / "cross_seed_report")
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[CROSS-SEED] Aggregating {len(seed_summaries)} seeds → {out_dir}")
 
-    df = aggregate_cross_seed(seed_summaries=seed_summaries,
-                              min_robustness=args.min_robustness,
-                              min_stability=args.min_stability)
+    # 3. Agrégation statistique (Appel à la version étendue de aggregate_cross_seed)
+    print(f"[CROSS-SEED] Aggregating {len(seed_summaries)} seeds → {out_dir}")
+    df = aggregate_cross_seed(
+        seed_summaries=seed_summaries,
+        min_robustness=args.min_robustness,
+        min_stability=args.min_stability
+    )
+
     if df.empty:
         print("No drivers passed the robustness / stability thresholds.")
         return
 
+    # 4. Export des tables de résultats (TSV) — table complète, sans filtres add.
     df.to_csv(out_dir / "cross_seed_drivers.tsv", sep="\t", index=False)
-    df[~df["is_pathway"]].to_csv(
-        out_dir / "cross_seed_drivers_genes.tsv", sep="\t", index=False)
-    df[df["is_pathway"]].to_csv(
-        out_dir / "cross_seed_drivers_pathways.tsv", sep="\t", index=False)
-    print(f"Wrote cross_seed_drivers.tsv  ({len(df)} drivers passing filters)")
+    # Séparation gènes vs pathways pour faciliter la lecture bio
+    df[~df["is_pathway"]].to_csv(out_dir / "cross_seed_drivers_genes.tsv", sep="\t", index=False)
+    df[df["is_pathway"]].to_csv(out_dir / "cross_seed_drivers_pathways.tsv", sep="\t", index=False)
+    print(f"Wrote cross_seed_drivers.tsv ({len(df)} drivers passing filters)")
 
+    # 4b. Per-gene cross-mode ranking (aggregation over KO/KD/OE per gene).
+    # Cross with VGAE baseline + DE info from gene_ranking_vgae.csv (per seed).
+    seed_roots = [_normalize_seed_root(p) for p in kept_paths]
+    vgae_baseline = _load_vgae_baselines(seed_roots)
+    if vgae_baseline.empty:
+        print("[INFO] No gene_ranking_vgae.csv found in seed roots — "
+              "vgae_importance / is_de_significant columns will be empty.")
+    gene_rank = build_gene_ranking(
+        df,
+        min_robustness=args.gene_ranking_min_robustness,
+        min_stability=args.gene_ranking_min_stability,
+        min_ppi_degree=args.gene_ranking_min_ppi_degree,
+        vgae_baseline=vgae_baseline,
+        de_top_n=args.gene_ranking_de_top_n,
+    )
+    if not gene_rank.empty:
+        gene_rank.to_csv(out_dir / "cross_seed_gene_ranking.tsv",
+                         sep="\t", index=False)
+        print(f"Wrote cross_seed_gene_ranking.tsv ({len(gene_rank)} genes "
+              f"after default filters: robustness≥{args.gene_ranking_min_robustness}, "
+              f"stability≥{args.gene_ranking_min_stability}, NOT hub-inflated)")
+        # Q1.C: separate export for incoherent rows (sign_consistent==False)
+        # — kept out of main ranking but useful for inspection (noise vs
+        # non-monotonic regulators).
+        incoh = gene_rank[gene_rank["sign_consistent"] == False].copy()  # noqa: E712
+        if not incoh.empty:
+            incoh.to_csv(out_dir / "cross_seed_gene_ranking_incoherent.tsv",
+                         sep="\t", index=False)
+            print(f"Wrote cross_seed_gene_ranking_incoherent.tsv "
+                  f"({len(incoh)} genes with OE/loss same-direction)")
+
+    # 4c. Filtres optionnels appliqués AVANT figures uniquement.
+    df_fig = apply_figure_filters(df, args)
+    if len(df_fig) < len(df):
+        print(f"[FILTER] {len(df) - len(df_fig)} rows removed for figures "
+              f"(min_abs_diff={args.min_abs_diff}, min_abs_cosine="
+              f"{args.min_abs_cosine}, min_ppi_degree={args.min_ppi_degree}, "
+              f"exclude_hubs={args.exclude_hubs}). Now plotting {len(df_fig)} rows.")
+
+    # 5. Génération des Visualisations sur df_fig
     for mode in MODES:
-        d_mode = df[df["mode"] == mode]
+        # Filtrage par mode (KD, KO, OE)
+        d_mode = df_fig[df_fig["mode"] == mode]
         if d_mode.empty:
             continue
+
+        # Séparation gènes / pathways pour les figures
         d_genes = d_mode[~d_mode["is_pathway"]]
         d_pw = d_mode[d_mode["is_pathway"]]
+
         for suffix, sub in (("genes", d_genes), ("pw", d_pw)):
             if sub.empty:
                 continue
+            
             kind = "genes" if suffix == "genes" else "pathways"
+            tag_mode = shorten_mode(mode)
+
+            # --- Figures de Robustesse Standard ---
+            # Barplot des top drivers avec barres d'erreur (std entre seeds)
             fig_cross_seed_top_bars(
                 sub, out_dir / f"cross_seed_top_{mode}_{suffix}.png",
-                f"Cross-seed top drivers — {shorten_mode(mode)} / {kind} "
-                f"(top {args.top_per_side} pro + top {args.top_per_side} anti)",
-                n_per_side=args.top_per_side)
-            fig_cross_seed_volcano(
-                sub, out_dir / f"cross_seed_volcano_{mode}_{suffix}.png",
-                f"Effect vs stability — {shorten_mode(mode)} / {kind}")
+                f"Cross-seed top drivers — {tag_mode} / {kind}",
+                n_per_side=args.top_per_side
+            )
 
-    print(f"\nCross-seed figures written to {out_dir}")
+            # --- Figures Transition / Global ---
+            sub_fig = sub.copy()
+            if "tag" not in sub_fig.columns:
+                sub_fig["tag"] = sub_fig["mode"].astype(str) + "_" + sub_fig["target"].astype(str)
+
+            # 1. Transitions Scatter Matrix (P4 -> c0 -> c1 -> c2 -> c3 + global)
+            fig_transitions_scatter_df(
+                sub_fig, out_dir / f"cross_seed_transitions_{mode}_{suffix}.png",
+                f"Cross-seed transitions — {tag_mode} / {kind}")
+
+            # 2. Heatmap global — diff (signal cumulé, sensible aux hubs).
+            fig_heatmap_projections_global_df(
+                sub_fig, out_dir / f"cross_seed_heatmap_diff_{mode}_{suffix}.png",
+                f"Cross-seed heatmap (diff) — {tag_mode} / {kind}",
+                max_runs=args.top_per_side * 2)
+
+            # 2b. Heatmap global — cosine (∈ [−1, 1], pas de biais hub).
+            fig_heatmap_projections_cosine_df(
+                sub_fig, out_dir / f"cross_seed_heatmap_cosine_{mode}_{suffix}.png",
+                f"Cross-seed heatmap (cosine) — {tag_mode} / {kind}",
+                n_per_side=args.top_per_side)
+
+            # 3. Quadrant diff x cosine — vue synthétique : vrais drivers vs hubs.
+            #    (Remplace l'ancien volcano effect-vs-stability — info redondante)
+            fig_cross_seed_quadrant_diff_cosine(
+                sub_fig, out_dir / f"cross_seed_quadrant_diff_cosine_{mode}_{suffix}.png",
+                f"Quadrant diff × cosine — {tag_mode} / {kind}",
+                n_annotate=args.top_per_side)
+
+            # 4. Matrice de corrélation rang entre les 6 variantes de projection.
+            fig_cross_seed_metrics_matrix(
+                sub_fig, out_dir / f"cross_seed_metrics_matrix_{mode}_{suffix}.png",
+                f"Spearman ρ across proj metrics — {tag_mode} / {kind}")
+
+            # 5. Grille scatter : diff vs chaque variante (norm, amp, ext, deg, cos).
+            fig_cross_seed_diff_vs_variants(
+                sub_fig, out_dir / f"cross_seed_diff_vs_variants_{mode}_{suffix}.png",
+                f"Cross-seed diff vs all variants — {tag_mode} / {kind}")
+
+    print(f"\n[SUCCESS] Cross-seed report and figures written to {out_dir}")
 
 
 def build_transition_drivers(table: pd.DataFrame) -> pd.DataFrame:
@@ -1604,6 +2308,103 @@ def fig_transitions_scatter(runs: list[Path], out: Path, title: str,
     plt.close(fig)
 
 
+def fig_transitions_scatter_df(df: pd.DataFrame, out: Path, title: str,
+                                n_annotate: int = 8):
+    """DataFrame-backed version of fig_transitions_scatter — used by
+    --cross-seed where per-run summary paths aren't available.
+
+    Expects columns: tag, P4, P16_cluster_0, P16_cluster_1, P16_cluster_2,
+    P16_cluster_3. Values are assumed to be on the global senescence axis
+    (e.g. cross-seed averaged proj_signed_diff per group).
+    """
+    need = ["P4", "P16_cluster_0", "P16_cluster_1",
+            "P16_cluster_2", "P16_cluster_3"]
+    if df.empty or any(c not in df.columns for c in need):
+        return
+    df = df.dropna(subset=need).copy()
+    if df.empty:
+        return
+    if "tag" not in df.columns:
+        df["tag"] = df["mode"].astype(str) + "_" + df["target"].astype(str)
+    df["quiescent_like"] = (df["P4"] + df["P16_cluster_0"]) / 2
+    df["senescent"] = (df["P16_cluster_1"] + df["P16_cluster_2"]
+                       + df["P16_cluster_3"]) / 3
+
+    pairs = [
+        ("P4", "P16_cluster_0", "P4 → c0 (quiescent→q-like)"),
+        ("P16_cluster_0", "P16_cluster_1", "c0 → c1"),
+        ("P16_cluster_1", "P16_cluster_2", "c1 → c2"),
+        ("P16_cluster_2", "P16_cluster_3", "c2 → c3"),
+        ("quiescent_like", "senescent",
+         "mean(P4,c0) → mean(c1,c2,c3)"),
+    ]
+
+    fig, axes = plt.subplots(1, 5, figsize=(24, 5.2))
+    for ax, (a, b, sub) in zip(axes, pairs):
+        x = df[a].to_numpy(); y = df[b].to_numpy()
+        div = np.abs(y - x)
+        ax.scatter(x, y, c=div, cmap="viridis", s=12, alpha=0.6,
+                   edgecolor="none")
+        lo = float(min(x.min(), y.min()))
+        hi = float(max(x.max(), y.max()))
+        pad = 0.05 * (hi - lo + 1e-9)
+        lo, hi = lo - pad, hi + pad
+        ax.plot([lo, hi], [lo, hi], "k-", alpha=0.3, lw=0.6, zorder=0)
+        ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
+        ax.axhline(0, color="k", lw=0.3, alpha=0.3)
+        ax.axvline(0, color="k", lw=0.3, alpha=0.3)
+        ax.set_xlabel(a); ax.set_ylabel(b)
+        ax.set_title(sub, fontsize=10)
+        if n_annotate > 0:
+            order = np.argsort(div)[-n_annotate:]
+            for idx in order:
+                ax.annotate(shorten_tag(df.iloc[idx]["tag"]),
+                            (x[idx], y[idx]),
+                            fontsize=6, alpha=0.7,
+                            xytext=(3, 3), textcoords="offset points")
+    fig.suptitle(f"{title}  (n={len(df)})", y=1.02)
+    fig.tight_layout()
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig_heatmap_projections_global_df(df: pd.DataFrame, out: Path, title: str,
+                                       max_runs: int = 50):
+    """DataFrame-backed variant of fig_heatmap_projections_global for
+    --cross-seed mode. Same behaviour, same column requirements."""
+    groups = ["P4", "P16_cluster_0", "P16_cluster_1",
+              "P16_cluster_2", "P16_cluster_3"]
+    if df.empty or any(c not in df.columns for c in groups):
+        return
+    sub = df.dropna(subset=groups).copy()
+    if sub.empty:
+        return
+    if "tag" not in sub.columns:
+        sub["tag"] = sub["mode"].astype(str) + "_" + sub["target"].astype(str)
+    sub = sub.set_index(sub["tag"].map(shorten_tag))[groups]
+
+    if len(sub) > max_runs:
+        keep = sub.abs().max(axis=1).nlargest(max_runs).index
+        sub = sub.loc[keep]
+        title = f"{title}  (top {max_runs} of {len(df)} by |max proj|)"
+    show_y = len(sub) <= 60
+    height = max(5, min(25, 0.15 * len(sub)))
+    g = sns.clustermap(sub, cmap="RdBu_r", center=0,
+                       method="average", metric="euclidean",
+                       figsize=(6, height),
+                       cbar_kws={"label": "proj_signed_diff (global axis)"},
+                       linewidths=0.2 if show_y else 0,
+                       linecolor="white",
+                       yticklabels=show_y, xticklabels=True,
+                       col_cluster=False)
+    if show_y:
+        g.ax_heatmap.set_yticklabels(g.ax_heatmap.get_yticklabels(),
+                                     rotation=0, fontsize=6)
+    g.figure.suptitle(title, y=1.01)
+    g.savefig(out)
+    plt.close(g.figure)
+
+
 def fig_heatmap_projections_global(runs: list[Path], out: Path, title: str,
                                     max_runs: int = 200):
     """Heatmap: perturbations × [P4, P16_c0..c3] using the global-axis
@@ -1781,6 +2582,34 @@ def main():
                     help="--cross-seed only: min fraction of seeds with a "
                          "consistent sign of max_proj_signed_diff "
                          "(default 0.7).")
+    # --- Filtres optionnels appliqués AVANT génération des figures
+    # cross-seed. Tous default 0/False → aucun filtre additionnel.
+    ap.add_argument("--min-abs-diff", type=float, default=0.0,
+                    help="Cross-seed: min |avg_proj_signed_diff| (default 0).")
+    ap.add_argument("--min-abs-cosine", type=float, default=0.0,
+                    help="Cross-seed: min |avg_proj_signed_cosine| (default 0).")
+    ap.add_argument("--min-abs-extent", type=float, default=0.0,
+                    help="Cross-seed: min |avg_proj_signed_extent| (default 0).")
+    ap.add_argument("--min-abs-degree-metric", type=float, default=0.0,
+                    help="Cross-seed: min |avg_proj_signed_degree| (default 0). "
+                         "Distinct de --min-ppi-degree (filtre topologique).")
+    ap.add_argument("--min-ppi-degree", type=int, default=0,
+                    help="Cross-seed: min target_ppi_degree to keep a target "
+                         "(default 0; recommended 5 for interpretation).")
+    ap.add_argument("--exclude-hubs", action="store_true",
+                    help="Cross-seed: drop is_hub_inflated rows before figures.")
+    # --- Per-gene ranking (cross-mode aggregation, written as TSV)
+    ap.add_argument("--gene-ranking-min-robustness", type=float, default=0.7,
+                    help="Per-gene ranking TSV: default 0.7.")
+    ap.add_argument("--gene-ranking-min-stability", type=float, default=0.7,
+                    help="Per-gene ranking TSV: default 0.7.")
+    ap.add_argument("--gene-ranking-min-ppi-degree", type=int, default=5,
+                    help="Per-gene ranking TSV: filter target_ppi_degree<X "
+                         "for the interpretation column (default 5).")
+    ap.add_argument("--gene-ranking-de-top-n", type=int, default=1000,
+                    help="Per-gene ranking TSV: a gene is tagged "
+                         "is_de_significant=True if its rank_stat (from "
+                         "gene_ranking_vgae.csv) is ≤ this value (default 1000).")
     ap.add_argument("--include", nargs="+", default=None,
                     help="Glob pattern(s) on run folder names to keep.")
     ap.add_argument("--top-per-run", type=int, default=5)
@@ -1881,6 +2710,18 @@ def main():
             # ---- Option 2 : signed projection on senescence axis ----
             "max_proj_signed_diff_group": s.get("max_proj_signed_diff_group", ""),
             "max_proj_signed_diff": s.get("max_proj_signed_diff", 0.0),
+            # ---- Variantes normalisées (comparaison des corrections hub) ----
+            "max_proj_signed_norm_group": s.get("max_proj_signed_norm_group", ""),
+            "max_proj_signed_norm": s.get("max_proj_signed_norm", 0.0),
+            "max_proj_signed_amplitude_group": s.get("max_proj_signed_amplitude_group", ""),
+            "max_proj_signed_amplitude": s.get("max_proj_signed_amplitude", 0.0),
+            "max_proj_signed_extent_group": s.get("max_proj_signed_extent_group", ""),
+            "max_proj_signed_extent": s.get("max_proj_signed_extent", 0.0),
+            "max_proj_signed_degree_group": s.get("max_proj_signed_degree_group", ""),
+            "max_proj_signed_degree": s.get("max_proj_signed_degree", 0.0),
+            "max_proj_signed_cosine_group": s.get("max_proj_signed_cosine_group", ""),
+            "max_proj_signed_cosine": s.get("max_proj_signed_cosine", 0.0),
+            "target_ppi_degree": s.get("target_ppi_degree", 0),
         }
         raw = dict(base)
         raw.update({
@@ -1971,6 +2812,16 @@ def main():
                 sub, report_dir / f"projection_signed_{mode}_{suffix}.png",
                 f"Signed projection on senescence axis (Option 2) — "
                 f"{shorten_mode(mode)} / {kind_label}{bar_suffix}")
+            # Matrice Spearman entre les 6 variantes de projection.
+            fig_cross_seed_metrics_matrix(
+                sub_full, report_dir / f"projection_metrics_matrix_{mode}_{suffix}.png",
+                f"Spearman ρ across proj metrics — {shorten_mode(mode)} / {kind_label}",
+                prefix="max_proj_signed_")
+            # Scatter grid diff vs chaque normalisation (amp, ext, deg, cos, norm).
+            fig_cross_seed_diff_vs_variants(
+                sub_full, report_dir / f"projection_diff_vs_variants_{mode}_{suffix}.png",
+                f"Diff vs all variants — {shorten_mode(mode)} / {kind_label}",
+                prefix="max_proj_signed_")
         fig_pathway_heatmap(
             mode_runs, report_dir / f"pathway_heatmap_{mode}.png",
             f"Top pathways × perturbation — {shorten_mode(mode)} (-log10 p.adj)",

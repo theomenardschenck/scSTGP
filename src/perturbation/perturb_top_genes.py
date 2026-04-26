@@ -15,10 +15,11 @@ Two modes:
     Loads the VGAE run once and iterates over EVERY gene (or every
     REACTOME pathway within size bounds), running each mode in-process
     via `gnn_perturbation.run_perturbation_once()`. No per-target folder
-    is created — a single aggregated TSV is written at the run_dir root:
-        perturbation_all_genes_summary.tsv
-        perturbation_all_pathways_summary.tsv
-    One row per (target, mode), columns flattened from summary.json.
+    is created — one aggregated TSV per mode is written at the run_dir root:
+        perturbation_all_genes_{knockout,knockdown,overexpress}.tsv
+        perturbation_all_pathways_{knockout,knockdown,overexpress}.tsv
+    One row per target, columns flattened from summary.json. Splitting by
+    mode avoids overwriting a previous mode's output on re-runs.
 
 Usage
 -----
@@ -47,10 +48,10 @@ Usage
         --run-dir output/gnn_vgae/V3_Run3 \\
         --all-genes --modes knockdown
 
-    # ALL REACTOME pathways (size in [10, 300]), all three modes
+    # ALL REACTOME pathways (size in [5, 300]), all three modes
     python src/perturb_top_genes.py \\
         --run-dir output/gnn_vgae/V3_Run3 \\
-        --all-pathways --pw-min-size 10 --pw-max-size 300
+        --all-pathways --pw-min-size 5 --pw-max-size 300
 
 Outputs
 -------
@@ -61,8 +62,8 @@ Outputs
       data/pathway_gene_list/<pathway_slug>.txt                 — pathway lists
 
     ALL mode:
-      <run-dir>/perturbation_all_genes_summary.tsv              — flat TSV
-      <run-dir>/perturbation_all_pathways_summary.tsv           — flat TSV
+      <run-dir>/perturbation_all_genes_{mode}.tsv               — flat TSV
+      <run-dir>/perturbation_all_pathways_{mode}.tsv            — flat TSV
 """
 
 from __future__ import annotations
@@ -75,6 +76,15 @@ from pathlib import Path
 
 import pandas as pd
 
+# Make gnn_perturbation importable under both layouts:
+#   * nested (local repo)  : src/perturbation/this.py  +  src/gnn/gnn_perturbation.py
+#   * flat   (cluster copy): src/this.py              +  src/gnn_perturbation.py
+_THIS_DIR = Path(__file__).resolve().parent
+_IMPORT_PATH = (_THIS_DIR if (_THIS_DIR / "gnn_perturbation.py").exists()
+                else _THIS_DIR.parent / "gnn")
+if str(_IMPORT_PATH) not in sys.path:
+    sys.path.insert(0, str(_IMPORT_PATH))
+
 ROOT = Path(__file__).resolve().parents[1]
 PERTURB_SCRIPT = Path(__file__).resolve().parent / "gnn_perturbation.py"
 PATHWAY_LIST_DIR = ROOT / "data/pathway_gene_list"
@@ -86,6 +96,52 @@ DEFAULT_MODES = ("knockdown", "knockout", "overexpress")
 # L'ordre fixe ici reflète l'ordre CELL_GROUPS dans gnn_perturbation.py.
 CELL_GROUPS = ("P4", "P16_cluster_0", "P16_cluster_1",
                "P16_cluster_2", "P16_cluster_3")
+
+# Track if run_perturbation_once supports include_details (for rétro-compatibility).
+_SUPPORTS_INCLUDE_DETAILS = True
+
+
+def _run_perturbation_compat(model, data, gene_symbols, gene_to_idx,
+                            spec, base_imp, base_rank, z_cg_base, mu_base,
+                            targets, mode, factor, top_k, fdr,
+                            reactome, background, group_expr=None,
+                            axis_global=None, axes_cluster=None,
+                            out_dir=None, include_details=False):
+    """Wrapper to run_perturbation_once that handles rétro-compatibility.
+    
+    Tries to pass include_details if supported; falls back to older signature.
+    """
+    from gnn_perturbation import run_perturbation_once
+    
+    global _SUPPORTS_INCLUDE_DETAILS
+    if not _SUPPORTS_INCLUDE_DETAILS:
+        # Old signature: no include_details parameter.
+        return run_perturbation_once(
+            model, data, gene_symbols, gene_to_idx,
+            spec, base_imp, base_rank, z_cg_base, mu_base,
+            targets, mode, factor, top_k, fdr,
+            reactome, background, group_expr,
+            axis_global, axes_cluster, out_dir)
+    
+    try:
+        return run_perturbation_once(
+            model, data, gene_symbols, gene_to_idx,
+            spec, base_imp, base_rank, z_cg_base, mu_base,
+            targets, mode, factor, top_k, fdr,
+            reactome, background, group_expr,
+            axis_global, axes_cluster, out_dir, 
+            write_full=True, include_details=include_details)
+    except TypeError as e:
+        if "include_details" in str(e):
+            _SUPPORTS_INCLUDE_DETAILS = False
+            print(f"[compat] Falling back to old signature (include_details not supported)")
+            return run_perturbation_once(
+                model, data, gene_symbols, gene_to_idx,
+                spec, base_imp, base_rank, z_cg_base, mu_base,
+                targets, mode, factor, top_k, fdr,
+                reactome, background, group_expr,
+                axis_global, axes_cluster, out_dir)
+        raise
 
 
 def flatten_summary(target_type: str, target: str,
@@ -136,6 +192,18 @@ def flatten_summary(target_type: str, target: str,
         # Option 2 : shift SIGNÉ (projection sur axe sénescence).
         "max_proj_signed_diff_group": summary.get("max_proj_signed_diff_group"),
         "max_proj_signed_diff": summary.get("max_proj_signed_diff"),
+        # Variantes normalisées (comparaison des stratégies de correction hub).
+        "max_proj_signed_norm_group": summary.get("max_proj_signed_norm_group"),
+        "max_proj_signed_norm": summary.get("max_proj_signed_norm"),
+        "max_proj_signed_amplitude_group": summary.get("max_proj_signed_amplitude_group"),
+        "max_proj_signed_amplitude": summary.get("max_proj_signed_amplitude"),
+        "max_proj_signed_extent_group": summary.get("max_proj_signed_extent_group"),
+        "max_proj_signed_extent": summary.get("max_proj_signed_extent"),
+        "max_proj_signed_degree_group": summary.get("max_proj_signed_degree_group"),
+        "max_proj_signed_degree": summary.get("max_proj_signed_degree"),
+        "max_proj_signed_cosine_group": summary.get("max_proj_signed_cosine_group"),
+        "max_proj_signed_cosine": summary.get("max_proj_signed_cosine"),
+        "target_ppi_degree": summary.get("target_ppi_degree"),
     }
     for grp in CELL_GROUPS:
         row[f"shift_{grp}"] = shift.get(grp)
@@ -143,18 +211,43 @@ def flatten_summary(target_type: str, target: str,
         row[f"shift_gene_weighted_norm_{grp}"] = shift_gw_norm.get(grp)
         row[f"shift_gene_differential_{grp}"] = shift_gw_diff.get(grp)
         row[f"shift_gene_direct_target_{grp}"] = shift_gw_direct.get(grp)
-        # Projections globales (un seul axe global pour tous les groupes).
+        # Projections globales / cluster : toutes les métriques.
+        _metric_keys = ("proj_signed", "proj_signed_diff", "proj_signed_norm",
+                        "proj_signed_amplitude", "proj_signed_extent",
+                        "proj_signed_degree", "proj_signed_cosine")
         if grp in proj_global:
             proj_data = proj_global[grp]
-            row[f"proj_signed_global_{grp}"] = proj_data.get("proj_signed")
-            row[f"proj_signed_norm_global_{grp}"] = proj_data.get("proj_signed_norm")
-            row[f"proj_signed_diff_global_{grp}"] = proj_data.get("proj_signed_diff")
-        # Projections par cluster P16 (ignorées pour P4).
+            for k in _metric_keys:
+                row[f"{k}_global_{grp}"] = proj_data.get(k)
         if grp in proj_cluster:
             proj_data = proj_cluster[grp]
-            row[f"proj_signed_cluster_{grp}"] = proj_data.get("proj_signed")
-            row[f"proj_signed_norm_cluster_{grp}"] = proj_data.get("proj_signed_norm")
-            row[f"proj_signed_diff_cluster_{grp}"] = proj_data.get("proj_signed_diff")
+            for k in _metric_keys:
+                row[f"{k}_cluster_{grp}"] = proj_data.get(k)
+
+    # --- Details block (populated when run_perturbation_once was called with
+    # include_details=True). Joined with ';' so a single TSV row carries enough
+    # to reconstruct the pathway heatmap, riser sets / blocklist, and a
+    # boxplot-compatible |delta_rank| distribution.
+    pw_padj = summary.get("top_delta_pathways_padj") or []
+    if pw_padj:
+        row["top_delta_pathways"] = ";".join(p["pathway"] for p in pw_padj)
+        row["top_delta_pathways_padj"] = ";".join(
+            f"{p['p_adj']:.3e}" for p in pw_padj)
+    risers = summary.get("top_risers") or []
+    if risers:
+        row["top_risers_genes"] = ";".join(r["gene"] for r in risers)
+        row["top_risers_delta"] = ";".join(str(r["delta_rank"]) for r in risers)
+        row["top_risers_baseline"] = ";".join(
+            f"{r['baseline_importance']:.6f}" for r in risers)
+    fallers = summary.get("top_fallers") or []
+    if fallers:
+        row["top_fallers_genes"] = ";".join(f["gene"] for f in fallers)
+        row["top_fallers_delta"] = ";".join(str(f["delta_rank"]) for f in fallers)
+    q = summary.get("delta_rank_abs_quantiles") or {}
+    if q:
+        for k in ("q0", "q25", "q50", "q75", "q95", "q99", "q100",
+                  "mean", "n_genes"):
+            row[f"delta_rank_abs_{k}"] = q.get(k)
     return row
 
 
@@ -166,8 +259,7 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
     pull torch when not needed.
     """
     # Local import — gnn_perturbation needs torch + PyG which are heavy.
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from gnn_huvec.src.gnn.gnn_perturbation import (  # noqa: E402
+    from gnn_perturbation import (  # noqa: E402
         load_run, prepare_baseline,
         load_reactome_gmt as _load_gmt,
         load_background as _load_bg,
@@ -193,21 +285,27 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
 
 
 def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
-                  top_k: int, fdr: float, out_tsv: Path,
+                  top_k: int, fdr: float, out_prefix: Path,
                   reactome_for_pw: dict | None = None) -> None:
-    """Perturb every gene in the graph, every mode, into a single TSV."""
-    from gnn_huvec.src.gnn.gnn_perturbation import run_perturbation_once  # local import
+    """Perturb every gene in the graph, for each mode, into one TSV per mode.
+
+    Output files are `{out_prefix}_{mode}.tsv` (e.g.
+    `perturbation_all_genes_knockout.tsv`). Running the script again with a
+    different mode won't overwrite a previous mode's output.
+    """
     gene_symbols = ctx["gene_symbols"]
     n_total = len(gene_symbols) * len(modes)
     print(f"\n[ALL GENES] {len(gene_symbols)} genes × {len(modes)} modes "
           f"= {n_total} perturbations.")
 
-    rows: list[dict] = []
+    rows_by_mode: dict[str, list[dict]] = {m: [] for m in modes}
+    out_by_mode = {m: out_prefix.with_name(f"{out_prefix.name}_{m}.tsv")
+                   for m in modes}
     done = 0
     for gene in gene_symbols:
         for mode in modes:
             factor = oe_factor if mode == "overexpress" else None
-            summary = run_perturbation_once(
+            summary = _run_perturbation_compat(
                 ctx["model"], ctx["data"],
                 gene_symbols, ctx["gene_to_idx"],
                 ctx["spec"], ctx["base_imp"],
@@ -217,26 +315,32 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                 reactome=ctx["reactome"], background=ctx["background"],
                 group_expr=ctx["group_expr"],
                 axis_global=ctx["axis_global"], axes_cluster=ctx["axes_cluster"],
-                out_dir=None)
+                out_dir=None, include_details=True)
             if summary is None:
                 continue
-            rows.append(flatten_summary("gene", str(gene), "",
-                                        mode, factor, summary))
+            rows_by_mode[mode].append(
+                flatten_summary("gene", str(gene), "", mode, factor, summary))
             done += 1
             if done % 50 == 0 or done == n_total:
                 print(f"  [{done}/{n_total}] last: {gene} ({mode})")
                 # Flush partial TSV so long runs leave intermediate state.
-                pd.DataFrame(rows).to_csv(out_tsv, sep="\t", index=False)
+                for m, rs in rows_by_mode.items():
+                    if rs:
+                        pd.DataFrame(rs).to_csv(out_by_mode[m],
+                                                sep="\t", index=False)
 
-    pd.DataFrame(rows).to_csv(out_tsv, sep="\t", index=False)
-    print(f"\nWrote aggregated summary: {out_tsv}  ({len(rows)} rows)")
+    for m, rs in rows_by_mode.items():
+        pd.DataFrame(rs).to_csv(out_by_mode[m], sep="\t", index=False)
+        print(f"\nWrote {out_by_mode[m]}  ({len(rs)} rows)")
 
 
 def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
-                     top_k: int, fdr: float, out_tsv: Path,
+                     top_k: int, fdr: float, out_prefix: Path,
                      pw_min_size: int, pw_max_size: int) -> None:
-    """Perturb every REACTOME pathway (within size bounds) in a single TSV."""
-    from gnn_huvec.src.gnn.gnn_perturbation import run_perturbation_once
+    """Perturb every REACTOME pathway (within size bounds), one TSV per mode.
+
+    Output files are `{out_prefix}_{mode}.tsv`.
+    """
     reactome = ctx["reactome"]
     pathways = [
         (name, sorted(members))
@@ -249,12 +353,14 @@ def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
           f"[{pw_min_size},{pw_max_size}]) × {len(modes)} modes "
           f"= {n_total} perturbations.")
 
-    rows: list[dict] = []
+    rows_by_mode: dict[str, list[dict]] = {m: [] for m in modes}
+    out_by_mode = {m: out_prefix.with_name(f"{out_prefix.name}_{m}.tsv")
+                   for m in modes}
     done = 0
     for pw_name, members in pathways:
         for mode in modes:
             factor = oe_factor if mode == "overexpress" else None
-            summary = run_perturbation_once(
+            summary = _run_perturbation_compat(
                 ctx["model"], ctx["data"],
                 ctx["gene_symbols"], ctx["gene_to_idx"],
                 ctx["spec"], ctx["base_imp"],
@@ -264,18 +370,23 @@ def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
                 reactome=ctx["reactome"], background=ctx["background"],
                 group_expr=ctx["group_expr"],
                 axis_global=ctx["axis_global"], axes_cluster=ctx["axes_cluster"],
-                out_dir=None)
+                out_dir=None, include_details=True)
             if summary is None:
                 continue
-            rows.append(flatten_summary("pathway", pw_name, pw_name,
-                                        mode, factor, summary))
+            rows_by_mode[mode].append(
+                flatten_summary("pathway", pw_name, pw_name,
+                                mode, factor, summary))
             done += 1
             if done % 25 == 0 or done == n_total:
                 print(f"  [{done}/{n_total}] last: {pw_name} ({mode})")
-                pd.DataFrame(rows).to_csv(out_tsv, sep="\t", index=False)
+                for m, rs in rows_by_mode.items():
+                    if rs:
+                        pd.DataFrame(rs).to_csv(out_by_mode[m],
+                                                sep="\t", index=False)
 
-    pd.DataFrame(rows).to_csv(out_tsv, sep="\t", index=False)
-    print(f"\nWrote aggregated summary: {out_tsv}  ({len(rows)} rows)")
+    for m, rs in rows_by_mode.items():
+        pd.DataFrame(rs).to_csv(out_by_mode[m], sep="\t", index=False)
+        print(f"\nWrote {out_by_mode[m]}  ({len(rs)} rows)")
 
 
 def load_reactome_gmt() -> dict[str, set[str]]:
@@ -458,14 +569,15 @@ def main():
         ctx = _load_model_and_baseline(run_dir, args.hidden, args.latent,
                                        args.n_layers, args.n_heads)
         if args.all_genes:
-            out_tsv = run_dir / "perturbation_all_genes_summary.tsv"
             run_all_genes(ctx, modes, args.oe_factor,
-                          args.top_k, args.fdr, out_tsv)
+                          args.top_k, args.fdr,
+                          out_prefix=run_dir / "perturbation_all_genes")
         if args.all_pathways:
-            out_tsv = run_dir / "perturbation_all_pathways_summary.tsv"
             run_all_pathways(ctx, modes, args.oe_factor,
-                             args.top_k, args.fdr, out_tsv,
-                             args.pw_min_size, args.pw_max_size)
+                             args.top_k, args.fdr,
+                             out_prefix=run_dir / "perturbation_all_pathways",
+                             pw_min_size=args.pw_min_size,
+                             pw_max_size=args.pw_max_size)
         return
 
     # --------------------------------------------------------------- #
