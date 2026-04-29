@@ -39,6 +39,8 @@ ARCHITECTURE :
 
 import os
 import re
+import json
+import argparse
 import zipfile
 import urllib.request
 import numpy as np
@@ -57,6 +59,186 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # =============================================================================
+# ARGUMENTS CLI — MODULARITÉ DU GRAPHE & DES FEATURES
+# =============================================================================
+# Permet d'activer/désactiver chaque source de données et chaque feature pour
+# les études d'ablation (cf. §11 du rapport : « qu'apporte vraiment HuMess ?
+# la coexpression ? »). Les drapeaux par défaut reproduisent la config V3.3
+# (toutes sources actives). Un manifest run_config.json est exporté dans le
+# run_dir pour rendre chaque ablation auditable.
+#
+# Exemples :
+#   python gnn_vgae.py                          # baseline V3.3 complet
+#   python gnn_vgae.py --no-humess --run-tag no_humess
+#   python gnn_vgae.py --no-coexpr --no-humess  # ablation double
+#   python gnn_vgae.py --exclude-features ppi_degree,reg_degree
+#   python gnn_vgae.py --ppi-score-thresh 700 --run-tag ppi700
+# Si --run-tag vaut "auto" (défaut), il est dérivé des modules désactivés.
+
+def _parse_cli_args():
+    p = argparse.ArgumentParser(add_help=True,
+                                description="VGAE HUVEC — modulaire (sources & features).")
+    # --- Sources de données (edge types) ---
+    p.add_argument("--use-ppi", dest="use_ppi", action="store_true", default=True)
+    p.add_argument("--no-ppi", dest="use_ppi", action="store_false")
+    p.add_argument("--use-reactome", dest="use_reactome", action="store_true", default=True)
+    p.add_argument("--no-reactome", dest="use_reactome", action="store_false")
+    p.add_argument("--use-coexpr", dest="use_coexpr", action="store_true", default=True)
+    p.add_argument("--no-coexpr", dest="use_coexpr", action="store_false")
+    p.add_argument("--use-scenic-regulons", dest="use_scenic_regulons",
+                   action="store_true", default=True)
+    p.add_argument("--no-scenic-regulons", dest="use_scenic_regulons",
+                   action="store_false")
+    p.add_argument("--use-humess-edges", dest="use_humess_edges",
+                   action="store_true", default=True,
+                   help="arêtes metabolic_cocatalysis (GPR rules)")
+    p.add_argument("--no-humess-edges", dest="use_humess_edges", action="store_false")
+    p.add_argument("--use-humess-features", dest="use_humess_features",
+                   action="store_true", default=True,
+                   help="features de noeud imp_P4_z, imp_P16_z, imp_delta, has_humess")
+    p.add_argument("--no-humess-features", dest="use_humess_features",
+                   action="store_false")
+    p.add_argument("--use-cell-group-edges", dest="use_cell_group_edges",
+                   action="store_true", default=True,
+                   help="arêtes bipartites cell_group ↔ gene (expresses/expressed_in)")
+    p.add_argument("--no-cell-group-edges", dest="use_cell_group_edges",
+                   action="store_false")
+    # Convenience flag : --no-humess désactive arêtes ET features HuMess.
+    p.add_argument("--no-humess", action="store_true", default=False,
+                   help="raccourci : désactive --use-humess-edges ET --use-humess-features")
+
+    # --- Exclusion fine de features de noeud gene ---
+    # Liste possible : is_tf, variance, ppi_degree, reg_degree,
+    #                  imp_P4, imp_P16, imp_delta, has_humess
+    p.add_argument("--exclude-features", default="",
+                   help="liste séparée par des virgules de gene_features à exclure "
+                        "(parmi : is_tf, variance, ppi_degree, reg_degree, "
+                        "imp_P4, imp_P16, imp_delta, has_humess)")
+
+    # --- Hyperparamètres de filtrage du graphe ---
+    p.add_argument("--ppi-score-thresh", type=int, default=900,
+                   help="seuil STRING combined_score (0-1000), defaut=900")
+    p.add_argument("--coexpr-top-quantile", type=float, default=0.98,
+                   help="quantile minimal pour garder une coexpression GRNBoost2 "
+                        "(0.98 = top 2%%)")
+    p.add_argument("--reactome-max-pathway", type=int, default=20,
+                   help="taille max d'un pathway REACTOME pour rester informatif")
+
+    # --- Étiquetage du run ---
+    p.add_argument("--run-tag", default="auto",
+                   help="suffixe ajouté à OUT_DIR pour ce run. 'auto' = construit "
+                        "à partir des modules désactivés ; 'full' = baseline ; "
+                        "ou nom libre.")
+    p.add_argument("--seed", type=int, default=42,
+                   help="graine aléatoire — appliquée à numpy + torch + cuda. "
+                        "Inclus dans RUN_TAG (sauf si --run-tag <libre>) pour "
+                        "ne pas écraser un run d'un autre seed.")
+
+    args, _unknown = p.parse_known_args()
+
+    # Application du raccourci --no-humess
+    if args.no_humess:
+        args.use_humess_edges = False
+        args.use_humess_features = False
+
+    return args
+
+
+CLI_ARGS = _parse_cli_args()
+
+# Set des features à exclure (normalisées en minuscules, dépouillées d'espaces)
+_EXCLUDED_FEATURES = {
+    s.strip().lower() for s in CLI_ARGS.exclude_features.split(",") if s.strip()
+}
+
+# MODULES : dictionnaire compact qui résume la config — référé partout dans
+# le pipeline pour gater les blocs (loading + edges + features).
+MODULES = {
+    "use_ppi":              CLI_ARGS.use_ppi,
+    "use_reactome":         CLI_ARGS.use_reactome,
+    "use_coexpr":           CLI_ARGS.use_coexpr,
+    "use_scenic_regulons":  CLI_ARGS.use_scenic_regulons,
+    "use_humess_edges":     CLI_ARGS.use_humess_edges,
+    "use_humess_features":  CLI_ARGS.use_humess_features,
+    "use_cell_group_edges": CLI_ARGS.use_cell_group_edges,
+}
+
+# Matrice « feature → activée ? » — recoupe les modules et l'option
+# --exclude-features. Une feature est INCLUSE ssi (a) sa source est active
+# ET (b) elle n'est pas listée dans --exclude-features.
+def _feature_enabled(name, source_ok=True):
+    return source_ok and (name not in _EXCLUDED_FEATURES)
+
+
+GENE_FEATURE_FLAGS = {
+    "is_tf":       _feature_enabled("is_tf",      MODULES["use_scenic_regulons"]),
+    "variance":    _feature_enabled("variance",   True),  # toujours dispo (group_stats)
+    "ppi_degree":  _feature_enabled("ppi_degree", MODULES["use_ppi"]),
+    "reg_degree":  _feature_enabled("reg_degree", MODULES["use_scenic_regulons"]),
+    "imp_P4":      _feature_enabled("imp_p4",     MODULES["use_humess_features"]),
+    "imp_P16":     _feature_enabled("imp_p16",    MODULES["use_humess_features"]),
+    "imp_delta":   _feature_enabled("imp_delta",  MODULES["use_humess_features"]),
+    "has_humess":  _feature_enabled("has_humess", MODULES["use_humess_features"]),
+}
+
+
+def _build_run_tag():
+    """Construit un tag court à partir des modules désactivés.
+    'full' si tout est actif. Ex : 'no-ppi.no-humess.s7' si ces deux sont
+    off et seed=7. Si --run-tag est explicite, on respecte le tag libre tel
+    quel (l'utilisateur est responsable de l'unicité par seed)."""
+    tag = CLI_ARGS.run_tag
+    if tag != "auto":
+        return tag if tag else "full"
+    parts = []
+    if not MODULES["use_ppi"]:              parts.append("no-ppi")
+    if not MODULES["use_reactome"]:         parts.append("no-reactome")
+    if not MODULES["use_coexpr"]:           parts.append("no-coexpr")
+    if not MODULES["use_scenic_regulons"]:  parts.append("no-scenic")
+    if not MODULES["use_humess_edges"] and not MODULES["use_humess_features"]:
+        parts.append("no-humess")
+    else:
+        if not MODULES["use_humess_edges"]:    parts.append("no-humess-edges")
+        if not MODULES["use_humess_features"]: parts.append("no-humess-feats")
+    if not MODULES["use_cell_group_edges"]: parts.append("no-cgrp")
+    if _EXCLUDED_FEATURES:                  parts.append("ex-" + "-".join(sorted(_EXCLUDED_FEATURES)))
+    if CLI_ARGS.ppi_score_thresh != 900:    parts.append(f"ppi{CLI_ARGS.ppi_score_thresh}")
+    if abs(CLI_ARGS.coexpr_top_quantile - 0.98) > 1e-9:
+        parts.append(f"q{int(CLI_ARGS.coexpr_top_quantile*1000):04d}")
+    if CLI_ARGS.reactome_max_pathway != 20:
+        parts.append(f"rxmax{CLI_ARGS.reactome_max_pathway}")
+    base = "full" if not parts else ".".join(parts)
+    # Toujours suffixer par le seed pour différencier les runs multi-seed.
+    return f"{base}.s{CLI_ARGS.seed}"
+
+
+RUN_TAG = _build_run_tag()
+
+# Application immédiate du seed à tous les RNG. Important de le faire AVANT
+# tout import-side-effect ou allocation pour assurer la reproductibilité.
+np.random.seed(CLI_ARGS.seed)
+torch.manual_seed(CLI_ARGS.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(CLI_ARGS.seed)
+
+print("=" * 70)
+print("Configuration modulaire :")
+print("=" * 70)
+for k, v in MODULES.items():
+    flag = "ON " if v else "OFF"
+    print(f"  [{flag}] {k}")
+print(f"  Features actives  : "
+      f"{[k for k, v in GENE_FEATURE_FLAGS.items() if v]}")
+if _EXCLUDED_FEATURES:
+    print(f"  Features exclues  : {sorted(_EXCLUDED_FEATURES)}")
+print(f"  PPI threshold     : {CLI_ARGS.ppi_score_thresh}")
+print(f"  Coexpr quantile   : {CLI_ARGS.coexpr_top_quantile}")
+print(f"  REACTOME max size : {CLI_ARGS.reactome_max_pathway}")
+print(f"  RUN_TAG           : {RUN_TAG}")
+print()
+
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 # Cette section définit tous les chemins d'accès aux données et les
@@ -73,7 +255,11 @@ LAB_DIR = "/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/"
 BASE_DIR = os.path.join(LAB_DIR, "gnn")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 SCENIC_DIR = os.path.join(BASE_DIR, "output", "pyscenic")
-OUT_DIR = "/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae"
+# OUT_DIR_BASE : racine de sortie. Le run_dir final = OUT_DIR_BASE / RUN_TAG.
+# Cela évite d'écraser une ablation par la suivante : chaque combinaison de
+# modules désactivés (ou hyperparams modifiés) écrit dans son propre dossier.
+OUT_DIR_BASE = "/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae"
+OUT_DIR = os.path.join(OUT_DIR_BASE, RUN_TAG)
 
 # --- Chemins locaux (décommentez pour debug sur votre machine) ---
 # BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -105,20 +291,36 @@ HUMESS_CONDITIONS = ["P4", "P16"]  # Les deux conditions à comparer
 for d in [PPI_DIR, DB_DIR, OUT_DIR, FIG_DIR]:
     os.makedirs(d, exist_ok=True)
 
+# Manifest des modules activés/désactivés pour ce run — sert d'audit pour les
+# études d'ablation (cf. perturb_report.py / cross_seed_report).
+_MANIFEST_PATH = os.path.join(OUT_DIR, "run_config.json")
+with open(_MANIFEST_PATH, "w") as _fh:
+    json.dump({
+        "run_tag": RUN_TAG,
+        "seed": CLI_ARGS.seed,
+        "modules": MODULES,
+        "gene_feature_flags": GENE_FEATURE_FLAGS,
+        "excluded_features": sorted(_EXCLUDED_FEATURES),
+        "ppi_score_thresh": CLI_ARGS.ppi_score_thresh,
+        "coexpr_top_quantile": CLI_ARGS.coexpr_top_quantile,
+        "reactome_max_pathway": CLI_ARGS.reactome_max_pathway,
+    }, _fh, indent=2)
+print(f"  Manifest écrit    : {_MANIFEST_PATH}")
+
 # ── Paramètres du graphe ─────────────────────────────────────────────────────
 # PPI_SCORE_THRESH : seuil de confiance STRING (0-1000). 900 = "highest
 #   confidence". On ne garde que les interactions protéine-protéine très
 #   fiables pour éviter le bruit dans le graphe.
-PPI_SCORE_THRESH = 900
+PPI_SCORE_THRESH = CLI_ARGS.ppi_score_thresh
 # REACTOME_MAX_PATHWAY : taille max d'un pathway REACTOME (en gènes).
 #   Les très grands pathways (ex : "Metabolism") sont non informatifs —
 #   ils connectent trop de gènes entre eux et diluent le signal.
 #   Les très petits (< 2 gènes) ne créent pas d'arêtes utiles.
-REACTOME_MAX_PATHWAY = 20
+REACTOME_MAX_PATHWAY = CLI_ARGS.reactome_max_pathway
 # COEXPR_TOP_QUANTILE : seules les co-expressions GRNBoost2 au-dessus de
 #   ce quantile sont conservées. 0.98 = top 2% des poids → réseau épars
 #   de haute confiance.
-COEXPR_TOP_QUANTILE = 0.98
+COEXPR_TOP_QUANTILE = CLI_ARGS.coexpr_top_quantile
 
 # ── Paramètres du VGAE ──────────────────────────────────────────────────────
 # HIDDEN_DIM : dimension des couches cachées du GNN (après projection des
@@ -308,11 +510,16 @@ print(f"  TF activity : {tf_activity.shape[0]} clusters × {tf_activity.shape[1]
 # Colonnes = TF, target, importance. On ne garde que le top 2% (COEXPR_TOP_QUANTILE)
 # pour avoir un réseau épars de haute confiance. Les poids faibles sont
 # vraisemblablement du bruit et ajouteraient des arêtes non informatives.
-adjacencies = pd.read_csv(os.path.join(SCENIC_DIR, "adjacencies.csv"))
-importance_thresh = adjacencies["importance"].quantile(COEXPR_TOP_QUANTILE)
-adjacencies_filtered = adjacencies[adjacencies["importance"] >= importance_thresh].copy()
-print(f"  Adjacencies : {len(adjacencies)} → {len(adjacencies_filtered)} "
-      f"(top {100*(1-COEXPR_TOP_QUANTILE):.0f}%, seuil={importance_thresh:.2f})")
+# Modulaire : si --no-coexpr, on ne charge même pas le fichier (~700 Mo).
+if MODULES["use_coexpr"]:
+    adjacencies = pd.read_csv(os.path.join(SCENIC_DIR, "adjacencies.csv"))
+    importance_thresh = adjacencies["importance"].quantile(COEXPR_TOP_QUANTILE)
+    adjacencies_filtered = adjacencies[adjacencies["importance"] >= importance_thresh].copy()
+    print(f"  Adjacencies : {len(adjacencies)} → {len(adjacencies_filtered)} "
+          f"(top {100*(1-COEXPR_TOP_QUANTILE):.0f}%, seuil={importance_thresh:.2f})")
+else:
+    print("  Adjacencies : SKIP (--no-coexpr)")
+    adjacencies_filtered = pd.DataFrame(columns=["TF", "target", "importance"])
 
 # =============================================================================
 # 3. SÉLECTION DES GÈNES — BASÉE SUR LA CONNECTIVITÉ (pas les DEGs)
@@ -354,47 +561,55 @@ coexpr_genes &= available_set
 # plusieurs canaux de preuve. On télécharge 2 fichiers :
 #   - links : les interactions (protein1, protein2, combined_score)
 #   - aliases : mapping identifiant STRING → symbole HGNC (ex : ENSP00000... → TP53)
-PPI_FILE = os.path.join(PPI_DIR, "9606.protein.links.v12.0.txt.gz")
-PPI_ALIAS_FILE = os.path.join(PPI_DIR, "9606.protein.aliases.v12.0.txt.gz")
-download_if_absent(
-    "https://stringdb-static.org/download/protein.links.v12.0/9606.protein.links.v12.0.txt.gz",
-    PPI_FILE, "STRING links"
-)
-download_if_absent(
-    "https://stringdb-static.org/download/protein.aliases.v12.0/9606.protein.aliases.v12.0.txt.gz",
-    PPI_ALIAS_FILE, "STRING aliases"
-)
-
-# Construction du mapping symbole ↔ identifiant STRING.
-# On filtre par "Ensembl_HGNC" pour avoir des symboles de gènes standards
-# (ex : TP53, CDKN1A) et non des alias ambigus. Cela évite les collisions
-# où un alias pourrait correspondre à plusieurs protéines.
-aliases = pd.read_csv(PPI_ALIAS_FILE, sep="\t", compression="gzip")
-aliases_filt = aliases[
-    (aliases["alias"].isin(available_set)) &
-    (aliases["source"].str.contains("Ensembl_HGNC", na=False))
-]
-# sym2string : "TP53" → "9606.ENSP00000269305"
-sym2string = dict(zip(aliases_filt["alias"], aliases_filt["#string_protein_id"]))
-# string2sym : inverse, pour reconvertir après filtrage
-string2sym = {v: k for k, v in sym2string.items()}
-string_ids = set(sym2string.values())
-
-# Chargement du réseau PPI complet puis filtrage :
-# 1. Les deux protéines doivent être dans notre ensemble de gènes
-# 2. Le combined_score doit dépasser PPI_SCORE_THRESH (900 = highest confidence)
-ppi_raw = pd.read_csv(PPI_FILE, sep=" ", compression="gzip")
-ppi_hc = ppi_raw[
-    (ppi_raw["protein1"].isin(string_ids)) &
-    (ppi_raw["protein2"].isin(string_ids)) &
-    (ppi_raw["combined_score"] >= PPI_SCORE_THRESH)
-]
-# Extraction des symboles de gènes impliqués dans au moins une PPI fiable
+# Modulaire : si --no-ppi, on saute le téléchargement et la lecture (~1.6 Go),
+# ppi_hc / string2sym restent vides, aucune arête PPI ne sera créée.
 ppi_genes = set()
-for _, row in ppi_hc.iterrows():
-    s1, s2 = string2sym.get(row["protein1"]), string2sym.get(row["protein2"])
-    if s1 and s2:
-        ppi_genes.update([s1, s2])
+ppi_hc = pd.DataFrame(columns=["protein1", "protein2", "combined_score"])
+sym2string = {}
+string2sym = {}
+if MODULES["use_ppi"]:
+    PPI_FILE = os.path.join(PPI_DIR, "9606.protein.links.v12.0.txt.gz")
+    PPI_ALIAS_FILE = os.path.join(PPI_DIR, "9606.protein.aliases.v12.0.txt.gz")
+    download_if_absent(
+        "https://stringdb-static.org/download/protein.links.v12.0/9606.protein.links.v12.0.txt.gz",
+        PPI_FILE, "STRING links"
+    )
+    download_if_absent(
+        "https://stringdb-static.org/download/protein.aliases.v12.0/9606.protein.aliases.v12.0.txt.gz",
+        PPI_ALIAS_FILE, "STRING aliases"
+    )
+
+    # Construction du mapping symbole ↔ identifiant STRING.
+    # On filtre par "Ensembl_HGNC" pour avoir des symboles de gènes standards
+    # (ex : TP53, CDKN1A) et non des alias ambigus. Cela évite les collisions
+    # où un alias pourrait correspondre à plusieurs protéines.
+    aliases = pd.read_csv(PPI_ALIAS_FILE, sep="\t", compression="gzip")
+    aliases_filt = aliases[
+        (aliases["alias"].isin(available_set)) &
+        (aliases["source"].str.contains("Ensembl_HGNC", na=False))
+    ]
+    # sym2string : "TP53" → "9606.ENSP00000269305"
+    sym2string = dict(zip(aliases_filt["alias"], aliases_filt["#string_protein_id"]))
+    # string2sym : inverse, pour reconvertir après filtrage
+    string2sym = {v: k for k, v in sym2string.items()}
+    string_ids = set(sym2string.values())
+
+    # Chargement du réseau PPI complet puis filtrage :
+    # 1. Les deux protéines doivent être dans notre ensemble de gènes
+    # 2. Le combined_score doit dépasser PPI_SCORE_THRESH (900 = highest confidence)
+    ppi_raw = pd.read_csv(PPI_FILE, sep=" ", compression="gzip")
+    ppi_hc = ppi_raw[
+        (ppi_raw["protein1"].isin(string_ids)) &
+        (ppi_raw["protein2"].isin(string_ids)) &
+        (ppi_raw["combined_score"] >= PPI_SCORE_THRESH)
+    ]
+    # Extraction des symboles de gènes impliqués dans au moins une PPI fiable
+    for _, row in ppi_hc.iterrows():
+        s1, s2 = string2sym.get(row["protein1"]), string2sym.get(row["protein2"])
+        if s1 and s2:
+            ppi_genes.update([s1, s2])
+else:
+    print("  STRING PPI : SKIP (--no-ppi)")
 
 # --- 3d. Gènes REACTOME (pathways biologiques) ---
 # REACTOME via MSigDB : fichier GMT (Gene Matrix Transposed) où chaque ligne
@@ -402,24 +617,28 @@ for _, row in ppi_hc.iterrows():
 # On filtre par taille : un pathway de 2-20 gènes est informatif. Au-delà de
 # REACTOME_MAX_PATHWAY gènes, le pathway est trop générique (ex : "Metabolism")
 # et connecterait des gènes sans rapport fonctionnel direct.
-MSIGDB_REACTOME = os.path.join(DB_DIR, "c2.cp.reactome.symbols.gmt")
-download_if_absent(
-    "https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2024.1.Hs/c2.cp.reactome.v2024.1.Hs.symbols.gmt",
-    MSIGDB_REACTOME, "MSigDB REACTOME"
-)
-# Parse du fichier GMT REACTOME : on ne garde que les pathways de taille
-# raisonnable (2 à REACTOME_MAX_PATHWAY gènes) après intersection avec
-# les gènes disponibles dans notre matrice scRNA-seq.
+# Modulaire : si --no-reactome, on saute le téléchargement et le parse.
 reactome_pathways = {}   # nom_pathway → set(gènes)
 reactome_genes = set()   # union de tous les gènes dans au moins un pathway
-with open(MSIGDB_REACTOME) as f:
-    for line in f:
-        parts = line.strip().split("\t")
-        # parts[0] = nom du pathway, parts[1] = URL, parts[2:] = gènes
-        genes_in_pw = set(parts[2:]) & available_set
-        if 2 <= len(genes_in_pw) <= REACTOME_MAX_PATHWAY:
-            reactome_pathways[parts[0]] = genes_in_pw
-            reactome_genes |= genes_in_pw
+if MODULES["use_reactome"]:
+    MSIGDB_REACTOME = os.path.join(DB_DIR, "c2.cp.reactome.symbols.gmt")
+    download_if_absent(
+        "https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2024.1.Hs/c2.cp.reactome.v2024.1.Hs.symbols.gmt",
+        MSIGDB_REACTOME, "MSigDB REACTOME"
+    )
+    # Parse du fichier GMT REACTOME : on ne garde que les pathways de taille
+    # raisonnable (2 à REACTOME_MAX_PATHWAY gènes) après intersection avec
+    # les gènes disponibles dans notre matrice scRNA-seq.
+    with open(MSIGDB_REACTOME) as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            # parts[0] = nom du pathway, parts[1] = URL, parts[2:] = gènes
+            genes_in_pw = set(parts[2:]) & available_set
+            if 2 <= len(genes_in_pw) <= REACTOME_MAX_PATHWAY:
+                reactome_pathways[parts[0]] = genes_in_pw
+                reactome_genes |= genes_in_pw
+else:
+    print("  REACTOME : SKIP (--no-reactome)")
 
 # --- 3e. UNION FINALE : tous les gènes connectés par au moins un réseau ---
 # connected_genes = SCENIC ∪ GRNBoost2 ∪ PPI ∪ REACTOME
@@ -611,46 +830,51 @@ print("=" * 70)
 # C'est un graphe COMPLET (chaque groupe est connecté à chaque gène),
 # donc n_arêtes = 5 groupes × n_genes.
 expr_src, expr_dst, expr_attrs = [], [], []
-for grp_idx, grp in enumerate(CELL_GROUPS):
-    stats = group_stats[grp]
-    # cluster_id sert à récupérer le score AUCell : None pour P4 (pas de
-    # clustering), 0-3 pour les clusters P16.
-    cluster_id = None if grp == "P4" else int(grp.split("_")[-1])
+if MODULES["use_cell_group_edges"]:
+    for grp_idx, grp in enumerate(CELL_GROUPS):
+        stats = group_stats[grp]
+        # cluster_id sert à récupérer le score AUCell : None pour P4 (pas de
+        # clustering), 0-3 pour les clusters P16.
+        cluster_id = None if grp == "P4" else int(grp.split("_")[-1])
 
-    for gene_idx in range(n_genes):
-        gene_name = gene_symbols[gene_idx]
-        # tf_activity : score AUCell du TF dans ce cluster. Vaut 0 si le
-        # gène n'est pas un TF ou si on est dans P4 (pas de clusters).
-        tf_act = 0.0
-        if cluster_id is not None and gene_name in tf_activity.columns:
-            if cluster_id in tf_activity.index:
-                tf_act = float(tf_activity.loc[cluster_id, gene_name])
+        for gene_idx in range(n_genes):
+            gene_name = gene_symbols[gene_idx]
+            # tf_activity : score AUCell du TF dans ce cluster. Vaut 0 si le
+            # gène n'est pas un TF ou si on est dans P4 (pas de clusters).
+            tf_act = 0.0
+            if cluster_id is not None and gene_name in tf_activity.columns:
+                if cluster_id in tf_activity.index:
+                    tf_act = float(tf_activity.loc[cluster_id, gene_name])
 
-        expr_src.append(grp_idx)     # Index du noeud cell_group source
-        expr_dst.append(gene_idx)    # Index du noeud gene destination
-        expr_attrs.append([
-            float(stats["mean_expression"][gene_idx]),   # Feature 1 : expression moyenne
-            float(stats["pct_expressing"][gene_idx]),     # Feature 2 : % de cellules exprimant
-            tf_act,                                       # Feature 3 : activité TF (AUCell)
-            float(stats["std_expression"][gene_idx]),     # Feature 4 : écart-type
-            float(stats["cv_expression"][gene_idx]),      # Feature 5 : coefficient de variation
-            float(stats["q25"][gene_idx]),                # Feature 6 : 1er quartile
-            float(stats["q75"][gene_idx]),                # Feature 7 : 3ème quartile
-        ])
+            expr_src.append(grp_idx)     # Index du noeud cell_group source
+            expr_dst.append(gene_idx)    # Index du noeud gene destination
+            expr_attrs.append([
+                float(stats["mean_expression"][gene_idx]),   # Feature 1 : expression moyenne
+                float(stats["pct_expressing"][gene_idx]),     # Feature 2 : % de cellules exprimant
+                tf_act,                                       # Feature 3 : activité TF (AUCell)
+                float(stats["std_expression"][gene_idx]),     # Feature 4 : écart-type
+                float(stats["cv_expression"][gene_idx]),      # Feature 5 : coefficient de variation
+                float(stats["q25"][gene_idx]),                # Feature 6 : 1er quartile
+                float(stats["q75"][gene_idx]),                # Feature 7 : 3ème quartile
+            ])
 
 # Conversion en tenseurs PyG (format COO : [2, n_edges])
-edge_index_expresses = torch.tensor([expr_src, expr_dst], dtype=torch.long)
-edge_attr_expresses = torch.tensor(expr_attrs, dtype=torch.float)
+edge_index_expresses = (torch.tensor([expr_src, expr_dst], dtype=torch.long)
+                        if expr_src else torch.zeros((2, 0), dtype=torch.long))
+edge_attr_expresses = (torch.tensor(expr_attrs, dtype=torch.float)
+                       if expr_attrs else torch.zeros((0, 7), dtype=torch.float))
 # Z-score normalisation colonne par colonne pour que chaque feature ait
 # mean=0 et std=1. Important pour GATConv qui calcule des scores d'attention
 # sur les features d'arête — sans normalisation, les features à grande
 # échelle domineraient le calcul d'attention.
-for col in range(edge_attr_expresses.shape[1]):
-    col_data = edge_attr_expresses[:, col]
-    mu, std = col_data.mean(), col_data.std() + 1e-8
-    edge_attr_expresses[:, col] = (col_data - mu) / std
+if edge_attr_expresses.numel() > 0:
+    for col in range(edge_attr_expresses.shape[1]):
+        col_data = edge_attr_expresses[:, col]
+        mu, std = col_data.mean(), col_data.std() + 1e-8
+        edge_attr_expresses[:, col] = (col_data - mu) / std
 print(f"  expresses : {edge_index_expresses.shape[1]} arêtes, "
-      f"7 features [mean, pct, tf_act, std, cv, q25, q75]")
+      f"7 features [mean, pct, tf_act, std, cv, q25, q75]"
+      + ("" if MODULES["use_cell_group_edges"] else " [SKIP --no-cell-group-edges]"))
 
 # ── 6b. PPI STRING ──────────────────────────────────────────────────────────
 # Arêtes protéine-protéine de STRING (>= 900, highest confidence).
@@ -660,18 +884,22 @@ print(f"  expresses : {edge_index_expresses.shape[1]} arêtes, "
 # Les hubs PPI (gènes avec beaucoup de partenaires) reçoivent plus de
 # messages et tendent à avoir des embeddings plus informatifs.
 ppi_src, ppi_dst, ppi_w = [], [], []
-for _, row in ppi_hc.iterrows():
-    s1, s2 = string2sym.get(row["protein1"]), string2sym.get(row["protein2"])
-    if s1 and s2 and s1 in gene_to_idx and s2 in gene_to_idx:
-        i, j = gene_to_idx[s1], gene_to_idx[s2]
-        # Bidirectionnel : on ajoute les deux directions
-        ppi_src.extend([i, j])
-        ppi_dst.extend([j, i])
-        ppi_w.extend([row["combined_score"] / 1000.0] * 2)  # Même poids dans les deux sens
+if MODULES["use_ppi"]:
+    for _, row in ppi_hc.iterrows():
+        s1, s2 = string2sym.get(row["protein1"]), string2sym.get(row["protein2"])
+        if s1 and s2 and s1 in gene_to_idx and s2 in gene_to_idx:
+            i, j = gene_to_idx[s1], gene_to_idx[s2]
+            # Bidirectionnel : on ajoute les deux directions
+            ppi_src.extend([i, j])
+            ppi_dst.extend([j, i])
+            ppi_w.extend([row["combined_score"] / 1000.0] * 2)  # Même poids dans les deux sens
 
-edge_index_ppi = torch.tensor([ppi_src, ppi_dst], dtype=torch.long)
-edge_attr_ppi = torch.tensor(ppi_w, dtype=torch.float).unsqueeze(1)  # (n_edges, 1)
-print(f"  ppi : {len(ppi_src)//2} interactions ({len(ppi_src)} arêtes)")
+edge_index_ppi = (torch.tensor([ppi_src, ppi_dst], dtype=torch.long)
+                  if ppi_src else torch.zeros((2, 0), dtype=torch.long))
+edge_attr_ppi = (torch.tensor(ppi_w, dtype=torch.float).unsqueeze(1)
+                 if ppi_w else torch.zeros((0, 1), dtype=torch.float))
+print(f"  ppi : {len(ppi_src)//2} interactions ({len(ppi_src)} arêtes)"
+      + ("" if MODULES["use_ppi"] else " [SKIP --no-ppi]"))
 
 # ── 6c. REACTOME (same_pathway) ─────────────────────────────────────────────
 # Pour chaque pathway REACTOME (2 à 20 gènes), on crée une arête entre
@@ -684,23 +912,26 @@ print(f"  ppi : {len(ppi_src)//2} interactions ({len(ppi_src)} arêtes)")
 # Le message passing propagera l'information au sein des modules fonctionnels.
 react_src, react_dst = [], []
 react_pairs = set()  # Déduplique les paires (un gène peut être dans plusieurs pathways)
-for pw_genes in reactome_pathways.values():
-    gene_list = sorted(pw_genes)
-    # Double boucle : toutes les paires (i, j) avec i < j (évite les doublons a↔b / b↔a)
-    for i_idx in range(len(gene_list)):
-        for j_idx in range(i_idx + 1, len(gene_list)):
-            g1, g2 = gene_list[i_idx], gene_list[j_idx]
-            if g1 in gene_to_idx and g2 in gene_to_idx:
-                pair = (min(gene_to_idx[g1], gene_to_idx[g2]),
-                        max(gene_to_idx[g1], gene_to_idx[g2]))
-                if pair not in react_pairs:
-                    react_pairs.add(pair)
-                    # Bidirectionnel
-                    react_src.extend([pair[0], pair[1]])
-                    react_dst.extend([pair[1], pair[0]])
+if MODULES["use_reactome"]:
+    for pw_genes in reactome_pathways.values():
+        gene_list = sorted(pw_genes)
+        # Double boucle : toutes les paires (i, j) avec i < j (évite les doublons a↔b / b↔a)
+        for i_idx in range(len(gene_list)):
+            for j_idx in range(i_idx + 1, len(gene_list)):
+                g1, g2 = gene_list[i_idx], gene_list[j_idx]
+                if g1 in gene_to_idx and g2 in gene_to_idx:
+                    pair = (min(gene_to_idx[g1], gene_to_idx[g2]),
+                            max(gene_to_idx[g1], gene_to_idx[g2]))
+                    if pair not in react_pairs:
+                        react_pairs.add(pair)
+                        # Bidirectionnel
+                        react_src.extend([pair[0], pair[1]])
+                        react_dst.extend([pair[1], pair[0]])
 
-edge_index_pathway = torch.tensor([react_src, react_dst], dtype=torch.long)
-print(f"  pathway : {len(react_pairs)} paires ({len(react_src)} arêtes)")
+edge_index_pathway = (torch.tensor([react_src, react_dst], dtype=torch.long)
+                     if react_src else torch.zeros((2, 0), dtype=torch.long))
+print(f"  pathway : {len(react_pairs)} paires ({len(react_src)} arêtes)"
+      + ("" if MODULES["use_reactome"] else " [SKIP --no-reactome]"))
 
 # ── 6d. Regulon (pySCENIC) — arêtes "regulates" ────────────────────────────
 # Liens DIRIGÉS TF → gène cible (pas bidirectionnel à ce stade).
@@ -714,26 +945,31 @@ print(f"  pathway : {len(react_pairs)} paires ({len(react_src)} arêtes)")
 # pas d'information vers les TFs qui les régulent.
 reg_src, reg_dst, reg_w = [], [], []
 reg_pairs = set()  # Déduplique si un TF régule la même cible dans plusieurs regulons
-for _, row in regulon_edges.iterrows():
-    tf, target = row["TF_clean"], row["target_gene"]
-    if tf in gene_to_idx and target in gene_to_idx:
-        pair = (gene_to_idx[tf], gene_to_idx[target])
-        if pair not in reg_pairs:
-            reg_pairs.add(pair)
-            reg_src.append(pair[0])      # TF (source)
-            reg_dst.append(pair[1])      # Cible (destination)
-            reg_w.append(float(row["weight"]))  # Poids de régulation
+if MODULES["use_scenic_regulons"]:
+    for _, row in regulon_edges.iterrows():
+        tf, target = row["TF_clean"], row["target_gene"]
+        if tf in gene_to_idx and target in gene_to_idx:
+            pair = (gene_to_idx[tf], gene_to_idx[target])
+            if pair not in reg_pairs:
+                reg_pairs.add(pair)
+                reg_src.append(pair[0])      # TF (source)
+                reg_dst.append(pair[1])      # Cible (destination)
+                reg_w.append(float(row["weight"]))  # Poids de régulation
 
-edge_index_regulates = torch.tensor([reg_src, reg_dst], dtype=torch.long)
-edge_attr_regulates = torch.tensor(reg_w, dtype=torch.float).unsqueeze(1)
+edge_index_regulates = (torch.tensor([reg_src, reg_dst], dtype=torch.long)
+                       if reg_src else torch.zeros((2, 0), dtype=torch.long))
+edge_attr_regulates = (torch.tensor(reg_w, dtype=torch.float).unsqueeze(1)
+                      if reg_w else torch.zeros((0, 1), dtype=torch.float))
 # Normalisation min-max par le poids max (les poids SCENIC ne sont pas bornés)
 if edge_attr_regulates.numel() > 0:
     edge_attr_regulates = edge_attr_regulates / (edge_attr_regulates.max() + 1e-8)
 # Arête inverse "regulated_by" : cible → TF (même poids, sens inversé).
 # Permet aux TFs de recevoir de l'information de leurs cibles pendant
 # le message passing.
-edge_index_regulated_by = torch.tensor([reg_dst, reg_src], dtype=torch.long)
-print(f"  regulates : {len(reg_pairs)} liens TF→cible")
+edge_index_regulated_by = (torch.tensor([reg_dst, reg_src], dtype=torch.long)
+                          if reg_src else torch.zeros((2, 0), dtype=torch.long))
+print(f"  regulates : {len(reg_pairs)} liens TF→cible"
+      + ("" if MODULES["use_scenic_regulons"] else " [SKIP --no-scenic-regulons]"))
 
 # ── 6e. Co-expression (GRNBoost2) ──────────────────────────────────────────
 # Arêtes de co-expression inférées par GRNBoost2 (top 2% des poids).
@@ -744,17 +980,18 @@ print(f"  regulates : {len(reg_pairs)} liens TF→cible")
 # Feature = importance GRNBoost2 normalisée par le max.
 coexpr_src, coexpr_dst, coexpr_w = [], [], []
 coexpr_pairs = set()
-for _, row in adjacencies_filtered.iterrows():
-    g1, g2 = str(row["TF"]), str(row["target"])
-    if g1 in gene_to_idx and g2 in gene_to_idx:
-        i, j = gene_to_idx[g1], gene_to_idx[g2]
-        pair = (min(i, j), max(i, j))
-        if pair not in coexpr_pairs:
-            coexpr_pairs.add(pair)
-            coexpr_src.extend([i, j])
-            coexpr_dst.extend([j, i])
-            imp = float(row["importance"])
-            coexpr_w.extend([imp, imp])
+if MODULES["use_coexpr"]:
+    for _, row in adjacencies_filtered.iterrows():
+        g1, g2 = str(row["TF"]), str(row["target"])
+        if g1 in gene_to_idx and g2 in gene_to_idx:
+            i, j = gene_to_idx[g1], gene_to_idx[g2]
+            pair = (min(i, j), max(i, j))
+            if pair not in coexpr_pairs:
+                coexpr_pairs.add(pair)
+                coexpr_src.extend([i, j])
+                coexpr_dst.extend([j, i])
+                imp = float(row["importance"])
+                coexpr_w.extend([imp, imp])
 
 # Conversion en tenseurs PyG. Si aucune co-expression n'a été trouvée,
 # on crée un tenseur vide (0 arêtes) pour éviter les erreurs en aval.
@@ -766,7 +1003,8 @@ coexpr_w_tensor = (torch.tensor(coexpr_w, dtype=torch.float).unsqueeze(1)
 # Normalisation min-max par le max
 if coexpr_w_tensor.numel() > 0:
     coexpr_w_tensor = coexpr_w_tensor / (coexpr_w_tensor.max() + 1e-8)
-print(f"  coexpression : {len(coexpr_pairs)} paires ({len(coexpr_src)} arêtes)")
+print(f"  coexpression : {len(coexpr_pairs)} paires ({len(coexpr_src)} arêtes)"
+      + ("" if MODULES["use_coexpr"] else " [SKIP --no-coexpr]"))
 
 # ── 6f. HuMess : cocatalysis (A) + importance métabolique (B) ───────────────
 # HuMess (Métabolisme Humain par Échantillonnage de Solutions) est un pipeline
@@ -807,70 +1045,75 @@ def _parse_gpr(gpr_str):
     return {t for t in _gene_token_re.findall(cleaned) if t not in _gpr_skip}
 
 
-# --- PARTIE A : parse des GPR rules par condition ---
+# --- PARTIE A : parse des GPR rules par condition (arêtes cocatalysis) ---
 # Pour chaque condition (P4, P16), on charge les GPR rules du modèle
 # métabolique CarveMe et on identifie quels gènes catalysent quelles réactions.
 # Format du fichier : réaction_id <TAB> GPR_rule
 # Exemple : "R_PFK → (PFKL or PFKM or PFKP)"
+# Modulaire : si --no-humess-edges, on n'ouvre même pas les fichiers GPR.
 reaction_to_genes = {}   # condition → {réaction : set(gènes)}
 gene_to_reactions = {c: {} for c in HUMESS_CONDITIONS}  # condition → {gène : set(réactions)}
-
-for cond in HUMESS_CONDITIONS:
-    path = os.path.join(HUMESS_DIR, "models", cond, "stats", "carveme.gr-rules.tsv")
-    cond_map = {}
-    if not os.path.exists(path):
-        print(f"    [warn] introuvable : {path}")
-        reaction_to_genes[cond] = cond_map
-        continue
-    with open(path) as fh:
-        for line in fh:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) < 2:
-                continue
-            rxn, gpr = parts[0], parts[1]
-            genes = _parse_gpr(gpr)  # Extrait les gènes de la règle GPR
-            cond_map[rxn] = genes
-            # Index inverse : pour chaque gène, stocker les réactions qu'il catalyse
-            for g in genes:
-                gene_to_reactions[cond].setdefault(g, set()).add(rxn)
-    reaction_to_genes[cond] = cond_map
-    print(f"    {cond} : {len(cond_map)} réactions, "
-          f"{len(gene_to_reactions[cond])} gènes")
-
-# Construction des paires de cocatalyse (indices graphe).
-# Deux gènes sont co-catalytiques s'ils apparaissent dans la même GPR rule
-# (= catalysent la même réaction). Le flag [in_P4, in_P16] indique dans
-# quelle(s) condition(s) ce lien existe. Exemple :
-#   [1, 1] = la réaction existe dans les deux conditions
-#   [1, 0] = la réaction n'existe que dans P4 (perdue en sénescence)
-#   [0, 1] = la réaction apparaît en P16 (gain métabolique en sénescence)
 cocat_pair_flags = {}  # (index_gene_i, index_gene_j) → [in_P4, in_P16]
-for cond_idx, cond in enumerate(HUMESS_CONDITIONS):
-    for rxn, genes in reaction_to_genes[cond].items():
-        # Convertir les symboles en indices du graphe (ignorer les gènes absents)
-        idx_list = sorted({gene_to_idx[g] for g in genes if g in gene_to_idx})
-        # Toutes les paires (graphe complet intra-réaction)
-        for a in range(len(idx_list)):
-            for b in range(a + 1, len(idx_list)):
-                pair = (idx_list[a], idx_list[b])
-                flags = cocat_pair_flags.setdefault(pair, [0.0, 0.0])
-                flags[cond_idx] = 1.0  # Marquer la condition dans le flag
-
-# Conversion en arêtes bidirectionnelles avec features [in_P4, in_P16]
 cocat_src, cocat_dst, cocat_attr = [], [], []
-for (i, j), flags in cocat_pair_flags.items():
-    cocat_src.extend([i, j])       # Bidirectionnel
-    cocat_dst.extend([j, i])
-    cocat_attr.append(flags)       # Même flags dans les deux sens
-    cocat_attr.append(flags)
+
+if MODULES["use_humess_edges"]:
+    for cond in HUMESS_CONDITIONS:
+        path = os.path.join(HUMESS_DIR, "models", cond, "stats", "carveme.gr-rules.tsv")
+        cond_map = {}
+        if not os.path.exists(path):
+            print(f"    [warn] introuvable : {path}")
+            reaction_to_genes[cond] = cond_map
+            continue
+        with open(path) as fh:
+            for line in fh:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 2:
+                    continue
+                rxn, gpr = parts[0], parts[1]
+                genes = _parse_gpr(gpr)  # Extrait les gènes de la règle GPR
+                cond_map[rxn] = genes
+                # Index inverse : pour chaque gène, stocker les réactions qu'il catalyse
+                for g in genes:
+                    gene_to_reactions[cond].setdefault(g, set()).add(rxn)
+        reaction_to_genes[cond] = cond_map
+        print(f"    {cond} : {len(cond_map)} réactions, "
+              f"{len(gene_to_reactions[cond])} gènes")
+
+    # Construction des paires de cocatalyse (indices graphe).
+    # Deux gènes sont co-catalytiques s'ils apparaissent dans la même GPR rule
+    # (= catalysent la même réaction). Le flag [in_P4, in_P16] indique dans
+    # quelle(s) condition(s) ce lien existe. Exemple :
+    #   [1, 1] = la réaction existe dans les deux conditions
+    #   [1, 0] = la réaction n'existe que dans P4 (perdue en sénescence)
+    #   [0, 1] = la réaction apparaît en P16 (gain métabolique en sénescence)
+    for cond_idx, cond in enumerate(HUMESS_CONDITIONS):
+        for rxn, genes in reaction_to_genes[cond].items():
+            # Convertir les symboles en indices du graphe (ignorer les gènes absents)
+            idx_list = sorted({gene_to_idx[g] for g in genes if g in gene_to_idx})
+            # Toutes les paires (graphe complet intra-réaction)
+            for a in range(len(idx_list)):
+                for b in range(a + 1, len(idx_list)):
+                    pair = (idx_list[a], idx_list[b])
+                    flags = cocat_pair_flags.setdefault(pair, [0.0, 0.0])
+                    flags[cond_idx] = 1.0  # Marquer la condition dans le flag
+
+    # Conversion en arêtes bidirectionnelles avec features [in_P4, in_P16]
+    for (i, j), flags in cocat_pair_flags.items():
+        cocat_src.extend([i, j])       # Bidirectionnel
+        cocat_dst.extend([j, i])
+        cocat_attr.append(flags)       # Même flags dans les deux sens
+        cocat_attr.append(flags)
+else:
+    print("    cocatalysis : SKIP (--no-humess-edges)")
 
 edge_index_cocat = torch.tensor(
     [cocat_src, cocat_dst] if cocat_src else [[], []], dtype=torch.long
 )
 edge_attr_cocat = (torch.tensor(cocat_attr, dtype=torch.float)
                    if cocat_attr else torch.zeros((0, 2)))
-print(f"    cocatalysis : {len(cocat_pair_flags)} paires "
-      f"({edge_index_cocat.shape[1]} arêtes, attr=[in_P4, in_P16])")
+if MODULES["use_humess_edges"]:
+    print(f"    cocatalysis : {len(cocat_pair_flags)} paires "
+          f"({edge_index_cocat.shape[1]} arêtes, attr=[in_P4, in_P16])")
 
 # --- PARTIE B : importance métabolique par gène ---
 # Corner Sampling (CS) estime l'importance de chaque gène dans le modèle
@@ -880,21 +1123,24 @@ print(f"    cocatalysis : {len(cocat_pair_flags)} paires "
 gene_importance = {c: np.zeros(n_genes, dtype=np.float32) for c in HUMESS_CONDITIONS}
 gene_in_model = {c: np.zeros(n_genes, dtype=np.float32) for c in HUMESS_CONDITIONS}
 
-for cond in HUMESS_CONDITIONS:
-    path = os.path.join(HUMESS_DIR, "models", cond, "cs",
-                        f"cs_gene_to_importance_{cond}.tsv")
-    if not os.path.exists(path):
-        print(f"    [warn] introuvable : {path}")
-        continue
-    df_imp = pd.read_csv(path, sep="\t")
-    # Format : symbol, bigg (réaction), importance (une ligne par (gène, réaction))
-    df_imp = df_imp.dropna(subset=["symbol", "importance"])
-    # Max importance par symbole : agrège les réactions → 1 valeur par gène
-    agg = df_imp.groupby("symbol")["importance"].max()
-    for sym, val in agg.items():
-        if sym in gene_to_idx:
-            gene_importance[cond][gene_to_idx[sym]] = float(val)
-            gene_in_model[cond][gene_to_idx[sym]] = 1.0  # Marquer comme "a des données HuMess"
+if MODULES["use_humess_features"]:
+    for cond in HUMESS_CONDITIONS:
+        path = os.path.join(HUMESS_DIR, "models", cond, "cs",
+                            f"cs_gene_to_importance_{cond}.tsv")
+        if not os.path.exists(path):
+            print(f"    [warn] introuvable : {path}")
+            continue
+        df_imp = pd.read_csv(path, sep="\t")
+        # Format : symbol, bigg (réaction), importance (une ligne par (gène, réaction))
+        df_imp = df_imp.dropna(subset=["symbol", "importance"])
+        # Max importance par symbole : agrège les réactions → 1 valeur par gène
+        agg = df_imp.groupby("symbol")["importance"].max()
+        for sym, val in agg.items():
+            if sym in gene_to_idx:
+                gene_importance[cond][gene_to_idx[sym]] = float(val)
+                gene_in_model[cond][gene_to_idx[sym]] = 1.0  # Marquer comme "a des données HuMess"
+else:
+    print("    HuMess gene importance : SKIP (--no-humess-features)")
 
 # Transformation log1p + z-score par condition.
 # log1p : compresse les valeurs extrêmes (l'importance brute peut varier
@@ -947,26 +1193,38 @@ for idx in reg_src + reg_dst:
     reg_degree[idx] += 1
 reg_degree_norm = reg_degree / (reg_degree.max() + 1e-8)
 
-# ASSEMBLAGE FINAL DES FEATURES DE NOEUDS "gene" — 8 dimensions :
-# [0] is_tf            : facteur de transcription (binaire)
-# [1] variance_norm    : variabilité d'expression inter-groupes (0-1)
-# [2] ppi_degree_norm  : degré PPI normalisé (0-1)
-# [3] reg_degree_norm  : degré de régulation normalisé (0-1)
-# [4] imp_P4_z         : importance métabolique en P4 (z-score)
-# [5] imp_P16_z        : importance métabolique en P16 (z-score)
-# [6] imp_delta         : delta d'importance P16-P4 (remodelage métabolique)
-# [7] has_humess        : masque HuMess (binaire, 1 si données disponibles)
-# AUCUNE de ces features ne contient log2FC, padj, ou delta_pct.
+# ASSEMBLAGE FINAL DES FEATURES DE NOEUDS "gene" (modulaire — V3.5+) :
+# Chaque colonne n'est incluse que si GENE_FEATURE_FLAGS[name] est True
+# (dépend (a) de la source activée, (b) de --exclude-features).
+# Ordre canonique conservé : is_tf, variance, ppi_degree, reg_degree,
+# imp_P4, imp_P16, imp_delta, has_humess. AUCUNE feature ne contient
+# log2FC, padj, ou delta_pct (anti-circularité).
+_FEATURE_VECTORS = [
+    ("is_tf",      is_tf),
+    ("variance",   variance_norm),
+    ("ppi_degree", ppi_degree_norm),
+    ("reg_degree", reg_degree_norm),
+    ("imp_P4",     imp_P4_z),
+    ("imp_P16",    imp_P16_z),
+    ("imp_delta",  imp_delta),
+    ("has_humess", has_humess),
+]
+_active_feature_names = [n for n, _ in _FEATURE_VECTORS if GENE_FEATURE_FLAGS[n]]
+_active_feature_arrays = [v for n, v in _FEATURE_VECTORS if GENE_FEATURE_FLAGS[n]]
+
+# Garantie d'au moins une feature : si tout est exclu, on retombe sur un
+# vecteur de biais constant pour ne pas casser nn.Linear(0, hidden).
+if not _active_feature_arrays:
+    print("    [warn] toutes les features exclues — fallback bias constant")
+    _active_feature_names = ["bias"]
+    _active_feature_arrays = [np.ones(n_genes, dtype=np.float32)]
+
 gene_features = torch.tensor(
-    np.column_stack([
-        is_tf, variance_norm, ppi_degree_norm, reg_degree_norm,
-        imp_P4_z, imp_P16_z, imp_delta, has_humess,
-    ]),
+    np.column_stack(_active_feature_arrays),
     dtype=torch.float,
 )
 print(f"\n  Gene features : {gene_features.shape}")
-print(f"    [is_tf, variance, ppi_degree, reg_degree,")
-print(f"     met_imp_P4, met_imp_P16, met_imp_delta, has_humess]")
+print(f"    actives : {_active_feature_names}")
 print(f"    PAS de log2FC, padj, delta_pct (circularité supprimée)")
 
 # =============================================================================
@@ -1003,32 +1261,33 @@ data["gene"].num_nodes = n_genes
 data["cell_group"].x = cell_group_features  # (5, 3)
 data["cell_group"].num_nodes = len(CELL_GROUPS)
 
-# --- Arêtes bipartites cell_group ↔ gene ---
+# --- Arêtes bipartites cell_group ↔ gene (conditionnelles V3.5+) ---
 # "expresses" : cell_group → gene (le groupe cellulaire exprime le gène)
-data["cell_group", "expresses", "gene"].edge_index = edge_index_expresses
-data["cell_group", "expresses", "gene"].edge_attr = edge_attr_expresses
 # "expressed_in" : gene → cell_group (reverse, mêmes features)
-# Permet au gène de recevoir l'information de ses groupes cellulaires
-data["gene", "expressed_in", "cell_group"].edge_index = torch.stack([
-    edge_index_expresses[1], edge_index_expresses[0]  # Inverse src/dst
-])
-data["gene", "expressed_in", "cell_group"].edge_attr = edge_attr_expresses
+# Skip total si --no-cell-group-edges.
+if edge_index_expresses.numel() > 0:
+    data["cell_group", "expresses", "gene"].edge_index = edge_index_expresses
+    data["cell_group", "expresses", "gene"].edge_attr = edge_attr_expresses
+    data["gene", "expressed_in", "cell_group"].edge_index = torch.stack([
+        edge_index_expresses[1], edge_index_expresses[0]  # Inverse src/dst
+    ])
+    data["gene", "expressed_in", "cell_group"].edge_attr = edge_attr_expresses
 
-# --- Arêtes gene ↔ gene ---
-data["gene", "ppi", "gene"].edge_index = edge_index_ppi
-data["gene", "ppi", "gene"].edge_attr = edge_attr_ppi
-data["gene", "same_pathway", "gene"].edge_index = edge_index_pathway
-# same_pathway n'a pas d'edge_attr (existence binaire suffit)
-data["gene", "regulates", "gene"].edge_index = edge_index_regulates
-data["gene", "regulates", "gene"].edge_attr = edge_attr_regulates
-data["gene", "regulated_by", "gene"].edge_index = edge_index_regulated_by
-data["gene", "regulated_by", "gene"].edge_attr = edge_attr_regulates  # Mêmes poids
-
-# Arêtes conditionnelles (peuvent être vides si pas de données)
+# --- Arêtes gene ↔ gene (toutes conditionnelles V3.5+) ---
+if edge_index_ppi.numel() > 0:
+    data["gene", "ppi", "gene"].edge_index = edge_index_ppi
+    data["gene", "ppi", "gene"].edge_attr = edge_attr_ppi
+if edge_index_pathway.numel() > 0:
+    data["gene", "same_pathway", "gene"].edge_index = edge_index_pathway
+    # same_pathway n'a pas d'edge_attr (existence binaire suffit)
+if edge_index_regulates.numel() > 0:
+    data["gene", "regulates", "gene"].edge_index = edge_index_regulates
+    data["gene", "regulates", "gene"].edge_attr = edge_attr_regulates
+    data["gene", "regulated_by", "gene"].edge_index = edge_index_regulated_by
+    data["gene", "regulated_by", "gene"].edge_attr = edge_attr_regulates  # Mêmes poids
 if edge_index_coexpr.numel() > 0:
     data["gene", "coexpression", "gene"].edge_index = edge_index_coexpr
     data["gene", "coexpression", "gene"].edge_attr = coexpr_w_tensor
-
 if edge_index_cocat.numel() > 0:
     data["gene", "metabolic_cocatalysis", "gene"].edge_index = edge_index_cocat
     data["gene", "metabolic_cocatalysis", "gene"].edge_attr = edge_attr_cocat
@@ -1102,8 +1361,29 @@ class HeteroEncoder(nn.Module):
     SEULS les gènes sont projetés dans l'espace latent (μ, log(σ²)).
     """
 
+    # Catalogue de tous les edge_types possibles dans le graphe, avec leur
+    # dimension d'edge_attr. Filtré dynamiquement à l'init selon les
+    # types réellement présents dans `data.edge_types` (ablations modulaires).
+    # None = pas d'edge_attr → GATConv sans edge_dim (attention purement topologique).
+    EDGE_TYPE_CATALOG = [
+        (("gene", "ppi", "gene"), 1),
+        (("gene", "same_pathway", "gene"), None),
+        (("gene", "regulates", "gene"), 1),
+        (("gene", "regulated_by", "gene"), 1),
+        (("cell_group", "expresses", "gene"), 7),
+        (("gene", "expressed_in", "cell_group"), 7),
+        (("gene", "coexpression", "gene"), 1),
+        (("gene", "metabolic_cocatalysis", "gene"), 2),
+    ]
+
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
-                 n_heads=4, dropout=0.2):
+                 n_heads=4, dropout=0.2, available_edge_types=None):
+        """
+        Args:
+            available_edge_types: itérable de tuples (src, rel, dst) — typiquement
+                `list(data.edge_types)`. Si fourni, seuls les types listés sont
+                instanciés. None = utilise tout le catalogue (rétro-compatible).
+        """
         super().__init__()
         self.n_layers = n_layers
         # Chaque tête d'attention travaille en dimension head_dim = hidden/n_heads.
@@ -1120,22 +1400,26 @@ class HeteroEncoder(nn.Module):
         self.convs = nn.ModuleList()   # N couches de convolution hétérogène
         self.norms = nn.ModuleList()   # N couches de BatchNorm par type de noeud
 
-        # Les 8 types d'arêtes du graphe. Chacun aura son propre GATConv
-        # avec ses propres poids — le modèle apprend des "langages" de
-        # message passing différents pour chaque type de relation biologique.
-        # EDGE_DIMS : nombre de features d'arête par type (None = pas d'edge_attr).
-        # Passé à GATConv via edge_dim → l'attention intègre les features d'arête
-        # (mean_expr, pct, tf_activity, ppi_score, etc.), pas seulement la topologie.
-        edge_types_dims = [
-            (("gene", "ppi", "gene"), 1),
-            (("gene", "same_pathway", "gene"), None),
-            (("gene", "regulates", "gene"), 1),
-            (("gene", "regulated_by", "gene"), 1),
-            (("cell_group", "expresses", "gene"), 7),
-            (("gene", "expressed_in", "cell_group"), 7),
-            (("gene", "coexpression", "gene"), 1),
-            (("gene", "metabolic_cocatalysis", "gene"), 2),
-        ]
+        # Filtrage dynamique du catalogue selon les edge_types réellement
+        # présents dans le graphe (modularité V3.5+ : si --no-coexpr,
+        # le type ("gene", "coexpression", "gene") n'est pas dans data.edge_types
+        # et on n'instancie pas son GATConv).
+        if available_edge_types is None:
+            edge_types_dims = list(self.EDGE_TYPE_CATALOG)
+        else:
+            available = set(tuple(et) for et in available_edge_types)
+            edge_types_dims = [(et, dim) for et, dim in self.EDGE_TYPE_CATALOG
+                               if et in available]
+            # Avertit si des edge_types existent dans le graphe mais pas dans
+            # le catalogue — il faudrait les ajouter à EDGE_TYPE_CATALOG.
+            unknown = available - {et for et, _ in self.EDGE_TYPE_CATALOG}
+            if unknown:
+                print(f"  [warn] edge_types inconnus dans le catalogue : {unknown}")
+        if not edge_types_dims:
+            raise ValueError(
+                "HeteroEncoder : aucun edge_type actif. Vérifie --no-* / la "
+                "présence de data.edge_types."
+            )
         self.edge_dims = {et: dim for et, dim in edge_types_dims}
 
         for _ in range(n_layers):
@@ -1384,13 +1668,14 @@ class VGAE(nn.Module):
 # produit μ, log(σ²) en dimension latent=64 pour chaque gène.
 # Le VGAE enveloppe l'encoder + le décodeur cosinus avec τ.
 encoder = HeteroEncoder(
-    gene_in=gene_features.shape[1],       # 8 features topologiques
+    gene_in=gene_features.shape[1],       # n features actives (modulaire)
     cell_in=cell_group_features.shape[1],  # 3 features de groupe
     hidden=HIDDEN_DIM,                     # 128 (dimension cachée)
     latent=LATENT_DIM,                     # 64 (dimension de l'espace latent)
     n_layers=N_LAYERS,                     # 3 couches de message passing
     n_heads=N_HEADS,                       # 4 têtes d'attention
     dropout=DROPOUT,                       # 0.2
+    available_edge_types=list(data.edge_types),  # filtre selon ablations
 )
 model = VGAE(encoder)
 
@@ -1435,10 +1720,11 @@ all_edges = np.array(list(all_gene_edges))
 n_edges = len(all_edges)
 print(f"  Arêtes gene↔gene uniques : {n_edges}")
 
-# Split train/test aléatoire (seed=42 pour reproductibilité).
+# Split train/test aléatoire — utilise CLI_ARGS.seed (défaut 42) pour
+# reproductibilité ET multi-seed inter-runs (V3.6+).
 # EDGE_SAMPLE_RATIO = 10% des arêtes sont réservées pour le test.
 # Ce split est fait au niveau des paires non dirigées (pas des arêtes bidirectionnelles).
-np.random.seed(42)
+np.random.seed(CLI_ARGS.seed)
 perm = np.random.permutation(n_edges)
 n_test = max(1, int(n_edges * EDGE_SAMPLE_RATIO))
 test_edge_idx = perm[:n_test]      # Premiers 10% → test
@@ -1492,31 +1778,13 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
 x_dict = {"gene": data["gene"].x, "cell_group": data["cell_group"].x}
 edge_index_dict = {}
 edge_attr_dict = {}   # features d'arête passées aux GATConv via edge_dim
-for et_key in [
-    ("cell_group", "expresses", "gene"),
-    ("gene", "expressed_in", "cell_group"),
-    ("gene", "ppi", "gene"),
-    ("gene", "same_pathway", "gene"),
-    ("gene", "regulates", "gene"),
-    ("gene", "regulated_by", "gene"),
-]:
-    edge_index_dict[et_key] = data[et_key].edge_index
-    if "edge_attr" in data[et_key] and data[et_key].edge_attr is not None:
-        edge_attr_dict[et_key] = data[et_key].edge_attr
-# Les arêtes optionnelles (coexpression, cocatalyse) ne sont ajoutées que
-# si elles existent dans le graphe (elles peuvent être vides).
-if ("gene", "coexpression", "gene") in data.edge_types:
-    edge_index_dict[("gene", "coexpression", "gene")] = \
-        data["gene", "coexpression", "gene"].edge_index
-    if data["gene", "coexpression", "gene"].edge_attr is not None:
-        edge_attr_dict[("gene", "coexpression", "gene")] = \
-            data["gene", "coexpression", "gene"].edge_attr
-if ("gene", "metabolic_cocatalysis", "gene") in data.edge_types:
-    edge_index_dict[("gene", "metabolic_cocatalysis", "gene")] = \
-        data["gene", "metabolic_cocatalysis", "gene"].edge_index
-    if data["gene", "metabolic_cocatalysis", "gene"].edge_attr is not None:
-        edge_attr_dict[("gene", "metabolic_cocatalysis", "gene")] = \
-            data["gene", "metabolic_cocatalysis", "gene"].edge_attr
+# Boucle dynamique sur tous les edge_types présents dans le graphe (modularité
+# V3.5+) — auparavant hard-codée, donc cassait sur les ablations partielles.
+for et_key in data.edge_types:
+    store = data[et_key]
+    edge_index_dict[et_key] = store.edge_index
+    if "edge_attr" in store and store.edge_attr is not None:
+        edge_attr_dict[et_key] = store.edge_attr
 
 # Historique pour les plots
 train_losses = []      # Loss totale à chaque epoch
