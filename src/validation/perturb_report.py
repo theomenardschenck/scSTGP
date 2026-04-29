@@ -1076,48 +1076,374 @@ def apply_figure_filters(df: pd.DataFrame, args) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def _compute_driver_score(canon_diff: float, canon_cos: float, n_modes: int,
+                           sign_cons: bool | None, hub: bool,
+                           vgae_rank: int | None = None,
+                           total_genes: int = 10500) -> float:
+    """Continuous driver score ∈ [0, 1] — graph-intrinsic only.
+
+    Aggregates only signals the GNN itself produces : amplitude
+    (log-normalized) + purity (cosine alignment with senescence axis) +
+    coverage (n_modes) + coherence (sign-consistency) + centrality
+    (VGAE rank). External literature evidence (DE-significance, aging
+    DBs) is **not** part of the driver score — it is exposed
+    separately via `validation_score` (corroboration) and inverted in
+    `discovery_score` (graph-only findings). This decoupling lets the
+    user choose between confirmatory and exploratory ranking.
+
+    Weights normalised to 1.0 with amplitude+purity dominant (0.65) so
+    the score reflects the graph signal first, then coverage/coherence
+    (sanity), then centrality (graph context).
+
+    Hub-inflated genes : V3.4 attenuates rather than zeroing-out.
+    Their amplitude is real but partly explained by PPI connectivity,
+    so we down-weight by 0.5 to push them mid-rank — visible but not
+    dominating. The [hub-inflated] tag in `interpretation` is the
+    explicit caveat. Replaces the V3.3 killswitch which made ASNS &
+    TP53 disappear entirely.
+    """
+    # log-normalized amplitude: log10(|x|+1) / log10(500+1) ≈ /2.7
+    amp = float(min(np.log10(abs(canon_diff) + 1.0) / np.log10(501.0), 1.0))
+    purity = float(min(abs(canon_cos), 1.0))
+    coverage = float(n_modes / 3.0)
+    if sign_cons is True:
+        coherence = 1.0
+    elif sign_cons is False:
+        coherence = 0.3   # low but not 0 (keeps non-monotonic candidates visible)
+    else:
+        coherence = 0.5   # NaN (single mode) — neutral
+    centrality = 0.0
+    if vgae_rank is not None and vgae_rank > 0:
+        centrality = max(0.0, 1.0 - vgae_rank / total_genes)
+    # Weights sum to 1.0. Amplitude + purity = 0.65 (graph signal core),
+    # coverage + coherence = 0.25 (sanity), centrality = 0.10 (context).
+    score = (
+        0.35 * amp
+        + 0.30 * purity
+        + 0.15 * coverage
+        + 0.10 * coherence
+        + 0.10 * centrality
+    )
+    if hub:
+        score *= 0.9   # attenuation, not killswitch
+    return float(min(max(score, 0.0), 1.0))
+
+
+def _compute_discovery_score(canon_diff: float,
+                              canon_cos: float,
+                              n_modes: int,
+                              is_de_significant: bool | None,
+                              n_aging_dbs: int,
+                              hub: bool,
+                              low_purity: bool = False,
+                              senescence_specificity: float | None = None,
+                              mean_robustness: float | None = None,
+                              mean_stability: float | None = None
+                              ) -> float:
+    """Discovery score (V3.5) — surfaces graph-only candidates the
+    literature misses. **Independent** of driver_score : a strong
+    driver may still not be a discovery (e.g. TP53 — known + corroborated).
+
+    Hard gates (return 0.0) :
+      * Literature evidence exists : `is_de_significant=True` OR
+        `n_aging_dbs >= 2` → not a discovery (well-known).
+      * Hub-inflated : a hub finding without literature is more likely
+        a topology artefact than a real lead.
+
+    Otherwise, the score combines three intrinsic graph signals
+    (purity, amplitude, coverage) with a graph-quality modulator
+    (robustness × stability) and a cluster-specificity bonus. The
+    weights mirror the driver score conceptually, but are recomputed
+    from raw inputs so neither score depends on the other.
+
+    Formula (post-gate) :
+        signal = 0.40·purity + 0.30·amp + 0.20·coverage + 0.10·spec_bonus
+        score  = signal · graph_quality
+    With :
+        purity         = min(|canon_cos|, 1)
+        amp            = log10(|canon_diff|+1) / log10(501)
+        coverage       = n_modes / 3
+        spec_bonus     = 1 if |senescence_specificity| > 0.3 else 0
+        graph_quality  = 0.5 + 0.5·(robustness × stability)  ∈ [0.5, 1]
+
+    Mild bonus (+0.05) if `n_aging_dbs == 1` — partial hint without
+    being well-known. The result is clamped to [0, 1].
+    """
+    if is_de_significant is True or n_aging_dbs >= 2:
+        return 0.0
+    if hub or low_purity:
+        return 0.0
+    purity = float(min(abs(canon_cos), 1.0))
+    amp = float(min(np.log10(abs(canon_diff) + 1.0) / np.log10(501.0), 1.0))
+    coverage = float(min(n_modes / 3.0, 1.0))
+    spec_bonus = 0.0
+    if (senescence_specificity is not None
+            and abs(senescence_specificity) > 0.3):
+        spec_bonus = 1.0
+    signal = 0.40 * purity + 0.30 * amp + 0.20 * coverage + 0.10 * spec_bonus
+    quality = 1.0
+    if mean_robustness is not None and mean_stability is not None:
+        quality = 0.5 + 0.5 * float(mean_robustness) * float(mean_stability)
+    score = signal * quality
+    if n_aging_dbs == 1:
+        score += 0.05
+    return float(min(max(score, 0.0), 1.0))
+
+
+def _compute_validation_score(is_de_significant: bool | None,
+                               n_aging_dbs: int,
+                               mean_robustness: float | None = None,
+                               mean_stability: float | None = None) -> float:
+    """Validation score (V3.5) — pure literature corroboration,
+    **independent** of driver_score. A strong driver_score with no
+    literature returns 0.0 (nothing to validate).
+
+    The literature signal is modulated by graph-quality (robustness ×
+    stability) so a literature-supported gene whose perturbation signal
+    is unstable across seeds gets penalized — the validation only
+    counts if the GNN's evidence is itself reliable.
+
+    Formula :
+        lit            = 0.5·is_de_significant + min(0.10·n_aging_dbs, 0.5)
+        graph_quality  = 0.5 + 0.5·(robustness × stability)  ∈ [0.5, 1]
+        score          = lit · graph_quality   (0 if lit == 0)
+
+    Clamped to [0, 1].
+    """
+    lit = 0.0
+    if is_de_significant is True:
+        lit += 0.5
+    lit += min(0.10 * max(n_aging_dbs, 0), 0.5)
+    if lit == 0.0:
+        return 0.0
+    quality = 1.0
+    if mean_robustness is not None and mean_stability is not None:
+        quality = 0.5 + 0.5 * float(mean_robustness) * float(mean_stability)
+    return float(min(max(lit * quality, 0.0), 1.0))
+
+
+def _refine_weak_subtag(canon_diff: float, canon_cos: float,
+                         sign_cons: bool | None, n_modes: int,
+                         ko_diff: float | None, kd_diff: float | None,
+                         oe_diff: float | None) -> str:
+    """Sub-tag for the 'weak / noise' bucket (when no driver tag fires).
+
+    Returns one of:
+      * `noise`             — no signal at all
+      * `subthreshold signal` — small but coherent driver-like
+      * `mode-asymmetric weak` — single mode produces a real but small effect
+      * `diffuse weak`      — amplitude but cascade dispersed (low cos)
+      * `marginal`          — close to threshold, borderline
+    """
+    a, c = abs(canon_diff), abs(canon_cos)
+    if a < 1.0 and c < 0.2:
+        return "noise"
+    # Sub-threshold but coherent driver-like signal.
+    if 1.0 <= a < 20.0 and c >= 0.4 and sign_cons is True:
+        return "subthreshold signal"
+    # Mode asymmetric : at least one mode has a real effect, others nearly silent.
+    per_mode_diffs = [abs(d) for d in (ko_diff, kd_diff, oe_diff) if d is not None]
+    if per_mode_diffs:
+        max_d = max(per_mode_diffs)
+        n_strong = sum(1 for d in per_mode_diffs if d >= 5)
+        if 5.0 <= max_d < 50.0 and c >= 0.4 and n_strong == 1:
+            return "mode-asymmetric weak"
+    # Diffuse but real amplitude.
+    if a >= 20.0 and c < 0.3:
+        return "diffuse weak"
+    return "marginal"
+
+
 def _gene_interpretation(canon_diff: float, canon_cos: float, ppi_deg: int,
                          hub: bool, sign_cons: bool | None, n_modes: int,
                          min_ppi_degree: int = 5,
                          senescence_specificity: float | None = None,
                          vgae_rank: int | None = None,
-                         is_de_significant: bool | None = None) -> str:
+                         is_de_significant: bool | None = None,
+                         n_aging_dbs: int = 0,
+                         ko_diff: float | None = None,
+                         kd_diff: float | None = None,
+                         oe_diff: float | None = None,
+                         oe_cos: float | None = None,
+                         mean_abs_extent: float | None = None,
+                         mean_abs_degree_metric: float | None = None,
+                         driver_score: float | None = None,
+                         is_tf: bool = False,
+                         mean_robustness: float | None = None,
+                         mean_stability: float | None = None,
+                         min_robustness: float = 0.5,
+                         min_stability: float = 0.7,
+                         low_purity: bool = False) -> str:
     """One-line interpretation per gene.
 
-    Base verdict from canon_diff / canon_cos / sign-consistency, then
-    enriched by optional context: senescence-specificity (cluster), VGAE
-    centrality rank, DE-significance.
+    All genes are tagged (no early-exit filtering) — quality issues are
+    surfaced as prefixes / suffixes so the user sees the verdict
+    alongside the caveat.
+
+    Prefixes (when applicable, applied in order):
+      * `[unreliable] ...` — mean_robustness < min_robustness OR
+        mean_stability < min_stability. The interpretation that follows
+        is the *would-be* verdict if the signal were stable.
+      * `[hub-inflated] ...` — `is_hub_inflated == True`. Verdict is
+        kept but the user is warned the amplitude likely reflects PPI
+        connectivity, not directional causation.
+      * `[incoherent] ...` — `sign_consistent == False` and the gene
+        does not match a non-monotonic pattern. The verdict shown is
+        what the gene would be tagged if its OE/loss were coherent —
+        offered as user-discretion.
+
+    Tier-1 / Tier-2 extensions (preserved) : non-monotonic driver,
+    borderline non-monotonic, weak non-monotonic (Tier-3, new — for
+    very low |KD| like ANXA1), gain-of-function-only, adaptive cosine,
+    TF-aware, low-PPI exception.
+
+    New tags (V3.4) :
+      * `low-amplitude direction-pure marker` — 0.5 < |cos| ≤ 0.7 AND
+        |diff| < 5. Captures direction-pure but quasi-silent
+        regulators (HELLS, DIAPH3 with |cos|≈0.7).
+      * `[low PPI deg=N — high literature support]` suffix — for genes
+        with `ppi_deg < min_ppi_degree` AND (DE-sig OR aging DBs ≥ 2).
+        These genes were previously discarded with the generic
+        'low PPI degree' tag — now they keep a proper verdict.
     """
-    if hub:
-        return "hub-inflated (filter out)"
+    is_unreliable = (
+        (mean_robustness is not None and mean_robustness < min_robustness) or
+        (mean_stability is not None and mean_stability < min_stability)
+    )
+
+    base: str | None = None
+    direction_word_global = "pro-senescence" if canon_diff > 0 else "anti-senescence"
+
+    # Low-PPI handling : exception preserved for high-literature genes,
+    # but instead of bailing out we just flag with a suffix and let the
+    # rest of the logic compute a verdict.
+    peripheral_warn = False
+    low_ppi_high_lit = False
     if ppi_deg < min_ppi_degree:
-        return f"low PPI degree (<{min_ppi_degree}, insufficient context)"
-    if sign_cons is False:
-        return "incoherent (OE and loss-of-function point same direction)"
+        literature_support = bool(is_de_significant is True or n_aging_dbs >= 2)
+        strong_signal = abs(canon_diff) > 50 and abs(canon_cos) > 0.5
+        if strong_signal and literature_support:
+            peripheral_warn = True
+        elif literature_support:
+            # New : low-PPI genes with literature support get a tag +
+            # the would-be verdict. Surfaced separately in
+            # cross_seed_gene_ranking_low_ppi_high_lit.tsv.
+            low_ppi_high_lit = True
+        else:
+            # Genuine low-context : no PPI propagation, no literature.
+            base = f"low PPI degree (<{min_ppi_degree}, insufficient context)"
 
-    direction_word = "pro-senescence" if canon_diff > 0 else "anti-senescence"
-    base = "weak / noise"
-    if n_modes >= 2 and sign_cons is True and abs(canon_cos) > 0.5:
+    # Tier-1 extension : non-monotonic driver detection.
+    # When sign_cons is False but the KD↔OE pair is itself coherent, the
+    # incoherence comes from KO alone — likely cellular compensation or
+    # the edge-cut artefact of the KO algorithm.
+    if (base is None and sign_cons is False and n_modes == 3 and
+            ko_diff is not None and kd_diff is not None and oe_diff is not None):
+        ko_oe_same = (np.sign(ko_diff) == np.sign(oe_diff))
+        kd_oe_opposite_sign = (np.sign(kd_diff) == -np.sign(oe_diff))
+        # Strict (Tier-1) : |KD|>5, |OE|>30.
+        if (kd_oe_opposite_sign and ko_oe_same
+                and abs(kd_diff) > 5 and abs(oe_diff) > 30):
+            d = "pro-senescence" if oe_diff > 0 else "anti-senescence"
+            base = (f"non-monotonic {d} driver "
+                    f"(KD/OE coherent, KO compensation-suspect)")
+        # Relaxed (Tier-2) : |KD|>3, |OE|>15.
+        elif (kd_oe_opposite_sign and ko_oe_same
+                and abs(kd_diff) > 3 and abs(oe_diff) > 15):
+            d = "pro-senescence" if oe_diff > 0 else "anti-senescence"
+            base = (f"borderline non-monotonic {d} candidate "
+                    f"(KD/OE coherent, KO unreliable)")
+        # Tier-3 (V3.4, new) : very relaxed |KD|>1, |OE|>5 BUT requires
+        # an additional pure-cosine constraint (|canon_cos|>0.6) to
+        # avoid noise. Recovers ANXA1 (|KD|=2.3, |OE|=10.4, cos=−0.81).
+        elif (kd_oe_opposite_sign and ko_oe_same
+                and abs(kd_diff) > 1 and abs(oe_diff) > 5
+                and abs(canon_cos) > 0.6):
+            d = "pro-senescence" if oe_diff > 0 else "anti-senescence"
+            base = (f"weak non-monotonic {d} candidate "
+                    f"(KD/OE coherent, small KD effect)")
+
+    # Tier-1 extension : gain-of-function-only candidate.
+    if (base is None and sign_cons is True and
+            oe_diff is not None and oe_cos is not None and
+            ko_diff is not None and kd_diff is not None and
+            abs(oe_diff) > 30 and abs(oe_cos) > 0.4 and
+            abs(ko_diff) < 5 and abs(kd_diff) < 5):
+        d = "pro-senescence" if oe_diff > 0 else "anti-senescence"
+        base = f"gain-of-function-only {d} candidate"
+
+    # Standard driver tags. Compute even when sign_cons is False (so
+    # incoherent rows can carry a "would-be" verdict).
+    pure = abs(canon_cos) > 0.5
+    diffuse_amplitudinal = abs(canon_cos) > 0.3 and abs(canon_diff) > 80
+    is_directional = pure or diffuse_amplitudinal
+    relaxed_directional = (
+        is_de_significant is False and
+        abs(canon_cos) > 0.4 and abs(canon_diff) > 30
+    )
+    tf_directional = (
+        is_tf and
+        abs(canon_cos) > 0.25 and abs(canon_diff) > 20 and
+        (is_de_significant is True or n_aging_dbs >= 2)
+    )
+    # Sign-coherence required for "true" driver tags ; for incoherent
+    # genes we still compute the verdict (treated as if coherent) so
+    # the user sees what the gene *would* have been tagged.
+    cohere = (sign_cons is True) or (sign_cons is False)
+
+    if base is None and n_modes >= 2 and cohere and is_directional:
         if abs(canon_diff) > 50:
-            base = f"strong {direction_word} driver"
+            base = f"strong {direction_word_global} driver"
         elif abs(canon_diff) > 20:
-            base = f"moderate {direction_word} driver"
-    elif n_modes == 1 and abs(canon_cos) > 0.5 and abs(canon_diff) > 50:
-        base = f"single-mode {direction_word} candidate"
-    elif abs(canon_cos) > 0.7 and abs(canon_diff) < 20:
+            base = f"moderate {direction_word_global} driver"
+    if base is None and n_modes >= 2 and cohere and relaxed_directional:
+        if abs(canon_diff) > 50:
+            base = f"strong {direction_word_global} driver"
+        else:
+            base = f"moderate {direction_word_global} driver"
+    if base is None and n_modes >= 2 and cohere and tf_directional:
+        base = f"moderate {direction_word_global} driver"
+    if base is None and n_modes == 1 and abs(canon_cos) > 0.5 and abs(canon_diff) > 50:
+        base = f"single-mode {direction_word_global} candidate"
+    # Small-but-pure marker — high cosine, low amplitude. Previously
+    # masked by the elif-chain ; now reachable as a fallthrough from
+    # the directional branches when amplitude is too small to be a
+    # driver. Catches TACC3 / DIAPH3 (|cos|≈0.74-0.75, |diff|≈0.1).
+    if base is None and abs(canon_cos) > 0.7 and abs(canon_diff) < 20:
         base = "small but pure (potential marker / fine-tuned regulator)"
+    # Low-amplitude direction-pure marker (V3.4, new) — bridges the
+    # gap between 'small but pure' (|cos|>0.7) and 'marginal'.
+    # Captures HELLS (|cos|=0.69, |diff|=0.1) and similar effectors.
+    if base is None and 0.5 < abs(canon_cos) <= 0.7 and abs(canon_diff) < 5:
+        base = "low-amplitude direction-pure marker"
+    if base is None:
+        base = _refine_weak_subtag(canon_diff, canon_cos, sign_cons,
+                                    n_modes, ko_diff, kd_diff, oe_diff)
 
-    # Enrichments — only attach if base is a meaningful driver tag.
-    is_driver_tag = ("driver" in base) or ("candidate" in base)
+    # Enrichments — attach suffixes to any tag carrying a real signal :
+    # drivers/candidates (strict + relaxed), 'subthreshold signal',
+    # 'mode-asymmetric weak', 'small but pure', 'low-amplitude
+    # direction-pure marker'. Excluded: noise, marginal, diffuse weak
+    # (no/poor purity), low_ppi (no graph context).
+    is_driver_tag = (
+        ("driver" in base) or ("candidate" in base) or
+        ("subthreshold signal" in base) or
+        ("mode-asymmetric weak" in base) or
+        ("small but pure" in base) or
+        ("low-amplitude direction-pure marker" in base)
+    )
     suffixes = []
 
     # Cluster specificity : senescence_specificity = cosine_senescent
     # (P16_c1+c2+c3) − cosine_quiescent_like (P4+P16_c0). |val| > 0.3 → spécifique.
-    if senescence_specificity is not None and is_driver_tag:
-        if abs(senescence_specificity) > 0.3:
-            suffixes.append("senescence-cluster-specific")
-        elif abs(senescence_specificity) < 0.1:
-            suffixes.append("pan-cluster")
+    # NB: Tier-2 diagnostic showed all 5 cluster axes are highly colinear
+    # (ρ > 0.92 across pairs) → 95% of drivers fall within |spec|<0.1
+    # ('pan-cluster'). The pan-cluster suffix was therefore non-informative
+    # and removed; only the rare 'senescence-cluster-specific' (1.6% of
+    # drivers) is kept. See §10.13bisbis 'Limites du modèle'.
+    if (senescence_specificity is not None and is_driver_tag
+            and abs(senescence_specificity) > 0.3):
+        suffixes.append("senescence-cluster-specific")
 
     # VGAE centrality enrichment (vgae_rank in 1..N, lower = more central).
     if vgae_rank is not None and vgae_rank > 0:
@@ -1134,10 +1460,346 @@ def _gene_interpretation(canon_diff: float, canon_cos: float, ppi_deg: int,
         suffixes.append("DE-significant (literature-aligned)")
     elif is_de_significant is False and is_driver_tag:
         suffixes.append("non-DE (graph-only finding)")
+        # Discovery boost : non-DE + aging DBs hit → strong discovery signal
+        # (gene known to be aging-relevant despite no DE in this dataset —
+        # likely post-transcriptional or context-dependent regulation).
+        if n_aging_dbs >= 2:
+            suffixes.append("aging-DB-anchored discovery")
 
+    # Tier-1.5 : cascade architecture (extent → concentrated/diffuse).
+    if mean_abs_extent is not None and is_driver_tag:
+        if mean_abs_extent > 0.01:
+            suffixes.append("concentrated cascade")
+        elif mean_abs_extent < 0.002:
+            suffixes.append("diffuse cascade")
+
+    # Tier-1.5 : impact-per-connection (degree metric → "small but mighty").
+    if (mean_abs_degree_metric is not None
+            and is_driver_tag and mean_abs_degree_metric > 5.0):
+        suffixes.append("high impact-per-connection")
+
+    # Tier-1.5 : peripheral PPI warning (deg < min_ppi_degree exception).
+    if peripheral_warn and is_driver_tag:
+        suffixes.append(f"peripheral PPI deg={ppi_deg} — WARN")
+
+    # V3.4 : low-PPI high-literature genes (no PPI context but DE/aging
+    # support). Different from peripheral_warn (which already requires
+    # strong signal). Surfaces metallothionein-type markers (MT1E, etc.).
+    if low_ppi_high_lit and is_driver_tag:
+        suffixes.append(f"low PPI deg={ppi_deg} — high literature support")
+
+    # TF marker — pleiotropy expected, low cosine is normal here.
+    if is_tf and is_driver_tag:
+        suffixes.append("transcription factor (pleiotropy expected)")
+
+    # Compose the verdict body.
+    body = f"{base} [{' | '.join(suffixes)}]" if suffixes else base
+
+    # Quality prefixes — applied last, in order from most-blocking to
+    # least. The user sees the would-be verdict alongside the caveat
+    # rather than a hard-filtered nothing.
+    prefixes = []
+    if is_unreliable:
+        prefixes.append("unreliable")
+    if hub:
+        prefixes.append("hub-inflated")
+    elif low_purity:
+        # V3.5 : amplitude forte mais cosine < 0.3 sans être un hub PPI
+        # (deg ≤ 200). Le signal est réel (pas explicable par la
+        # connectivité), juste à direction faible — laisser le verdict
+        # mais avertir que la pureté directionnelle est limite.
+        prefixes.append("low-purity signal")
+    if sign_cons is False and not (
+            base.startswith("non-monotonic")
+            or base.startswith("borderline non-monotonic")
+            or base.startswith("weak non-monotonic")):
+        prefixes.append("incoherent")
+    if prefixes:
+        return f"[{' | '.join(prefixes)}] {body}"
+    return body
+
+
+def _pathway_interpretation(canon_diff: float, canon_cos: float,
+                             hub: bool, sign_cons: bool | None, n_modes: int,
+                             ko_diff: float | None, kd_diff: float | None,
+                             oe_diff: float | None,
+                             mean_abs_extent: float | None = None) -> str:
+    """Pathway-specific interpretation.
+
+    Same logic as `_gene_interpretation` but with thresholds adjusted to
+    the pathway-scale of canon_diff (P95 ≈ 420 vs ≈ 30 for genes).
+
+    Tags:
+      * `strong {pro/anti}-senescence pathway` — n_modes ≥ 2,
+        sign-consistent, |cos|>0.4 (pathways have lower cos on average),
+        |diff|>100.
+      * `moderate {pro/anti}-senescence pathway` — |diff| ∈ ]30, 100].
+      * `non-monotonic {direction} pathway (KD/OE coherent, KO compensation-suspect)`
+      * `single-mode {direction} candidate pathway`
+      * `weak / noise`, `hub-inflated`, `incoherent` as for genes.
+    """
+    if hub:
+        return "hub-inflated (filter out)"
+
+    base: str | None = None
+
+    # Non-monotonic detection (same logic, pathway-scaled thresholds).
+    if (sign_cons is False and n_modes == 3 and
+            ko_diff is not None and kd_diff is not None and oe_diff is not None):
+        ko_oe_same = (np.sign(ko_diff) == np.sign(oe_diff))
+        kd_oe_opposite_sign = (np.sign(kd_diff) == -np.sign(oe_diff))
+        if (kd_oe_opposite_sign and ko_oe_same
+                and abs(kd_diff) > 20 and abs(oe_diff) > 100):
+            d = "pro-senescence" if oe_diff > 0 else "anti-senescence"
+            base = (f"non-monotonic {d} pathway "
+                    f"(KD/OE coherent, KO compensation-suspect)")
+    if base is None and sign_cons is False:
+        return "incoherent (OE and loss-of-function point same direction)"
+
+    direction_word = "pro-senescence" if canon_diff > 0 else "anti-senescence"
+    if base is None:
+        base = "weak / noise"
+        # Pathway-scaled thresholds (P95 of |canon_diff| ≈ 420).
+        pure = abs(canon_cos) > 0.4
+        diffuse_amplitudinal = abs(canon_cos) > 0.3 and abs(canon_diff) > 200
+        is_directional = pure or diffuse_amplitudinal
+        if n_modes >= 2 and sign_cons is True and is_directional:
+            if abs(canon_diff) > 100:
+                base = f"strong {direction_word} pathway"
+            elif abs(canon_diff) > 30:
+                base = f"moderate {direction_word} pathway"
+        elif n_modes == 1 and abs(canon_cos) > 0.4 and abs(canon_diff) > 100:
+            base = f"single-mode {direction_word} candidate pathway"
+
+    is_driver_tag = ("pathway" in base and
+                      ("driver" not in base or "non-monotonic" in base) and
+                      "incoherent" not in base and
+                      "hub" not in base and
+                      "weak" not in base)
+    suffixes = []
+    if mean_abs_extent is not None and is_driver_tag:
+        if mean_abs_extent > 0.05:
+            suffixes.append("concentrated cascade")
+        elif mean_abs_extent < 0.005:
+            suffixes.append("diffuse cascade")
     if suffixes:
         return f"{base} [{' | '.join(suffixes)}]"
     return base
+
+
+def build_pathway_ranking(df: pd.DataFrame,
+                           min_robustness: float = 0.7,
+                           min_stability: float = 0.7) -> pd.DataFrame:
+    """Per-pathway cross-mode ranking (pathways only).
+
+    Mirrors `build_gene_ranking` but on the is_pathway==True subset and
+    with pathway-scaled interpretation thresholds. No PPI degree filter,
+    no VGAE/DE lookup (those are gene-level concepts).
+    """
+    if df.empty:
+        return pd.DataFrame()
+    pw = df[df["is_pathway"] == True].copy()  # noqa: E712
+    if pw.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for target, sub in pw.groupby("target"):
+        modes = {r["mode"]: r for _, r in sub.iterrows()}
+        oe = modes.get("overexpress")
+        ko = modes.get("knockout")
+        kd = modes.get("knockdown")
+        loss = ko if ko is not None else kd
+
+        n_modes = sum(1 for m in (oe, ko, kd) if m is not None)
+        sign_cons: bool | None = None
+        if oe is not None and loss is not None:
+            sign_cons = bool(np.sign(oe["avg_proj_signed_diff"])
+                              == -np.sign(loss["avg_proj_signed_diff"]))
+
+        max_abs_diff = float(sub["avg_proj_signed_diff"].abs().max())
+        max_abs_cos = float(sub["avg_proj_signed_cosine"].abs().max())
+        mean_extent = float(sub["avg_proj_signed_extent"].abs().mean())
+        mean_robustness = float(sub["robustness_score"].mean())
+        mean_stability = float(sub["direction_stability"].mean())
+        any_hub = bool(sub["is_hub_inflated"].any())
+
+        # Canonical direction = sign of OE (gain pushes natural direction).
+        if oe is not None:
+            canon_sign = float(np.sign(oe["avg_proj_signed_diff"]))
+            canon_diff = float(oe["avg_proj_signed_diff"])
+            canon_cos = float(oe["avg_proj_signed_cosine"])
+        elif loss is not None:
+            canon_sign = float(-np.sign(loss["avg_proj_signed_diff"]))
+            canon_diff = float(-loss["avg_proj_signed_diff"])
+            canon_cos = float(-loss["avg_proj_signed_cosine"])
+        else:
+            canon_sign = 0.0
+            canon_diff = 0.0
+            canon_cos = 0.0
+
+        if canon_sign > 0:
+            direction = "pro-senescence"
+        elif canon_sign < 0:
+            direction = "anti-senescence"
+        else:
+            direction = "neutral"
+        if sign_cons is False:
+            direction += " (mixed)"
+
+        ko_diff_val = float(ko["avg_proj_signed_diff"]) if ko is not None else None
+        kd_diff_val = float(kd["avg_proj_signed_diff"]) if kd is not None else None
+        oe_diff_val = float(oe["avg_proj_signed_diff"]) if oe is not None else None
+
+        interp = _pathway_interpretation(
+            canon_diff, canon_cos, any_hub, sign_cons, n_modes,
+            ko_diff_val, kd_diff_val, oe_diff_val,
+            mean_abs_extent=mean_extent,
+        )
+
+        rec = {
+            "pathway": target,
+            # Pathway driver_score : pathway-scaled. Amplitude normalised
+            # by P95(|diff|) ≈ 420; no DE/VGAE/aging-DB lit boost.
+            "driver_score": round(_compute_pathway_driver_score(
+                canon_diff, canon_cos, n_modes, sign_cons, any_hub), 3),
+            "n_modes_present": n_modes,
+            "mean_robustness": round(mean_robustness, 2),
+            "mean_stability": round(mean_stability, 2),
+            "canon_diff": round(canon_diff, 1),
+            "canon_cosine": round(canon_cos, 3),
+            "max_abs_diff": round(max_abs_diff, 1),
+            "max_abs_cosine": round(max_abs_cos, 3),
+            "mean_abs_extent": round(mean_extent, 4),
+            "sign_consistent": sign_cons if sign_cons is not None else "",
+            "is_hub_inflated": any_hub,
+            "direction": direction,
+            "interpretation": interp,
+            "KO_diff": round(float(ko["avg_proj_signed_diff"]), 1) if ko is not None else None,
+            "KD_diff": round(float(kd["avg_proj_signed_diff"]), 1) if kd is not None else None,
+            "OE_diff": round(float(oe["avg_proj_signed_diff"]), 1) if oe is not None else None,
+            "KO_cos": round(float(ko["avg_proj_signed_cosine"]), 3) if ko is not None else None,
+            "KD_cos": round(float(kd["avg_proj_signed_cosine"]), 3) if kd is not None else None,
+            "OE_cos": round(float(oe["avg_proj_signed_cosine"]), 3) if oe is not None else None,
+        }
+        rows.append(rec)
+
+    out = pd.DataFrame(rows)
+    out = out[(out["mean_robustness"] >= min_robustness) &
+              (out["mean_stability"] >= min_stability) &
+              (~out["is_hub_inflated"])]
+    out = out.sort_values(["driver_score", "max_abs_diff"],
+                          ascending=[False, False]).reset_index(drop=True)
+    return out
+
+
+def _compute_pathway_driver_score(canon_diff: float, canon_cos: float,
+                                    n_modes: int, sign_cons: bool | None,
+                                    hub: bool) -> float:
+    """Pathway-scaled driver score ∈ [0, 1].
+
+    Same structure as gene driver_score but pathway-scaled :
+    amplitude denominator = log10(500+1), no DE/VGAE/aging boost (those
+    are gene-level concepts).
+    """
+    if hub:
+        return 0.0
+    amp = float(min(np.log10(abs(canon_diff) + 1.0) / np.log10(501.0), 1.0))
+    purity = float(min(abs(canon_cos), 1.0))
+    coverage = float(n_modes / 3.0)
+    if sign_cons is True:
+        coherence = 1.0
+    elif sign_cons is False:
+        coherence = 0.3
+    else:
+        coherence = 0.5
+    score = 0.40 * amp + 0.30 * purity + 0.15 * coverage + 0.15 * coherence
+    return float(min(max(score, 0.0), 1.0))
+
+
+def _load_is_tf(seed_paths: list[Path]) -> pd.Series:
+    """Extract `is_tf` (feature index 0) from any seed's hetero_graph_vgae.pt.
+
+    Source : pySCENIC-detected TFs in HUVEC (regulons with motif support,
+    ~62 genes — restricted set). Returns Series indexed by gene symbol,
+    values ∈ {0.0, 1.0}.
+    """
+    for seed in seed_paths:
+        graph_p = seed / "hetero_graph_vgae.pt"
+        emb_p = seed / "gene_embeddings_vgae.csv"
+        if not graph_p.exists() or not emb_p.exists():
+            continue
+        try:
+            import torch
+            data = torch.load(graph_p, weights_only=False)
+            emb = pd.read_csv(emb_p, index_col=0)
+            genes = list(emb.index.astype(str))
+            x = data["gene"].x.numpy()
+            return pd.Series(x[:, 0], index=genes, name="is_tf")
+        except Exception:
+            continue
+    return pd.Series(dtype=float)
+
+
+def _load_reactome_pathways() -> dict[str, set[str]]:
+    """Load REACTOME pathway → gene members mapping. Reuse ora_consensus loader."""
+    try:
+        # Import locally to avoid circular dependency at module level.
+        from ora_consensus import load_reactome_gmt
+        return load_reactome_gmt()
+    except Exception:
+        try:
+            import sys
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from ora_consensus import load_reactome_gmt
+            return load_reactome_gmt()
+        except Exception as e:
+            print(f"[INFO] Could not load REACTOME GMT: {e}")
+            return {}
+
+
+def _build_gene_to_strong_pathways(
+        gene_rank: pd.DataFrame,
+        pw_rank: pd.DataFrame,
+        reactome: dict[str, set[str]]) -> dict[str, list[str]]:
+    """For each gene in `gene_rank`, list strong/moderate REACTOME pathways
+    that contain it AND are flagged driver/candidate in `pw_rank`.
+
+    Returns dict {gene_symbol: ["pw_slug:tag", ...]} with up to 5 pathways
+    per gene (most relevant — strong > moderate > non-monotonic > single-mode).
+    """
+    if not reactome or pw_rank.empty:
+        return {}
+    # Map slug -> original REACTOME name (slugify is approximate, do exact lookup).
+    # The slug used in pw_rank is `pw_<slugified>` (cf. _slugify_pathway).
+    # We rebuild reverse lookup : strong_pw_slugs -> original REACTOME members.
+    strong_tags = ("strong", "moderate", "non-monotonic", "single-mode")
+    pw_filter = pw_rank[pw_rank["interpretation"].astype(str).str.startswith(
+        strong_tags)].copy()
+    if pw_filter.empty:
+        return {}
+    # Build slug -> members mapping. Slug = "pw_" + slugify(REACTOME_name).
+    slug_to_members: dict[str, set[str]] = {}
+    for orig_name, members in reactome.items():
+        slug = "pw_" + _slugify_pathway(orig_name)
+        slug_to_members[slug] = members
+    # For each strong pathway in the ranking, get its members.
+    out: dict[str, list[tuple[str, str]]] = {}
+    for _, row in pw_filter.iterrows():
+        slug = str(row["pathway"])
+        tag = str(row["interpretation"]).split(" [")[0]
+        members = slug_to_members.get(slug, set())
+        for g in members:
+            out.setdefault(g, []).append((slug, tag))
+    # Compress to top 5 per gene (sort by tag rank: strong > moderate > rest).
+    rank_order = {"strong": 0, "moderate": 1, "non-monotonic": 2, "single-mode": 3}
+    def _key(t):
+        return rank_order.get(t[1].split()[0], 9)
+    out_clean: dict[str, list[str]] = {}
+    for g, lst in out.items():
+        lst_sorted = sorted(lst, key=_key)[:5]
+        out_clean[g] = [f"{slug.replace('pw_','')} ({tag.split()[0]})"
+                        for slug, tag in lst_sorted]
+    return out_clean
 
 
 def _load_vgae_baselines(seed_paths: list[Path]) -> pd.DataFrame:
@@ -1174,7 +1836,9 @@ def build_gene_ranking(df: pd.DataFrame,
                         min_stability: float = 0.7,
                         min_ppi_degree: int = 5,
                         vgae_baseline: pd.DataFrame | None = None,
-                        de_top_n: int = 1000) -> pd.DataFrame:
+                        de_top_n: int = 1000,
+                        is_tf_series: pd.Series | None = None,
+                        gene_to_pathways: dict | None = None) -> pd.DataFrame:
     """Per-gene cross-mode ranking (genes only).
 
     For each gene, aggregates the up to 3 perturbation modes (KO/KD/OE)
@@ -1227,6 +1891,13 @@ def build_gene_ranking(df: pd.DataFrame,
         mean_stability = float(sub["direction_stability"].mean())
         ppi_degree = int(sub["target_ppi_degree"].iloc[0])
         any_hub = bool(sub["is_hub_inflated"].any())
+        # V3.5 : low-purity signal flag (high amplitude, low cosine,
+        # but PPI deg ≤ 200 — not mechanically a hub artefact). Backward
+        # compat : older runs without the column → False.
+        if "is_low_purity_signal" in sub.columns:
+            any_low_purity = bool(sub["is_low_purity_signal"].any())
+        else:
+            any_low_purity = False
 
         # Canonical direction = sign of OE (gain-of-function pushes the natural
         # phenotypic direction the gene supports). If OE is absent, use
@@ -1303,17 +1974,77 @@ def build_gene_ranking(df: pd.DataFrame,
                            ("in_genage", "in_cellage", "in_msigdb_aging",
                             "in_ageanno", "in_aging_local"))
 
+        # Per-mode raw diffs/cosines (passed to _gene_interpretation for
+        # Tier-1 tags : non-monotonic, gain-of-function-only).
+        ko_diff_val = float(ko["avg_proj_signed_diff"]) if ko is not None else None
+        kd_diff_val = float(kd["avg_proj_signed_diff"]) if kd is not None else None
+        oe_diff_val = float(oe["avg_proj_signed_diff"]) if oe is not None else None
+        oe_cos_val = float(oe["avg_proj_signed_cosine"]) if oe is not None else None
+
+        # is_tf flag (pySCENIC-detected TF in HUVEC). For TFs, we expect
+        # pleiotropic cascades → relaxed cosine threshold downstream.
+        is_tf_v = False
+        if is_tf_series is not None and target in is_tf_series.index:
+            is_tf_v = bool(int(is_tf_series.loc[target]) == 1)
+
+        # Pathways the gene is a member of, restricted to strong/moderate
+        # pathways from pw_ranking (informative cross-reference).
+        member_of = (gene_to_pathways or {}).get(target, [])
+
+        vgae_rank_int = (int(vgae_rank_v)
+                         if vgae_rank_v is not None and not (
+                             isinstance(vgae_rank_v, float) and np.isnan(vgae_rank_v))
+                         else None)
+
+        # Compute continuous scores (V3.5). The three scores are
+        # **independent** : driver = graph-intrinsic, validation = pure
+        # literature × graph-quality, discovery = graph-novelty for
+        # genes the literature ignores. A high driver_score does NOT
+        # propagate into the other two.
+        driver_score = _compute_driver_score(
+            canon_diff, canon_cos, n_modes, sign_cons, any_hub,
+            vgae_rank=vgae_rank_int)
+        discovery_score = _compute_discovery_score(
+            canon_diff, canon_cos, n_modes,
+            is_de_significant, n_aging_dbs, any_hub,
+            low_purity=any_low_purity,
+            senescence_specificity=senescence_specificity,
+            mean_robustness=mean_robustness,
+            mean_stability=mean_stability)
+        validation_score = _compute_validation_score(
+            is_de_significant, n_aging_dbs,
+            mean_robustness=mean_robustness,
+            mean_stability=mean_stability)
+
         interp = _gene_interpretation(
             canon_diff, canon_cos, ppi_degree, any_hub, sign_cons, n_modes,
             min_ppi_degree=min_ppi_degree,
             senescence_specificity=senescence_specificity,
-            vgae_rank=int(vgae_rank_v) if vgae_rank_v is not None and not (
-                isinstance(vgae_rank_v, float) and np.isnan(vgae_rank_v)) else None,
+            vgae_rank=vgae_rank_int,
             is_de_significant=is_de_significant,
+            n_aging_dbs=n_aging_dbs,
+            ko_diff=ko_diff_val, kd_diff=kd_diff_val,
+            oe_diff=oe_diff_val, oe_cos=oe_cos_val,
+            mean_abs_extent=mean_extent,
+            mean_abs_degree_metric=mean_degree,
+            driver_score=driver_score,
+            is_tf=is_tf_v,
+            mean_robustness=mean_robustness,
+            mean_stability=mean_stability,
+            min_robustness=min_robustness,
+            min_stability=min_stability,
+            low_purity=any_low_purity,
         )
 
         rec = {
             "target": target,
+            # Continuous scores (V3.4) — sort by driver_score (graph-only).
+            # Use discovery_score for graph-only candidates, validation_score
+            # for literature-backed shortlists.
+            "driver_score": round(driver_score, 3),
+            "discovery_score": round(discovery_score, 3),
+            "validation_score": round(validation_score, 3),
+            "is_tf": is_tf_v,
             "n_modes_present": n_modes,
             "mean_robustness": round(mean_robustness, 2),
             "mean_stability": round(mean_stability, 2),
@@ -1331,12 +2062,12 @@ def build_gene_ranking(df: pd.DataFrame,
             "senescence_specificity": round(senescence_specificity, 3) if senescence_specificity is not None else None,
             # Baseline cross-checks
             "vgae_importance": round(float(vgae_importance), 4) if vgae_importance is not None else None,
-            "vgae_rank": int(vgae_rank_v) if vgae_rank_v is not None and not (
-                isinstance(vgae_rank_v, float) and np.isnan(vgae_rank_v)) else None,
+            "vgae_rank": vgae_rank_int,
             "is_de_significant": is_de_significant,
             "n_aging_dbs": n_aging_dbs,
             "sign_consistent": sign_cons if sign_cons is not None else "",
             "is_hub_inflated": any_hub,
+            "is_low_purity_signal": any_low_purity,
             "direction": direction,
             "interpretation": interp,
             # Per-mode breakdown
@@ -1346,15 +2077,22 @@ def build_gene_ranking(df: pd.DataFrame,
             "KO_cos": round(float(ko["avg_proj_signed_cosine"]), 3) if ko is not None else None,
             "KD_cos": round(float(kd["avg_proj_signed_cosine"]), 3) if kd is not None else None,
             "OE_cos": round(float(oe["avg_proj_signed_cosine"]), 3) if oe is not None else None,
+            # Pathway membership — moved to last column (long string,
+            # better at the end for readability of the TSV).
+            "member_of_strong_pathways": ";".join(member_of) if member_of else "",
         }
         rows.append(rec)
 
     out = pd.DataFrame(rows)
-    # Defaults: robustness ≥ X, stability ≥ X, NOT hub-inflated.
-    out = out[(out["mean_robustness"] >= min_robustness) &
-              (out["mean_stability"] >= min_stability) &
-              (~out["is_hub_inflated"])]
-    out = out.sort_values("max_abs_diff", ascending=False).reset_index(drop=True)
+    # V3.4 : do NOT filter. Quality issues (low robustness/stability,
+    # hub-inflated, incoherent, low-PPI) are surfaced in the
+    # `interpretation` column as `[unreliable]`, `[hub-inflated]`,
+    # `[incoherent]` prefixes / `low PPI ...` suffix. The user can
+    # filter post-hoc on `mean_robustness` / `is_hub_inflated` /
+    # `sign_consistent` / `target_ppi_degree`.
+    # Sort by driver_score (graph-only signal) ; tie-break on max_abs_diff.
+    out = out.sort_values(["driver_score", "max_abs_diff"],
+                          ascending=[False, False]).reset_index(drop=True)
     return out
 
 
@@ -1496,11 +2234,22 @@ def aggregate_cross_seed(perturb_dirs: list[Path] | None = None,
         else:
             res["direction"] = "neutral"
 
-        # Hub-inflated flag : effet absolu fort mais cosine faible (cascade
-        # diffuse dominée par la connectivité PPI plutôt que la directionalité).
-        # Critère : |diff| > 50 et |cos| < 0.3 (seuils empiriques V3.3).
+        # Hub-inflated flag (V3.5) : effet absolu fort + cosine faible +
+        # **degré PPI élevé**. Sans la condition de degré, des gènes
+        # borderline (cos ≈ 0.29, deg ≈ 48 — ASNS) étaient flaggés à tort
+        # comme hubs alors que l'inflation par connectivité ne tient pas
+        # mécaniquement. Le seuil 200 sépare proprement les vrais hubs
+        # (UBC, RPS27A, UBA52 — deg > 1000) des gènes simplement à
+        # purety modérée.
+        # Pour les borderline (forte amplitude, cos faible, deg≤200) on
+        # ajoute `is_low_purity_signal` qui nourrit le tag
+        # `[low-purity signal]` dans l'interprétation, sans pénaliser
+        # le driver_score (l'amplitude n'est pas explicable par le hub).
         avg_cos = res.get("avg_proj_signed_cosine", 0.0)
-        res["is_hub_inflated"] = bool(abs(avg_proj) > 50.0 and abs(avg_cos) < 0.3)
+        ppi_deg = res.get("target_ppi_degree", 0.0)
+        is_low_purity = bool(abs(avg_proj) > 50.0 and abs(avg_cos) < 0.3)
+        res["is_hub_inflated"] = bool(is_low_purity and ppi_deg > 200)
+        res["is_low_purity_signal"] = bool(is_low_purity and ppi_deg <= 200)
 
         rows.append(res)
 
@@ -1518,6 +2267,117 @@ def aggregate_cross_seed(perturb_dirs: list[Path] | None = None,
     df = df.sort_values("abs_avg", ascending=False).drop(columns=["abs_avg"])
     
     return df.reset_index(drop=True)
+
+
+def fig_gene_ranking_top_bars(df: pd.DataFrame, out: Path, title: str,
+                               direction: str = "pro",
+                               n: int = 30,
+                               sort_by: str = "driver_score") -> None:
+    """Horizontal bar plot of top-N genes from cross_seed_gene_ranking.
+
+    `direction`: 'pro' or 'anti' — the function filters the corresponding
+    rows of the `direction` column (split on the parenthetical suffix used
+    by build_gene_ranking, e.g. "anti-senescence (mixed)").
+
+    Bar height = `sort_by` (default driver_score). Bars are colored by
+    direction (red=pro / green=anti) and alpha-modulated by |canon_cosine|
+    so direction-pure drivers appear saturated and hub-flavoured rows
+    appear pale.
+
+    Each bar is annotated, on the right, with:
+      - DE-significance (DE✓ / ✗)
+      - n_aging_dbs
+      - |canon_cosine| (= purity of the senescence direction)
+      - target_ppi_degree
+      - quality / status tags drawn from the columns produced by
+        build_gene_ranking : [HUB] [low-purity] [incoherent] [unreliable]
+        [TF]. Alarming tags switch the annotation colour to dark red so
+        the eye picks them up before the score is read.
+    """
+    if df.empty or "direction" not in df.columns or sort_by not in df.columns:
+        return
+    work = df.copy()
+    work["direction_clean"] = (work["direction"].astype(str)
+                               .str.split(r"\s*\(", regex=True).str[0])
+    keep = "pro-senescence" if direction == "pro" else "anti-senescence"
+    sub = work[work["direction_clean"] == keep].copy()
+    if sub.empty:
+        return
+    sub = sub.sort_values(sort_by, ascending=False).head(n)
+    if sub.empty:
+        return
+    sub = sub.iloc[::-1].reset_index(drop=True)  # top driver at top of barh
+
+    fig_h = max(4, 0.35 * len(sub) + 1.2)
+    fig, ax = plt.subplots(figsize=(13, fig_h))
+
+    base_color = "#e76f51" if direction == "pro" else "#2a9d8f"
+    cos_abs = (sub["canon_cosine"].abs().fillna(0.0).values
+               if "canon_cosine" in sub.columns
+               else np.full(len(sub), 1.0))
+    alphas = np.clip(0.30 + 0.65 * cos_abs, 0.30, 0.95)
+
+    y = np.arange(len(sub))
+    scores = sub[sort_by].values.astype(float)
+    for yi, s, a in zip(y, scores, alphas):
+        ax.barh(yi, s, color=base_color, alpha=a,
+                edgecolor="black", linewidth=0.4)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(sub["target"].astype(str), fontsize=9)
+    ax.set_xlabel(sort_by.replace("_", " "))
+    ax.set_title(title)
+    ax.grid(axis="x", alpha=0.3)
+
+    xmax = float(np.nanmax(scores)) if len(scores) and np.isfinite(scores).any() else 1.0
+    if xmax <= 0:
+        xmax = max(1.0, float(np.nanmax(np.abs(scores))) if np.isfinite(scores).any() else 1.0)
+    # Reserve a wide right margin for the annotation strings.
+    ax.set_xlim(0, xmax * 1.75)
+
+    alarm_tags = {"HUB", "low-purity", "incoherent", "unreliable"}
+    for yi, (_, r) in zip(y, sub.iterrows()):
+        s = float(r[sort_by]) if pd.notna(r[sort_by]) else 0.0
+
+        de_flag = bool(r.get("is_de_significant", False))
+        de_str = "DE✓" if de_flag else "DE✗"
+        n_db = int(r["n_aging_dbs"]) if pd.notna(r.get("n_aging_dbs", np.nan)) else 0
+        cos = r.get("canon_cosine", np.nan)
+        cos_str = f"|cos|={abs(cos):.2f}" if pd.notna(cos) else "|cos|=–"
+        ppi = int(r["target_ppi_degree"]) if pd.notna(r.get("target_ppi_degree", np.nan)) else 0
+        info = f"{de_str}  aging_DB={n_db}  {cos_str}  deg={ppi}"
+
+        tags: list[str] = []
+        if bool(r.get("is_hub_inflated", False)):
+            tags.append("HUB")
+        if bool(r.get("is_low_purity_signal", False)):
+            tags.append("low-purity")
+        if r.get("sign_consistent") is False:
+            tags.append("incoherent")
+        rob = r.get("mean_robustness", np.nan)
+        stab = r.get("mean_stability", np.nan)
+        if (pd.notna(rob) and rob < 0.5) or (pd.notna(stab) and stab < 0.7):
+            tags.append("unreliable")
+        if bool(r.get("is_tf", 0)):
+            tags.append("TF")
+        tag_str = " ".join(f"[{t}]" for t in tags)
+
+        text = f"{info}   {tag_str}".rstrip()
+        color = "darkred" if any(t in alarm_tags for t in tags) else "black"
+        ax.text(s + xmax * 0.015, yi, text,
+                va="center", ha="left", fontsize=7.5, color=color,
+                family="monospace")
+
+    legend = ("alpha ∝ |canon_cosine|  (saturated = direction-pure)\n"
+              "tags : [HUB] hub-inflated · [low-purity] |cos|<0.3 ·\n"
+              "       [incoherent] OE/loss same sign · [unreliable] rob<0.5 / stab<0.7 · [TF]")
+    ax.text(0.99, 0.01, legend, transform=ax.transAxes,
+            fontsize=7, ha="right", va="bottom",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.7))
+
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
 
 
 def fig_cross_seed_top_bars(df: pd.DataFrame, out: Path, title: str,
@@ -1892,11 +2752,41 @@ def _collect_seed_summaries(p: Path) -> list[tuple[str, dict]]:
 def run_cross_seed(args) -> None:
     """
     Handler principal pour le mode --cross-seed.
-    
+
     Cette fonction pilote l'agrégation de N seeds (répétitions) et génère
-    un rapport de robustesse incluant les drivers stables, les analyses de 
+    un rapport de robustesse incluant les drivers stables, les analyses de
     transition et les comparaisons de méthodes de calcul de shift.
+
+    Avec ``--figures-only`` on saute toute la phase d'agrégation et
+    d'écriture des TSV : les fichiers ``cross_seed_drivers.tsv`` et
+    ``cross_seed_gene_ranking.tsv`` sont lus depuis ``--report-dir`` (ou le
+    dossier ``cross_seed_report`` par défaut) et seules les figures sont
+    régénérées.
     """
+    # --- Branche --figures-only : on saute l'agrégation, on lit les TSV ---
+    if getattr(args, "figures_only", False):
+        if args.report_dir is not None:
+            out_dir = Path(args.report_dir)
+        else:
+            raw_paths = [Path(p) for p in args.cross_seed]
+            out_dir = _common_seed_parent(raw_paths) / "cross_seed_report"
+        drivers_path = out_dir / "cross_seed_drivers.tsv"
+        gene_rank_path = out_dir / "cross_seed_gene_ranking.tsv"
+        if not drivers_path.exists():
+            print(f"[figures-only] Missing {drivers_path} — cannot regenerate "
+                  f"figures without an existing cross_seed_drivers.tsv.")
+            return
+        print(f"[figures-only] Loading TSVs from {out_dir}")
+        df = pd.read_csv(drivers_path, sep="\t")
+        gene_rank = (pd.read_csv(gene_rank_path, sep="\t")
+                     if gene_rank_path.exists() else pd.DataFrame())
+        if gene_rank.empty:
+            print(f"[figures-only] {gene_rank_path.name} not found — "
+                  f"gene-ranking bar figures will be skipped.")
+        _render_cross_seed_figures(df, gene_rank, args, out_dir)
+        print(f"\n[SUCCESS] Figures regenerated in {out_dir}")
+        return
+
     raw_paths = [Path(p) for p in args.cross_seed]
     seed_summaries: list[list[tuple[str, dict]]] = []
     kept_paths: list[Path] = []
@@ -1922,19 +2812,31 @@ def run_cross_seed(args) -> None:
     out_dir = args.report_dir or (_common_seed_parent(kept_paths) / "cross_seed_report")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Agrégation statistique (Appel à la version étendue de aggregate_cross_seed)
+    # 3. Agrégation statistique. V3.4 : on garde toutes les lignes
+    # (min_robustness/stability=0) pour produire un gene_ranking
+    # exhaustif. Le filtre args.min_robustness / args.min_stability
+    # est ré-appliqué juste après pour les TSV "drivers" et les figures
+    # — comportement identique à V3.3 sur ces sorties.
     print(f"[CROSS-SEED] Aggregating {len(seed_summaries)} seeds → {out_dir}")
-    df = aggregate_cross_seed(
+    df_all = aggregate_cross_seed(
         seed_summaries=seed_summaries,
-        min_robustness=args.min_robustness,
-        min_stability=args.min_stability
+        min_robustness=0.0,
+        min_stability=0.0,
     )
-
-    if df.empty:
+    if df_all.empty:
         print("No drivers passed the robustness / stability thresholds.")
         return
+    # Strict view : same filter as V3.3 — used for cross_seed_drivers*.tsv,
+    # the cross-seed figures, and the pathway ranking input.
+    df = df_all[(df_all["robustness_score"] >= args.min_robustness) &
+                (df_all["direction_stability"] >= args.min_stability)].copy()
 
-    # 4. Export des tables de résultats (TSV) — table complète, sans filtres add.
+    if df.empty:
+        print("[INFO] No drivers passed the strict robustness / stability "
+              "thresholds — drivers TSV / figures will be empty. The "
+              "exhaustive gene_ranking is still produced from df_all.")
+
+    # 4. Export des tables de résultats (TSV) — table strict (drivers only).
     df.to_csv(out_dir / "cross_seed_drivers.tsv", sep="\t", index=False)
     # Séparation gènes vs pathways pour faciliter la lecture bio
     df[~df["is_pathway"]].to_csv(out_dir / "cross_seed_drivers_genes.tsv", sep="\t", index=False)
@@ -1948,31 +2850,160 @@ def run_cross_seed(args) -> None:
     if vgae_baseline.empty:
         print("[INFO] No gene_ranking_vgae.csv found in seed roots — "
               "vgae_importance / is_de_significant columns will be empty.")
-    gene_rank = build_gene_ranking(
+    is_tf_series = _load_is_tf(seed_roots)
+    if is_tf_series.empty:
+        print("[INFO] Could not extract is_tf from any seed graph.")
+    # Pre-compute pathway ranking (we'll re-compute it below for the TSV;
+    # here just to seed the gene-pathway cross-reference). The duplicated
+    # call has cost ~2-3s and keeps the call sites independent.
+    pw_rank_for_xref = build_pathway_ranking(
         df,
+        min_robustness=args.gene_ranking_min_robustness,
+        min_stability=args.gene_ranking_min_stability,
+    )
+    reactome = _load_reactome_pathways()
+    gene_to_pathways = _build_gene_to_strong_pathways(
+        df_all[~df_all["is_pathway"]], pw_rank_for_xref, reactome)
+    # V3.4 : the per-gene ranking sees ALL rows (df_all), not just the
+    # robust ones. Quality is encoded via [unreliable]/[hub-inflated]/
+    # [incoherent] prefixes in `interpretation`.
+    gene_rank = build_gene_ranking(
+        df_all,
         min_robustness=args.gene_ranking_min_robustness,
         min_stability=args.gene_ranking_min_stability,
         min_ppi_degree=args.gene_ranking_min_ppi_degree,
         vgae_baseline=vgae_baseline,
         de_top_n=args.gene_ranking_de_top_n,
+        is_tf_series=is_tf_series,
+        gene_to_pathways=gene_to_pathways,
     )
     if not gene_rank.empty:
+        # V3.4 : exhaustive ranking — all genes present, quality
+        # surfaced via [unreliable]/[hub-inflated]/[incoherent] prefixes
+        # in the `interpretation` column. The user can post-filter on
+        # `mean_robustness`, `is_hub_inflated`, `sign_consistent`,
+        # `target_ppi_degree` if they prefer the V3.3 strict view.
         gene_rank.to_csv(out_dir / "cross_seed_gene_ranking.tsv",
                          sep="\t", index=False)
-        print(f"Wrote cross_seed_gene_ranking.tsv ({len(gene_rank)} genes "
-              f"after default filters: robustness≥{args.gene_ranking_min_robustness}, "
-              f"stability≥{args.gene_ranking_min_stability}, NOT hub-inflated)")
-        # Q1.C: separate export for incoherent rows (sign_consistent==False)
-        # — kept out of main ranking but useful for inspection (noise vs
-        # non-monotonic regulators).
-        incoh = gene_rank[gene_rank["sign_consistent"] == False].copy()  # noqa: E712
+        n_unreliable = gene_rank["interpretation"].astype(str).str.contains(
+            r"\[unreliable", regex=True).sum()
+        n_hub = int(gene_rank["is_hub_inflated"].sum())
+        n_inc = int((gene_rank["sign_consistent"] == False).sum())  # noqa: E712
+        print(f"Wrote cross_seed_gene_ranking.tsv ({len(gene_rank)} genes, "
+              f"exhaustive: {n_unreliable} [unreliable], {n_hub} [hub-inflated], "
+              f"{n_inc} [incoherent] — flagged in `interpretation`)")
+        # Companion export — incoherent-but-tagged subset for users who
+        # want to inspect the non-canonical patterns. Contains TFDP1,
+        # PARD3, etc., that previously fell into a separate file.
+        is_inc = (gene_rank["sign_consistent"] == False)  # noqa: E712
+        interp_str = gene_rank["interpretation"].astype(str)
+        is_non_monotonic = (
+            interp_str.str.contains("non-monotonic", regex=False) |
+            interp_str.str.contains("borderline non-monotonic", regex=False) |
+            interp_str.str.contains("weak non-monotonic", regex=False)
+        )
+        incoh = gene_rank[is_inc & ~is_non_monotonic].copy()
         if not incoh.empty:
             incoh.to_csv(out_dir / "cross_seed_gene_ranking_incoherent.tsv",
                          sep="\t", index=False)
             print(f"Wrote cross_seed_gene_ranking_incoherent.tsv "
-                  f"({len(incoh)} genes with OE/loss same-direction)")
+                  f"({len(incoh)} genes with OE/loss same-direction; "
+                  f"{int(is_non_monotonic.sum())} non-monotonic kept in main "
+                  f"ranking with proper tag)")
 
-    # 4c. Filtres optionnels appliqués AVANT figures uniquement.
+        # V3.4 : low-PPI high-literature companion export.
+        # Surfaces metallothionein-type markers (MT1E, etc.) that are
+        # disconnected in STRING@900 but anchored in aging DBs / DE.
+        is_low_ppi = gene_rank["target_ppi_degree"] < args.gene_ranking_min_ppi_degree
+        has_lit = (
+            (gene_rank["is_de_significant"] == True) |  # noqa: E712
+            (gene_rank["n_aging_dbs"] >= 2)
+        )
+        low_ppi_lit = gene_rank[is_low_ppi & has_lit].copy()
+        if not low_ppi_lit.empty:
+            low_ppi_lit = low_ppi_lit.sort_values(
+                ["validation_score", "max_abs_cosine"],
+                ascending=[False, False]).reset_index(drop=True)
+            low_ppi_lit.to_csv(
+                out_dir / "cross_seed_gene_ranking_low_ppi_high_lit.tsv",
+                sep="\t", index=False)
+            print(f"Wrote cross_seed_gene_ranking_low_ppi_high_lit.tsv "
+                  f"({len(low_ppi_lit)} genes with PPI deg < "
+                  f"{args.gene_ranking_min_ppi_degree} but DE-sig OR ≥2 aging DBs)")
+
+        # Discovery-focused subset : non-DE genes ranked by discovery_score.
+        # Surfaces the graph-only findings (the GNN's value-add over DE).
+        if "is_de_significant" in gene_rank.columns:
+            non_de = gene_rank[gene_rank["is_de_significant"] == False].copy()  # noqa: E712
+            if not non_de.empty:
+                non_de = non_de.sort_values(
+                    ["discovery_score", "driver_score"],
+                    ascending=[False, False]).reset_index(drop=True)
+                # Save top-300 by discovery_score (configurable cutoff).
+                top_disc = non_de.head(300)
+                top_disc.to_csv(out_dir / "cross_seed_gene_ranking_discoveries.tsv",
+                                sep="\t", index=False)
+                print(f"Wrote cross_seed_gene_ranking_discoveries.tsv "
+                      f"(top-{len(top_disc)} non-DE genes by discovery_score)")
+
+        # V3.4 : validation-focused subset — DE-sig OR aging-DB anchored,
+        # ranked by validation_score (literature-corroborated targets).
+        has_validation = (
+            (gene_rank["is_de_significant"] == True) |  # noqa: E712
+            (gene_rank["n_aging_dbs"] >= 1)
+        )
+        validated = gene_rank[has_validation].copy()
+        if not validated.empty:
+            validated = validated.sort_values(
+                ["validation_score", "driver_score"],
+                ascending=[False, False]).reset_index(drop=True)
+            top_val = validated.head(300)
+            top_val.to_csv(out_dir / "cross_seed_gene_ranking_validation.tsv",
+                           sep="\t", index=False)
+            print(f"Wrote cross_seed_gene_ranking_validation.tsv "
+                  f"(top-{len(top_val)} literature-corroborated genes "
+                  f"by validation_score)")
+
+    # 4d. Per-pathway cross-mode ranking (similaire au gene_ranking, mais
+    # sur les pathways = REACTOME slug, sans VGAE/DE/PPI gene-level).
+    pw_rank = build_pathway_ranking(
+        df,
+        min_robustness=args.gene_ranking_min_robustness,
+        min_stability=args.gene_ranking_min_stability,
+    )
+    if not pw_rank.empty:
+        pw_rank.to_csv(out_dir / "cross_seed_pathway_ranking.tsv",
+                       sep="\t", index=False)
+        print(f"Wrote cross_seed_pathway_ranking.tsv ({len(pw_rank)} pathways "
+              f"after default filters: robustness≥{args.gene_ranking_min_robustness}, "
+              f"stability≥{args.gene_ranking_min_stability}, NOT hub-inflated)")
+        # Separate incoherent pathway export (mirror gene logic).
+        is_inc_pw = (pw_rank["sign_consistent"] == False)  # noqa: E712
+        interp_str_pw = pw_rank["interpretation"].astype(str)
+        is_kept_pw = interp_str_pw.str.startswith("non-monotonic")
+        incoh_pw = pw_rank[is_inc_pw & ~is_kept_pw].copy()
+        if not incoh_pw.empty:
+            incoh_pw.to_csv(out_dir / "cross_seed_pathway_ranking_incoherent.tsv",
+                            sep="\t", index=False)
+            print(f"Wrote cross_seed_pathway_ranking_incoherent.tsv "
+                  f"({len(incoh_pw)} pathways; "
+                  f"{int(is_kept_pw.sum())} non-monotonic kept in main)")
+
+    _render_cross_seed_figures(df, gene_rank, args, out_dir)
+
+    print(f"\n[SUCCESS] Cross-seed report and figures written to {out_dir}")
+
+
+def _render_cross_seed_figures(df: pd.DataFrame,
+                               gene_rank: pd.DataFrame,
+                               args,
+                               out_dir: Path) -> None:
+    """Generate every cross-seed figure given the aggregated DataFrames.
+
+    Split out of run_cross_seed so ``--figures-only`` can call it after
+    loading the existing TSVs without redoing the per-seed aggregation.
+    """
+    # Filtres optionnels appliqués AVANT figures uniquement.
     df_fig = apply_figure_filters(df, args)
     if len(df_fig) < len(df):
         print(f"[FILTER] {len(df) - len(df_fig)} rows removed for figures "
@@ -1980,25 +3011,22 @@ def run_cross_seed(args) -> None:
               f"{args.min_abs_cosine}, min_ppi_degree={args.min_ppi_degree}, "
               f"exclude_hubs={args.exclude_hubs}). Now plotting {len(df_fig)} rows.")
 
-    # 5. Génération des Visualisations sur df_fig
+    # Per-mode figures sur df_fig (drivers TSV).
     for mode in MODES:
-        # Filtrage par mode (KD, KO, OE)
         d_mode = df_fig[df_fig["mode"] == mode]
         if d_mode.empty:
             continue
 
-        # Séparation gènes / pathways pour les figures
         d_genes = d_mode[~d_mode["is_pathway"]]
         d_pw = d_mode[d_mode["is_pathway"]]
 
         for suffix, sub in (("genes", d_genes), ("pw", d_pw)):
             if sub.empty:
                 continue
-            
+
             kind = "genes" if suffix == "genes" else "pathways"
             tag_mode = shorten_mode(mode)
 
-            # --- Figures de Robustesse Standard ---
             # Barplot des top drivers avec barres d'erreur (std entre seeds)
             fig_cross_seed_top_bars(
                 sub, out_dir / f"cross_seed_top_{mode}_{suffix}.png",
@@ -2006,46 +3034,52 @@ def run_cross_seed(args) -> None:
                 n_per_side=args.top_per_side
             )
 
-            # --- Figures Transition / Global ---
             sub_fig = sub.copy()
             if "tag" not in sub_fig.columns:
                 sub_fig["tag"] = sub_fig["mode"].astype(str) + "_" + sub_fig["target"].astype(str)
 
-            # 1. Transitions Scatter Matrix (P4 -> c0 -> c1 -> c2 -> c3 + global)
             fig_transitions_scatter_df(
                 sub_fig, out_dir / f"cross_seed_transitions_{mode}_{suffix}.png",
                 f"Cross-seed transitions — {tag_mode} / {kind}")
-
-            # 2. Heatmap global — diff (signal cumulé, sensible aux hubs).
             fig_heatmap_projections_global_df(
                 sub_fig, out_dir / f"cross_seed_heatmap_diff_{mode}_{suffix}.png",
                 f"Cross-seed heatmap (diff) — {tag_mode} / {kind}",
                 max_runs=args.top_per_side * 2)
-
-            # 2b. Heatmap global — cosine (∈ [−1, 1], pas de biais hub).
             fig_heatmap_projections_cosine_df(
                 sub_fig, out_dir / f"cross_seed_heatmap_cosine_{mode}_{suffix}.png",
                 f"Cross-seed heatmap (cosine) — {tag_mode} / {kind}",
                 n_per_side=args.top_per_side)
-
-            # 3. Quadrant diff x cosine — vue synthétique : vrais drivers vs hubs.
-            #    (Remplace l'ancien volcano effect-vs-stability — info redondante)
             fig_cross_seed_quadrant_diff_cosine(
                 sub_fig, out_dir / f"cross_seed_quadrant_diff_cosine_{mode}_{suffix}.png",
                 f"Quadrant diff × cosine — {tag_mode} / {kind}",
                 n_annotate=args.top_per_side)
-
-            # 4. Matrice de corrélation rang entre les 6 variantes de projection.
             fig_cross_seed_metrics_matrix(
                 sub_fig, out_dir / f"cross_seed_metrics_matrix_{mode}_{suffix}.png",
                 f"Spearman ρ across proj metrics — {tag_mode} / {kind}")
-
-            # 5. Grille scatter : diff vs chaque variante (norm, amp, ext, deg, cos).
             fig_cross_seed_diff_vs_variants(
                 sub_fig, out_dir / f"cross_seed_diff_vs_variants_{mode}_{suffix}.png",
                 f"Cross-seed diff vs all variants — {tag_mode} / {kind}")
 
-    print(f"\n[SUCCESS] Cross-seed report and figures written to {out_dir}")
+    # Gene-ranking bar figures (per direction × per score), built from
+    # cross_seed_gene_ranking.tsv. Replaces the legacy display_top_genes.py
+    # barplot but with quality flags + literature context inline.
+    if gene_rank is not None and not gene_rank.empty:
+        n_top = max(args.top_per_side * 3, 20)
+        sort_specs = [("driver_score", "driver_score")]
+        if "discovery_score" in gene_rank.columns:
+            sort_specs.append(("discovery_score", "discovery_score"))
+        for sort_col, fname in sort_specs:
+            for direction, dir_label in (("pro", "pro_senescence"),
+                                         ("anti", "anti_senescence")):
+                fig_gene_ranking_top_bars(
+                    gene_rank,
+                    out_dir / f"gene_ranking_top_{dir_label}_by_{fname}.png",
+                    title=(f"Top {n_top} {dir_label.replace('_', '-')} "
+                           f"genes — sorted by {sort_col}"),
+                    direction=direction,
+                    n=n_top,
+                    sort_by=sort_col,
+                )
 
 
 def build_transition_drivers(table: pd.DataFrame) -> pd.DataFrame:
@@ -2567,6 +3601,12 @@ def main():
                          "<seed>/report (--perturb-dir or --all); "
                          "<version-parent>/cross_seed_report "
                          "(--cross-seed).")
+    ap.add_argument("--figures-only", action="store_true",
+                    help="--cross-seed only: skip per-seed aggregation and "
+                         "TSV writes; load existing cross_seed_drivers.tsv "
+                         "and cross_seed_gene_ranking.tsv from --report-dir "
+                         "(or the default cross_seed_report folder) and "
+                         "regenerate figures only.")
     ap.add_argument("--top-per-side", type=int, default=10,
                     help="For genome-wide / cross-seed bar figures, keep "
                          "the top-N most positive AND top-N most negative "
