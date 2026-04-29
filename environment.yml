@@ -54,10 +54,9 @@ dependencies:
   - tblib
   - zict
 
-  # PyTorch CPU + PyG
-  - pytorch=2.11
-  - cpuonly
-  - pyg=2.7
+  # PyTorch CPU + PyG — installed via pip below
+  # (the `pytorch` and `pyg` conda channels lag PyPI; torch 2.11 / pyg 2.7
+  #  only exist on PyPI as of 2026-04)
 
   # Jupyter / IPython
   - ipython=8.12
@@ -103,6 +102,11 @@ dependencies:
   - dill
 
   - pip:
+      # PyTorch CPU + PyG (pinned to latest PyPI — not yet on conda channels)
+      - --extra-index-url https://download.pytorch.org/whl/cpu
+      - torch==2.11.0
+      - torch-geometric==2.7.0
+
       # pySCENIC + ses deps non-conda
       - git+https://github.com/aertslab/pySCENIC.git@06bafba412792f6efa5a552a23bb221cc3bdea1b
       - arboreto==0.1.6
@@ -116,3 +120,6 @@ dependencies:
       - docopt==0.6.2
       - pipreqs==0.5.0
       - yarg==0.1.9
+      
+      # OmniPath - bases de données biologiques intégrées
+      - omnipath>=1.0.7
