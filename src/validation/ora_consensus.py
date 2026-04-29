@@ -57,6 +57,8 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[2]
+# ROOT cluster :
+# ROOT = Path("/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/")
 GMT_PATH = ROOT / "data/databases/c2.cp.reactome.symbols.gmt"
 DE_PATH = ROOT / "data/RNAseq/GSE98440_diff_expr_analysis_afterNorm_HUVEC_2reps.txt"
 DATA_DIR = ROOT / "data"
