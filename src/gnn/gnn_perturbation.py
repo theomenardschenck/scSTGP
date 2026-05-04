@@ -89,24 +89,45 @@ CELL_GROUPS = ("P4", "P16_cluster_0", "P16_cluster_1",
 # Model (duplicated from gnn_vgae.py to keep this tool self-contained).
 # --------------------------------------------------------------------------- #
 class HeteroEncoder(nn.Module):
+    # Catalogue de tous les edge_types possibles (V3.6+) — mirroir de
+    # gnn_vgae.HeteroEncoder.EDGE_TYPE_CATALOG. Filtré dynamiquement à
+    # l'init selon les types réellement présents dans le graphe entraîné
+    # (modularité : un modèle --no-ppi n'a pas de poids gene__ppi__gene,
+    # le state_dict serait incompatible avec un encoder qui les instancie).
+    EDGE_TYPE_CATALOG = [
+        (("gene", "ppi", "gene"), 1),
+        (("gene", "same_pathway", "gene"), None),
+        (("gene", "regulates", "gene"), 1),
+        (("gene", "regulated_by", "gene"), 1),
+        (("cell_group", "expresses", "gene"), 7),
+        (("gene", "expressed_in", "cell_group"), 7),
+        (("gene", "coexpression", "gene"), 1),
+        (("gene", "metabolic_cocatalysis", "gene"), 2),
+    ]
+
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
-                 n_heads=4, dropout=0.2):
+                 n_heads=4, dropout=0.2, available_edge_types=None):
         super().__init__()
         self.n_layers = n_layers
         head_dim = hidden // n_heads
         self.gene_proj = nn.Linear(gene_in, hidden)
         self.cell_proj = nn.Linear(cell_in, hidden)
 
-        edge_types_dims = [
-            (("gene", "ppi", "gene"), 1),
-            (("gene", "same_pathway", "gene"), None),
-            (("gene", "regulates", "gene"), 1),
-            (("gene", "regulated_by", "gene"), 1),
-            (("cell_group", "expresses", "gene"), 7),
-            (("gene", "expressed_in", "cell_group"), 7),
-            (("gene", "coexpression", "gene"), 1),
-            (("gene", "metabolic_cocatalysis", "gene"), 2),
-        ]
+        if available_edge_types is None:
+            edge_types_dims = list(self.EDGE_TYPE_CATALOG)
+        else:
+            available = {tuple(et) for et in available_edge_types}
+            edge_types_dims = [(et, dim) for et, dim in self.EDGE_TYPE_CATALOG
+                               if et in available]
+            unknown = available - {et for et, _ in self.EDGE_TYPE_CATALOG}
+            if unknown:
+                print(f"[warn] HeteroEncoder : edge_types inconnus dans le "
+                      f"catalogue : {unknown}")
+        if not edge_types_dims:
+            raise ValueError(
+                "HeteroEncoder : aucun edge_type actif. Vérifie le graphe "
+                "sauvegardé (data.edge_types)."
+            )
         self.edge_dims = {et: dim for et, dim in edge_types_dims}
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -633,6 +654,10 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
         gene_in=data["gene"].x.shape[1],
         cell_in=data["cell_group"].x.shape[1],
         hidden=hidden, latent=latent, n_layers=n_layers, n_heads=n_heads,
+        # V3.6 : ne créer que les GATConv pour les edge_types réellement
+        # présents dans le graphe entraîné — sinon le state_dict refuse
+        # de charger sur les ablations (--no-ppi, --no-coexpr, etc.).
+        available_edge_types=list(data.edge_types),
     )
     model = VGAE(encoder)
     state_path = run_dir / "best_vgae.pt"
