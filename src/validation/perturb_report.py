@@ -34,6 +34,8 @@ Usage
     python src/perturb_report.py \\
         --perturb-dir output/gnn_vgae/V3_Run3/perturbation \\
         --min-baseline-pct 10
+    
+    python src/validation/perturb_report.py --cross-seed output/gnn_vgae/V3.6/full/* --top-per-side 3
 
 Outputs (inside <perturb-dir>/report/)
 --------------------------------------
