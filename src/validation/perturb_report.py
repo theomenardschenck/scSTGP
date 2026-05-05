@@ -1804,6 +1804,92 @@ def _build_gene_to_strong_pathways(
     return out_clean
 
 
+def _load_de_magnitude(de_path: Path) -> pd.DataFrame:
+    """Load MAST DE magnitudes (P4 vs P16) for the per-gene ranking.
+
+    Expects columns ``gene``, ``avg_log2FC``, ``p_val_adj``. Returns DataFrame
+    indexed by gene with two numeric columns:
+      * ``de_log2fc_p4_vs_p16`` — signed log2 fold-change. Sign convention
+        follows the source file (typically positive = up in P4 vs P16, or
+        the reverse depending on the contrast direction; the value is
+        propagated as-is so the reader knows the absolute magnitude).
+      * ``de_neglog10_padj`` — −log10(p_val_adj), clipped to 50 to keep
+        the column readable when padj == 0 in the source.
+
+    Returns empty DataFrame on missing/invalid file (caller handles).
+    """
+    if not de_path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(de_path)
+    except Exception:
+        return pd.DataFrame()
+    cols = {c.lower(): c for c in df.columns}
+    gene_col = cols.get("gene") or cols.get("hgnc_symbol")
+    lfc_col = cols.get("avg_log2fc") or cols.get("log2foldchange")
+    padj_col = cols.get("p_val_adj") or cols.get("padj")
+    if not (gene_col and lfc_col and padj_col):
+        return pd.DataFrame()
+    out = pd.DataFrame({
+        "gene": df[gene_col].astype(str),
+        "de_log2fc_p4_vs_p16": pd.to_numeric(df[lfc_col], errors="coerce"),
+        "de_neglog10_padj": -np.log10(
+            pd.to_numeric(df[padj_col], errors="coerce").clip(lower=1e-50)
+        ).clip(upper=50.0),
+    }).dropna(subset=["de_log2fc_p4_vs_p16", "de_neglog10_padj"])
+    out = out.drop_duplicates(subset="gene", keep="first").set_index("gene")
+    return out
+
+
+def _compute_evidence_tier(driver_score: float,
+                           canon_cosine: float,
+                           is_de_significant: bool | None,
+                           n_aging_dbs: int,
+                           is_hub_inflated: bool,
+                           is_low_purity_signal: bool,
+                           min_driver_score: float = 0.5,
+                           min_cosine_purity: float = 0.4,
+                           weak_driver_score: float = 0.3) -> str:
+    """Single-letter evidence tier (column placed before `interpretation`).
+
+    Priority order (first match wins) :
+      D — hub : `is_hub_inflated` ∨ `is_low_purity_signal` ∨
+          (driver_score ≥ 0.5 ∧ |cos| < 0.4). Score élevé porté par la
+          connectivité plutôt que par une direction cohérente : artefact.
+      A — confirmé : driver pur (driver_score ≥ 0.5 ∧ |cos| ≥ 0.4) ET
+          littérature (DE-sig OU ≥2 aging DBs).
+      B — découverte : driver pur, sans littérature → finding graph-only,
+          prioritaire pour validation expérimentale.
+      C — effecteur : littérature présente mais driver pas pur (faible
+          score OU faible cosine). Marqueur clinique probable, peu
+          actionnable comme cible mécanistique.
+      E — bruit : ni littérature ni driver pur (signal de fond).
+
+    Returns one of {"A_confirmed", "B_discovery", "C_effector", "D_hub",
+    "E_noise"}.
+    """
+    cos_abs = abs(canon_cosine) if canon_cosine is not None else 0.0
+    has_lit = bool(is_de_significant is True) or n_aging_dbs >= 2
+    is_pure_driver = (driver_score >= min_driver_score
+                      and cos_abs >= min_cosine_purity)
+    has_strong_amplitude = driver_score >= min_driver_score
+
+    # D-hub : flagged hub, low-purity, OR strong-amplitude-but-low-purity.
+    # Le 3e cas attrape les gènes type EHMT2 (driver_score haut mais
+    # |cos|<0.4) que le hub-flag explicite (ppi>200 ∧ |cos|<0.3) rate.
+    if (is_hub_inflated or is_low_purity_signal
+            or (has_strong_amplitude and cos_abs < min_cosine_purity)):
+        return "D_hub"
+
+    if is_pure_driver and has_lit:
+        return "A_confirmed"
+    if is_pure_driver and not has_lit:
+        return "B_discovery"
+    if has_lit:
+        return "C_effector"
+    return "E_noise"
+
+
 def _load_vgae_baselines(seed_paths: list[Path]) -> pd.DataFrame:
     """Load + average gene_ranking_vgae.csv across seeds.
 
@@ -1840,7 +1926,8 @@ def build_gene_ranking(df: pd.DataFrame,
                         vgae_baseline: pd.DataFrame | None = None,
                         de_top_n: int = 1000,
                         is_tf_series: pd.Series | None = None,
-                        gene_to_pathways: dict | None = None) -> pd.DataFrame:
+                        gene_to_pathways: dict | None = None,
+                        de_magnitude: pd.DataFrame | None = None) -> pd.DataFrame:
     """Per-gene cross-mode ranking (genes only).
 
     For each gene, aggregates the up to 3 perturbation modes (KO/KD/OE)
@@ -1993,6 +2080,16 @@ def build_gene_ranking(df: pd.DataFrame,
         # pathways from pw_ranking (informative cross-reference).
         member_of = (gene_to_pathways or {}).get(target, [])
 
+        # MAST DE magnitudes (signed log2FC + −log10 padj, both clipped).
+        # Source : data/gnn_data/DEGs_P4_vs_P16_MAST.csv. Decoupled from
+        # `is_de_significant` (which uses rank_stat from the pseudo-LFC
+        # baseline); see report §10.13decies.
+        de_lfc: float | None = None
+        de_neglog10_padj: float | None = None
+        if de_magnitude is not None and target in de_magnitude.index:
+            de_lfc = float(de_magnitude.at[target, "de_log2fc_p4_vs_p16"])
+            de_neglog10_padj = float(de_magnitude.at[target, "de_neglog10_padj"])
+
         vgae_rank_int = (int(vgae_rank_v)
                          if vgae_rank_v is not None and not (
                              isinstance(vgae_rank_v, float) and np.isnan(vgae_rank_v))
@@ -2017,6 +2114,15 @@ def build_gene_ranking(df: pd.DataFrame,
             is_de_significant, n_aging_dbs,
             mean_robustness=mean_robustness,
             mean_stability=mean_stability)
+
+        evidence_tier = _compute_evidence_tier(
+            driver_score=driver_score,
+            canon_cosine=canon_cos,
+            is_de_significant=is_de_significant,
+            n_aging_dbs=n_aging_dbs,
+            is_hub_inflated=any_hub,
+            is_low_purity_signal=any_low_purity,
+        )
 
         interp = _gene_interpretation(
             canon_diff, canon_cos, ppi_degree, any_hub, sign_cons, n_modes,
@@ -2066,11 +2172,14 @@ def build_gene_ranking(df: pd.DataFrame,
             "vgae_importance": round(float(vgae_importance), 4) if vgae_importance is not None else None,
             "vgae_rank": vgae_rank_int,
             "is_de_significant": is_de_significant,
+            "de_log2fc_p4_vs_p16": de_lfc,
+            "de_neglog10_padj": de_neglog10_padj,
             "n_aging_dbs": n_aging_dbs,
             "sign_consistent": sign_cons if sign_cons is not None else "",
             "is_hub_inflated": any_hub,
             "is_low_purity_signal": any_low_purity,
             "direction": direction,
+            "evidence_tier": evidence_tier,
             "interpretation": interp,
             # Per-mode breakdown
             "KO_diff": round(float(ko["avg_proj_signed_diff"]), 1) if ko is not None else None,
@@ -2855,6 +2964,13 @@ def run_cross_seed(args) -> None:
     is_tf_series = _load_is_tf(seed_roots)
     if is_tf_series.empty:
         print("[INFO] Could not extract is_tf from any seed graph.")
+    de_magnitude = _load_de_magnitude(args.de_magnitude_csv)
+    if de_magnitude.empty:
+        print(f"[INFO] DE magnitude file not loaded ({args.de_magnitude_csv}); "
+              f"de_log2fc_p4_vs_p16 / de_neglog10_padj will be empty.")
+    else:
+        print(f"[INFO] Loaded DE magnitudes for {len(de_magnitude)} genes "
+              f"from {args.de_magnitude_csv}.")
     # Pre-compute pathway ranking (we'll re-compute it below for the TSV;
     # here just to seed the gene-pathway cross-reference). The duplicated
     # call has cost ~2-3s and keeps the call sites independent.
@@ -2878,6 +2994,7 @@ def run_cross_seed(args) -> None:
         de_top_n=args.gene_ranking_de_top_n,
         is_tf_series=is_tf_series,
         gene_to_pathways=gene_to_pathways,
+        de_magnitude=de_magnitude,
     )
     if not gene_rank.empty:
         # V3.4 : exhaustive ranking — all genes present, quality
@@ -3652,6 +3769,12 @@ def main():
                     help="Per-gene ranking TSV: a gene is tagged "
                          "is_de_significant=True if its rank_stat (from "
                          "gene_ranking_vgae.csv) is ≤ this value (default 1000).")
+    ap.add_argument("--de-magnitude-csv", type=Path,
+                    default=Path("data/gnn_data/DEGs_P4_vs_P16_MAST.csv"),
+                    help="MAST DE table (gene, avg_log2FC, p_val_adj). Used to "
+                         "populate de_log2fc_p4_vs_p16 and de_neglog10_padj in "
+                         "cross_seed_gene_ranking.tsv. Empty/missing → columns "
+                         "left empty (no error).")
     ap.add_argument("--include", nargs="+", default=None,
                     help="Glob pattern(s) on run folder names to keep.")
     ap.add_argument("--top-per-run", type=int, default=5)
