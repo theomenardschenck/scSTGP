@@ -20,7 +20,7 @@
 set -euo pipefail
 
 # --- Paramètres par défaut --------------------------------------------------
-DEFAULT_SEEDS=(1 2 3)
+DEFAULT_SEEDS=(1 2 3 4 5)
 MAX_PARALLEL=10                  # cap "max 10 simultanés" via --array=...%N
 TIME_LIMIT="0-02:00:00"          # 2h par run d'entraînement
 DRY_RUN=0
@@ -97,7 +97,7 @@ cat > "$SBATCH_SCRIPT" <<EOF
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem-per-cpu=16G
-#SBATCH --qos=short
+#SBATCH --qos=quick
 #SBATCH --array=$ARRAY_RANGE
 
 set -euo pipefail
@@ -129,8 +129,10 @@ echo "[grid] sbatch script : $SBATCH_SCRIPT"
 echo
 
 # --- Soumission -------------------------------------------------------------
+# NB : pas de -M nautilus côté sbatch — SLURMDBD n'est pas joignable depuis
+# le frontal Nautilus (le cluster est implicite). Cf. doc GLiCID.
 if [[ $DRY_RUN -eq 1 ]]; then
-    echo "[DRY-RUN] sbatch -M nautilus $SBATCH_SCRIPT"
+    echo "[DRY-RUN] sbatch $SBATCH_SCRIPT"
     echo
     echo "[DRY-RUN] Aperçu du configs.tsv :"
     cat "$CONFIGS_FILE"
@@ -140,8 +142,8 @@ if [[ $DRY_RUN -eq 1 ]]; then
     exit 0
 fi
 
-JOB_ID=$(sbatch -M nautilus --parsable "$SBATCH_SCRIPT")
-echo "[grid] soumis : job array \$JOB_ID (= ${N_TASKS} tâches, ${MAX_PARALLEL} max en //)"
-echo "[grid] suivi   : squeue -M nautilus -j $JOB_ID"
-echo "[grid] cancel  : scancel -M nautilus $JOB_ID"
+JOB_ID=$(sbatch --parsable "$SBATCH_SCRIPT")
+echo "[grid] soumis : job array $JOB_ID (= ${N_TASKS} tâches, ${MAX_PARALLEL} max en //)"
+echo "[grid] suivi   : squeue -j $JOB_ID    (ou squeue -u \$USER)"
+echo "[grid] cancel  : scancel $JOB_ID"
 echo "[grid] logs    : $LOG_DIR/vgae_ablation_${JOB_ID}_<task>.{out,err}"

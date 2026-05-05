@@ -153,8 +153,10 @@ echo "[grid] sbatch script : $SBATCH_SCRIPT"
 echo
 
 # --- Soumission -------------------------------------------------------------
+# NB : pas de -M nautilus côté sbatch — SLURMDBD n'est pas joignable depuis
+# le frontal Nautilus (le cluster est implicite). Cf. doc GLiCID.
 if [[ $DRY_RUN -eq 1 ]]; then
-    echo "[DRY-RUN] sbatch -M nautilus $SBATCH_SCRIPT"
+    echo "[DRY-RUN] sbatch $SBATCH_SCRIPT"
     echo
     echo "[DRY-RUN] Aperçu du configs.tsv :"
     head -20 "$CONFIGS_FILE"
@@ -165,8 +167,8 @@ if [[ $DRY_RUN -eq 1 ]]; then
     exit 0
 fi
 
-JOB_ID=$(sbatch -M nautilus --parsable "$SBATCH_SCRIPT")
-echo "[grid] soumis : job array \$JOB_ID (= ${N_TASKS} tâches, ${MAX_PARALLEL} max en //)"
-echo "[grid] suivi   : squeue -M nautilus -j $JOB_ID"
-echo "[grid] cancel  : scancel -M nautilus $JOB_ID"
+JOB_ID=$(sbatch --parsable "$SBATCH_SCRIPT")
+echo "[grid] soumis : job array $JOB_ID (= ${N_TASKS} tâches, ${MAX_PARALLEL} max en //)"
+echo "[grid] suivi   : squeue -j $JOB_ID    (ou squeue -u \$USER)"
+echo "[grid] cancel  : scancel $JOB_ID"
 echo "[grid] logs    : $LOG_DIR/vgae_perturb_${JOB_ID}_<task>.{out,err}"
