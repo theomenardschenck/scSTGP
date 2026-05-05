@@ -252,11 +252,18 @@ def flatten_summary(target_type: str, target: str,
 
 
 def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
-                             n_layers: int, n_heads: int):
+                             n_layers: int, n_heads: int,
+                             quiescent_groups=None, p16_groups=None):
     """Load the VGAE run + compute the shared baseline once.
 
     Imports gnn_perturbation lazily so the subprocess TOP-N mode doesn't
     pull torch when not needed.
+
+    Args:
+        quiescent_groups : V4 — tuple/list de groupes côté quiescent pour
+            l'axe de sénescence. Défaut historique = ("P4",).
+        p16_groups : optionnel — clusters P16 côté sénescent. Auto-dérivé
+            si None.
     """
     # Local import — gnn_perturbation needs torch + PyG which are heavy.
     from gnn_perturbation import (  # noqa: E402
@@ -267,7 +274,8 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
     data, model, gene_symbols, gene_to_idx, baseline, group_expr = load_run(
         run_dir, hidden, latent, n_layers, n_heads)
     spec, base_imp, base_rank, z_cg_base, mu_base, axis_global, axes_cluster = prepare_baseline(
-        model, data, baseline, gene_symbols, group_expr)
+        model, data, baseline, gene_symbols, group_expr,
+        quiescent_groups=quiescent_groups, p16_groups=p16_groups)
     reactome = _load_gmt()
     background = _load_bg()
     print(f"Loaded run ({len(gene_symbols)} genes); baseline computed; "
@@ -557,6 +565,19 @@ def main():
     ap.add_argument("--latent", type=int, default=64)
     ap.add_argument("--n-layers", type=int, default=3)
     ap.add_argument("--n-heads", type=int, default=4)
+    # V4 — axe de sénescence : groupes côté quiescent (et P16 résiduels).
+    # Permet d'agréger c0 avec P4 (c0 transcriptionnellement quiescent-like
+    # cf. CLAUDE.md §V3.3). Backward-compat : défaut "P4" seul.
+    ap.add_argument("--quiescent-groups", default="P4",
+                    help="liste séparée par virgules des groupes côté "
+                         "quiescent pour l'axe de sénescence "
+                         "(défaut V3 : 'P4' ; recommandé V4 : "
+                         "'P4,P16_cluster_0').")
+    ap.add_argument("--p16-groups", default=None,
+                    help="liste séparée par virgules des clusters côté "
+                         "sénescent. Si non fourni, dérivé automatiquement "
+                         "de --quiescent-groups (P16_cluster_0..3 moins "
+                         "ceux passés côté quiescent).")
     args = ap.parse_args()
 
     run_dir: Path = args.run_dir
@@ -566,8 +587,14 @@ def main():
     # ALL mode — in-process, single aggregated TSV per target type.
     # --------------------------------------------------------------- #
     if args.all_genes or args.all_pathways:
+        # Parse les groupes V4 axe sénescence (CSV → tuple ou None si défaut)
+        _q = tuple(s.strip() for s in args.quiescent_groups.split(",")
+                   if s.strip()) if args.quiescent_groups else None
+        _p = (tuple(s.strip() for s in args.p16_groups.split(",") if s.strip())
+              if args.p16_groups else None)
         ctx = _load_model_and_baseline(run_dir, args.hidden, args.latent,
-                                       args.n_layers, args.n_heads)
+                                       args.n_layers, args.n_heads,
+                                       quiescent_groups=_q, p16_groups=_p)
         if args.all_genes:
             run_all_genes(ctx, modes, args.oe_factor,
                           args.top_k, args.fdr,

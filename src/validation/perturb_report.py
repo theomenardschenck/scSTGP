@@ -2565,123 +2565,6 @@ def _variant_cols(df: pd.DataFrame, prefix: str = "avg_proj_signed_") -> list[st
             if f"{prefix}{v}" in df.columns]
 
 
-def fig_cross_seed_metrics_matrix(df: pd.DataFrame, out: Path, title: str,
-                                   prefix: str = "avg_proj_signed_"):
-    """Spearman rank correlation matrix between the 6 projection variants.
-
-    Shows whether normalizations re-order drivers (low ρ with diff) or
-    just rescale them (ρ ≈ ±1 with diff → same ranking).
-
-    `prefix`: 'avg_proj_signed_' for cross-seed, 'max_proj_signed_' for
-    single-seed.
-    """
-    from scipy.stats import spearmanr
-    cols = _variant_cols(df, prefix)
-    if len(cols) < 2 or df.empty:
-        return
-    M = np.full((len(cols), len(cols)), np.nan)
-    for i, ci in enumerate(cols):
-        for j, cj in enumerate(cols):
-            mask = np.isfinite(df[ci]) & np.isfinite(df[cj])
-            if mask.sum() < 3:
-                continue
-            rho, _ = spearmanr(df.loc[mask, ci], df.loc[mask, cj])
-            M[i, j] = rho
-    fig, ax = plt.subplots(figsize=(7, 6))
-    im = ax.imshow(M, vmin=-1, vmax=1, cmap="RdBu_r")
-    ax.set_xticks(np.arange(len(cols)))
-    ax.set_yticks(np.arange(len(cols)))
-    labels = [PROJ_VARIANT_LABELS[c.replace(prefix, "")] for c in cols]
-    ax.set_xticklabels(labels, rotation=35, ha="right", fontsize=8)
-    ax.set_yticklabels(labels, fontsize=8)
-    for i in range(len(cols)):
-        for j in range(len(cols)):
-            v = M[i, j]
-            if np.isfinite(v):
-                ax.text(j, i, f"{v:+.2f}", ha="center", va="center",
-                        fontsize=8, color=("white" if abs(v) > 0.6 else "black"))
-    plt.colorbar(im, ax=ax, label="Spearman ρ")
-    ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(out)
-    plt.close(fig)
-
-
-def fig_cross_seed_diff_vs_variants(df: pd.DataFrame, out: Path, title: str,
-                                     n_annotate: int = 10,
-                                     prefix: str = "avg_proj_signed_"):
-    """Scatter grid: diff vs each of the 5 normalization variants.
-
-    One subplot per variant. Each panel shows <prefix>diff on X and the
-    variant on Y, with Spearman ρ in the title. Points colored by sign
-    of diff. Annotates the top-n by |diff|.
-
-    `prefix`: 'avg_proj_signed_' for cross-seed, 'max_proj_signed_' for
-    single-seed (falls back to size=uniform if robustness_score absent).
-    """
-    from scipy.stats import spearmanr
-    cols = _variant_cols(df, prefix)
-    variants = [c.replace(prefix, "") for c in cols if c != f"{prefix}diff"]
-    if f"{prefix}diff" not in cols or not variants:
-        return
-    x = df[f"{prefix}diff"].to_numpy()
-    if "robustness_score" in df.columns:
-        sizes = 8 + 50 * df["robustness_score"].to_numpy()
-    else:
-        sizes = np.full(len(df), 24.0)
-    colors = ["#e76f51" if v > 0 else "#2a9d8f" for v in x]
-    # Layout: 2 rows × 3 cols (5 variants fit in 6 slots, last empty).
-    n = len(variants)
-    ncols = 3
-    nrows = int(np.ceil(n / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.3 * ncols, 4 * nrows),
-                              squeeze=False)
-    top_idx = df.assign(_a=df[f"{prefix}diff"].abs()).nlargest(n_annotate, "_a").index
-    for k, v in enumerate(variants):
-        r, c = divmod(k, ncols)
-        ax = axes[r][c]
-        y = df[f"{prefix}{v}"].to_numpy()
-        mask = np.isfinite(x) & np.isfinite(y)
-        ax.scatter(x[mask], y[mask], c=np.array(colors)[mask], s=sizes[mask],
-                   alpha=0.55, edgecolor="black", linewidth=0.3)
-        ax.axhline(0, color="k", lw=0.5, linestyle="--", alpha=0.5)
-        ax.axvline(0, color="k", lw=0.5, linestyle="--", alpha=0.5)
-        rho_txt = ""
-        try:
-            if mask.sum() >= 3:
-                rho, _ = spearmanr(x[mask], y[mask])
-                rho_txt = f"ρ = {rho:+.3f}"
-        except Exception:
-            pass
-        for idx in top_idx:
-            if idx not in df.index:
-                continue
-            row = df.loc[idx]
-            if "target" in row and "mode" in row:
-                lbl = (f"{shorten_mode(row['mode'])}_{row['target']}"
-                       if not row.get("is_pathway", False)
-                       else shorten_tag(f"{row['mode']}_{row['target']}"))
-            else:
-                lbl = shorten_tag(str(row.get("tag", "")))
-            ax.annotate(lbl, (row[f"{prefix}diff"],
-                              row[f"{prefix}{v}"]),
-                        fontsize=6, alpha=0.8,
-                        xytext=(3, 2), textcoords="offset points")
-        short_prefix = prefix.replace("_proj_signed_", " proj_signed_")
-        ax.set_xlabel(f"{short_prefix}diff")
-        ax.set_ylabel(f"{short_prefix}{v}")
-        ax.set_title(f"{PROJ_VARIANT_LABELS[v]}   {rho_txt}", fontsize=9)
-        ax.grid(alpha=0.3)
-    # Hide unused panels.
-    for k in range(len(variants), nrows * ncols):
-        r, c = divmod(k, ncols)
-        axes[r][c].axis("off")
-    fig.suptitle(title)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    fig.savefig(out, bbox_inches="tight")
-    plt.close(fig)
-
-
 def fig_cross_seed_quadrant_diff_cosine(df: pd.DataFrame, out: Path, title: str,
                                          n_annotate: int = 15):
     """Quadrant scatter: avg_proj_signed_diff (X) vs avg_proj_signed_cosine (Y).
@@ -3172,12 +3055,6 @@ def _render_cross_seed_figures(df: pd.DataFrame,
                 sub_fig, out_dir / f"cross_seed_quadrant_diff_cosine_{mode}_{suffix}.png",
                 f"Quadrant diff × cosine — {tag_mode} / {kind}",
                 n_annotate=args.top_per_side)
-            fig_cross_seed_metrics_matrix(
-                sub_fig, out_dir / f"cross_seed_metrics_matrix_{mode}_{suffix}.png",
-                f"Spearman ρ across proj metrics — {tag_mode} / {kind}")
-            fig_cross_seed_diff_vs_variants(
-                sub_fig, out_dir / f"cross_seed_diff_vs_variants_{mode}_{suffix}.png",
-                f"Cross-seed diff vs all variants — {tag_mode} / {kind}")
 
     # Gene-ranking bar figures (per direction × per score), built from
     # cross_seed_gene_ranking.tsv. Replaces the legacy display_top_genes.py
@@ -3977,16 +3854,6 @@ def main():
                 sub, report_dir / f"projection_signed_{mode}_{suffix}.png",
                 f"Signed projection on senescence axis (Option 2) — "
                 f"{shorten_mode(mode)} / {kind_label}{bar_suffix}")
-            # Matrice Spearman entre les 6 variantes de projection.
-            fig_cross_seed_metrics_matrix(
-                sub_full, report_dir / f"projection_metrics_matrix_{mode}_{suffix}.png",
-                f"Spearman ρ across proj metrics — {shorten_mode(mode)} / {kind_label}",
-                prefix="max_proj_signed_")
-            # Scatter grid diff vs chaque normalisation (amp, ext, deg, cos, norm).
-            fig_cross_seed_diff_vs_variants(
-                sub_full, report_dir / f"projection_diff_vs_variants_{mode}_{suffix}.png",
-                f"Diff vs all variants — {shorten_mode(mode)} / {kind_label}",
-                prefix="max_proj_signed_")
         fig_pathway_heatmap(
             mode_runs, report_dir / f"pathway_heatmap_{mode}.png",
             f"Top pathways × perturbation — {shorten_mode(mode)} (-log10 p.adj)",

@@ -58,6 +58,11 @@ from scipy.stats import mannwhitneyu
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# OmniPath integration (V4) — chargé lazily : si les flags --use-omnipath-*
+# sont OFF (défaut), on n'importe rien. Sinon on importe le module local.
+# Cela évite de planter un run baseline si `omnipath` n'est pas installé.
+_OPI = None  # peuplé dans la section 6g si MODULES["use_omnipath_*"]
+
 # =============================================================================
 # ARGUMENTS CLI — MODULARITÉ DU GRAPHE & DES FEATURES
 # =============================================================================
@@ -107,6 +112,33 @@ def _parse_cli_args():
     p.add_argument("--no-humess", action="store_true", default=False,
                    help="raccourci : désactive --use-humess-edges ET --use-humess-features")
 
+    # --- OmniPath (V4 — opt-in, OFF par défaut) ---
+    # Sources pré-téléchargées via scripts/cache_omnipath.py — les compute
+    # nodes Nautilus n'ayant pas Internet, on lit toujours depuis le cache TSV.
+    p.add_argument("--use-omnipath-signaling", dest="use_omnipath_signaling",
+                   action="store_true", default=False,
+                   help="V4 : ajoute arêtes 'signaling' dirigées signées "
+                        "(kinase-substrat OmniPath + SIGNOR causal). "
+                        "edge_attr=[score, sign∈{−1,0,+1}].")
+    p.add_argument("--no-omnipath-signaling", dest="use_omnipath_signaling",
+                   action="store_false")
+    p.add_argument("--use-omnipath-tf-curated", dest="use_omnipath_tf_curated",
+                   action="store_true", default=False,
+                   help="V4 : ajoute edge_type 'tf_curated' (CollecTRI, "
+                        "fallback DoRothEA) à côté de pySCENIC 'regulates'. "
+                        "~1186 TFs vs ~50 SCENIC, signe biologique préservé.")
+    p.add_argument("--no-omnipath-tf-curated", dest="use_omnipath_tf_curated",
+                   action="store_false")
+    p.add_argument("--omnipath-cache-dir", default=None,
+                   help="dossier des TSV OmniPath pré-téléchargés "
+                        "(défaut : <DATA_DIR>/omnipath). Cf. "
+                        "scripts/cache_omnipath.py")
+    p.add_argument("--omnipath-download-if-missing", action="store_true",
+                   default=False,
+                   help="autorise le téléchargement à la volée si le cache "
+                        "est absent (à n'utiliser que sur le frontal qui a "
+                        "Internet ; OFF sur les compute nodes)")
+
     # --- Exclusion fine de features de noeud gene ---
     # Liste possible : is_tf, variance, ppi_degree, reg_degree,
     #                  imp_P4, imp_P16, imp_delta, has_humess
@@ -154,13 +186,15 @@ _EXCLUDED_FEATURES = {
 # MODULES : dictionnaire compact qui résume la config — référé partout dans
 # le pipeline pour gater les blocs (loading + edges + features).
 MODULES = {
-    "use_ppi":              CLI_ARGS.use_ppi,
-    "use_reactome":         CLI_ARGS.use_reactome,
-    "use_coexpr":           CLI_ARGS.use_coexpr,
-    "use_scenic_regulons":  CLI_ARGS.use_scenic_regulons,
-    "use_humess_edges":     CLI_ARGS.use_humess_edges,
-    "use_humess_features":  CLI_ARGS.use_humess_features,
-    "use_cell_group_edges": CLI_ARGS.use_cell_group_edges,
+    "use_ppi":                   CLI_ARGS.use_ppi,
+    "use_reactome":              CLI_ARGS.use_reactome,
+    "use_coexpr":                CLI_ARGS.use_coexpr,
+    "use_scenic_regulons":       CLI_ARGS.use_scenic_regulons,
+    "use_humess_edges":          CLI_ARGS.use_humess_edges,
+    "use_humess_features":       CLI_ARGS.use_humess_features,
+    "use_cell_group_edges":      CLI_ARGS.use_cell_group_edges,
+    "use_omnipath_signaling":    CLI_ARGS.use_omnipath_signaling,
+    "use_omnipath_tf_curated":   CLI_ARGS.use_omnipath_tf_curated,
 }
 
 # Matrice « feature → activée ? » — recoupe les modules et l'option
@@ -201,6 +235,8 @@ def _build_run_tag():
         if not MODULES["use_humess_edges"]:    parts.append("no-humess-edges")
         if not MODULES["use_humess_features"]: parts.append("no-humess-feats")
     if not MODULES["use_cell_group_edges"]: parts.append("no-cgrp")
+    if MODULES["use_omnipath_signaling"]:   parts.append("op-sig")
+    if MODULES["use_omnipath_tf_curated"]:  parts.append("op-tf")
     if _EXCLUDED_FEATURES:                  parts.append("ex-" + "-".join(sorted(_EXCLUDED_FEATURES)))
     if CLI_ARGS.ppi_score_thresh != 900:    parts.append(f"ppi{CLI_ARGS.ppi_score_thresh}")
     if abs(CLI_ARGS.coexpr_top_quantile - 0.98) > 1e-9:
@@ -276,6 +312,12 @@ GNN_DATA_DIR = os.path.join(DATA_DIR, "gnn_data")
 PPI_DIR = os.path.join(DATA_DIR, "PPI")
 DB_DIR = os.path.join(DATA_DIR, "databases")
 FIG_DIR = os.path.join(OUT_DIR, "figure")
+# OMNIPATH_CACHE_DIR : TSV pré-téléchargés via scripts/cache_omnipath.py.
+# Si non fourni en CLI, on dérive de DATA_DIR pour rester cohérent avec
+# la convention de chemins (cache co-localisé avec les autres données).
+OMNIPATH_CACHE_DIR = (CLI_ARGS.omnipath_cache_dir
+                      if CLI_ARGS.omnipath_cache_dir is not None
+                      else os.path.join(DATA_DIR, "omnipath"))
 
 # --- HuMess (modélisation métabolique) ---
 # HuMess utilise CarveMe (reconstruction de modèles métaboliques spécifiques
@@ -304,6 +346,8 @@ with open(_MANIFEST_PATH, "w") as _fh:
         "ppi_score_thresh": CLI_ARGS.ppi_score_thresh,
         "coexpr_top_quantile": CLI_ARGS.coexpr_top_quantile,
         "reactome_max_pathway": CLI_ARGS.reactome_max_pathway,
+        "omnipath_cache_dir": OMNIPATH_CACHE_DIR,
+        "omnipath_download_if_missing": CLI_ARGS.omnipath_download_if_missing,
     }, _fh, indent=2)
 print(f"  Manifest écrit    : {_MANIFEST_PATH}")
 
@@ -1174,6 +1218,104 @@ print(f"    importance  : P4={int(gene_in_model['P4'].sum())} gènes, "
       f"P16={int(gene_in_model['P16'].sum())} gènes, "
       f"has_humess={int(has_humess.sum())}/{n_genes}")
 
+# ── 6g. OmniPath (V4) : signaling dirigé signé + TF curé ────────────────────
+# DEUX nouveaux edge_types optionnels :
+#
+#   ("gene", "signaling", "gene")  — kinase-substrat OmniPath + SIGNOR causal
+#       directionnel, edge_attr = [score, sign∈{−1,0,+1}].
+#       Active une couche de message passing CAUSALE (asymétrique) où
+#       l'attention GAT peut apprendre que activation et inhibition portent
+#       des messages de polarité différente. Réf : Türei et al. Nat Commun
+#       2021 ; Lo Surdo et al. NAR 2023 (SIGNOR 3.0).
+#
+#   ("gene", "tf_curated", "gene") + reverse  — CollecTRI (fallback DoRothEA)
+#       TF→cible curé sur ~1186 TFs (vs ~50 pySCENIC), edge_attr = [score, sign].
+#       Co-existe avec "regulates" (pySCENIC, HUVEC-spécifique inféré du
+#       scRNA-seq) — laisse le GNN apprendre les deux sources distinctement
+#       (option (c) du design V4). Réf : Müller-Dott et al. Genome Biol 2023.
+#
+# Les deux sources sont chargées depuis un cache TSV pré-téléchargé
+# (`scripts/cache_omnipath.py` à lancer sur le frontal). En cas d'absence
+# de cache et de --omnipath-download-if-missing OFF, on saute proprement
+# l'arête sans crasher le run (modularité préservée).
+#
+# Default OFF : à activer explicitement via --use-omnipath-signaling /
+# --use-omnipath-tf-curated pour les ablations V4.
+op_sig_src = op_sig_dst = np.array([], dtype=np.int64)
+op_sig_attr = np.zeros((0, 2), dtype=np.float32)
+op_tf_src  = op_tf_dst  = np.array([], dtype=np.int64)
+op_tf_attr = np.zeros((0, 2), dtype=np.float32)
+
+if MODULES["use_omnipath_signaling"] or MODULES["use_omnipath_tf_curated"]:
+    print("\n  OmniPath (V4)…")
+    try:
+        from omnipath_integration import (
+            load_signaling_directed,
+            load_collectri_tf_target,
+            load_signed_ppi_signor,
+            merge_signed_directed,
+        )
+        _OPI = True
+    except ImportError as _e:
+        print(f"    [warn] import omnipath_integration KO ({_e}) — "
+              f"aucune arête OmniPath ne sera ajoutée.")
+        _OPI = False
+
+    if _OPI:
+        _opi_kwargs = dict(
+            cache_dir=OMNIPATH_CACHE_DIR,
+            available_genes=available_set,
+            gene_to_idx=gene_to_idx,
+            download_if_missing=CLI_ARGS.omnipath_download_if_missing,
+        )
+
+        if MODULES["use_omnipath_signaling"]:
+            # Fusion kinase-substrat OmniPath + PPI causal SIGNOR — même
+            # sémantique sémantique (lien causal signé), même edge_type.
+            sig_kin = load_signaling_directed(**_opi_kwargs)
+            sig_sgn = load_signed_ppi_signor(**_opi_kwargs)
+            op_sig_src, op_sig_dst, op_sig_attr = merge_signed_directed(
+                (sig_kin[0], sig_kin[1], sig_kin[2]),
+                (sig_sgn[0], sig_sgn[1], sig_sgn[2]),
+            )
+            n_pos = int((op_sig_attr[:, 1] > 0).sum())
+            n_neg = int((op_sig_attr[:, 1] < 0).sum())
+            n_neu = int((op_sig_attr[:, 1] == 0).sum())
+            print(f"    signaling (kinase+SIGNOR) : {len(op_sig_src)} arêtes "
+                  f"[+:{n_pos} −:{n_neg} 0:{n_neu}]")
+
+        if MODULES["use_omnipath_tf_curated"]:
+            tf_op = load_collectri_tf_target(**_opi_kwargs)
+            op_tf_src, op_tf_dst, op_tf_attr = tf_op[0], tf_op[1], tf_op[2]
+            n_pos = int((op_tf_attr[:, 1] > 0).sum())
+            n_neg = int((op_tf_attr[:, 1] < 0).sum())
+            n_neu = int((op_tf_attr[:, 1] == 0).sum())
+            n_tfs = len(set(op_tf_src.tolist())) if op_tf_src.size > 0 else 0
+            print(f"    tf_curated (CollecTRI)    : {len(op_tf_src)} arêtes, "
+                  f"{n_tfs} TFs uniques [+:{n_pos} −:{n_neg} 0:{n_neu}]")
+
+# Conversion en tenseurs PyG (vides si désactivé ou cache absent)
+edge_index_signaling = (torch.tensor([op_sig_src.tolist(), op_sig_dst.tolist()],
+                                     dtype=torch.long)
+                        if op_sig_src.size > 0
+                        else torch.zeros((2, 0), dtype=torch.long))
+edge_attr_signaling = (torch.tensor(op_sig_attr, dtype=torch.float)
+                       if op_sig_attr.size > 0
+                       else torch.zeros((0, 2), dtype=torch.float))
+edge_index_tf_curated = (torch.tensor([op_tf_src.tolist(), op_tf_dst.tolist()],
+                                      dtype=torch.long)
+                         if op_tf_src.size > 0
+                         else torch.zeros((2, 0), dtype=torch.long))
+edge_attr_tf_curated = (torch.tensor(op_tf_attr, dtype=torch.float)
+                        if op_tf_attr.size > 0
+                        else torch.zeros((0, 2), dtype=torch.float))
+# Reverse pour message passing arrière (target → TF), même attr.
+edge_index_tf_curated_by = (torch.tensor([op_tf_dst.tolist(),
+                                          op_tf_src.tolist()],
+                                         dtype=torch.long)
+                            if op_tf_src.size > 0
+                            else torch.zeros((2, 0), dtype=torch.long))
+
 # ── Finaliser les features de noeuds gene avec les degrés ────────────────────
 # Les features de degré (nombre de voisins) sont calculées APRÈS la
 # construction des arêtes. Elles capturent la "centralité" de chaque gène
@@ -1291,6 +1433,18 @@ if edge_index_coexpr.numel() > 0:
 if edge_index_cocat.numel() > 0:
     data["gene", "metabolic_cocatalysis", "gene"].edge_index = edge_index_cocat
     data["gene", "metabolic_cocatalysis", "gene"].edge_attr = edge_attr_cocat
+# OmniPath V4 — signaling dirigé signé (kinase-substrat + SIGNOR causal)
+if edge_index_signaling.numel() > 0:
+    data["gene", "signaling", "gene"].edge_index = edge_index_signaling
+    data["gene", "signaling", "gene"].edge_attr = edge_attr_signaling
+# OmniPath V4 — TF→cible curé (CollecTRI), edge_type SÉPARÉ de "regulates"
+# pour que le GNN apprenne distinctement les deux sources (option (c) du
+# design : pySCENIC HUVEC-spécifique vs CollecTRI méta-curation).
+if edge_index_tf_curated.numel() > 0:
+    data["gene", "tf_curated", "gene"].edge_index = edge_index_tf_curated
+    data["gene", "tf_curated", "gene"].edge_attr = edge_attr_tf_curated
+    data["gene", "tf_curated_by", "gene"].edge_index = edge_index_tf_curated_by
+    data["gene", "tf_curated_by", "gene"].edge_attr = edge_attr_tf_curated
 
 print(f"  Noeuds gene       : {n_genes} (features={gene_features.shape[1]})")
 print(f"  Noeuds cell_group : {len(CELL_GROUPS)}")
@@ -1299,6 +1453,10 @@ print(f"  Arêtes pathway    : {edge_index_pathway.shape[1]}")
 print(f"  Arêtes regulates  : {edge_index_regulates.shape[1]}")
 print(f"  Arêtes coexpr     : {edge_index_coexpr.shape[1] if edge_index_coexpr.numel() > 0 else 0}")
 print(f"  Arêtes cocat      : {edge_index_cocat.shape[1] if edge_index_cocat.numel() > 0 else 0}")
+print(f"  Arêtes signaling  : {edge_index_signaling.shape[1]}"
+      + ("" if MODULES["use_omnipath_signaling"] else " [SKIP --no-omnipath-signaling]"))
+print(f"  Arêtes tf_curated : {edge_index_tf_curated.shape[1]}"
+      + ("" if MODULES["use_omnipath_tf_curated"] else " [SKIP --no-omnipath-tf-curated]"))
 
 # Sauvegarde du graphe complet pour réutilisation (perturbations, etc.)
 torch.save(data, os.path.join(OUT_DIR, "hetero_graph_vgae.pt"))
@@ -1374,6 +1532,10 @@ class HeteroEncoder(nn.Module):
         (("gene", "expressed_in", "cell_group"), 7),
         (("gene", "coexpression", "gene"), 1),
         (("gene", "metabolic_cocatalysis", "gene"), 2),
+        # OmniPath V4 — edge_attr = [score, sign∈{−1,0,+1}]
+        (("gene", "signaling", "gene"), 2),
+        (("gene", "tf_curated", "gene"), 2),
+        (("gene", "tf_curated_by", "gene"), 2),
     ]
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,

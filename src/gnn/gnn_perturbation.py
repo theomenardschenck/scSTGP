@@ -463,45 +463,84 @@ def cell_group_shift_gene_weighted(mu_base: np.ndarray,
 def compute_senescence_axes(mu_base: np.ndarray,
                              group_expr: pd.DataFrame,
                              gene_symbols: np.ndarray,
-                             p4_group: str = "P4",
+                             p4_group="P4",
                              p16_groups=("P16_cluster_0", "P16_cluster_1",
-                                         "P16_cluster_2", "P16_cluster_3")):
-    """Axes P4 -> P16 dans l'espace latent des gènes (unitaires).
+                                         "P16_cluster_2", "P16_cluster_3"),
+                             quiescent_groups=None):
+    """Axes quiescent -> sénescent dans l'espace latent des gènes.
 
-    Centroïdes pondérés par l'expression :
+    Centroïdes pondérés par l'expression (par groupe) :
         c_g = Σᵢ expr_g[i] · μ_base[i]  /  Σᵢ expr_g[i]
 
-    Axes :
-        axis_global           = unit( mean_k c_{P16_k}  −  c_{P4} )
-        axes_cluster[P16_k]   = unit( c_{P16_k}  −  c_{P4} )          pour chaque k
+    Côté QUIESCENT (= début de l'axe) : par défaut le seul groupe "P4".
+    Mais V4 permet d'agréger plusieurs groupes — par ex. {P4, P16_cluster_0}
+    car c0 est transcriptionnellement quiescent-like (cf. CLAUDE.md §V3.3).
+    Dans ce cas le centroïde quiescent est la MOYENNE des centroïdes des
+    groupes listés (équipondérée — chacun compte autant indépendamment de
+    sa taille). Ce choix évite que le gros cluster c0 écrase P4 dans la
+    pondération si on faisait une moyenne par expression cumulée.
 
-    L'axe global est plus robuste (moyenne sur 4 clusters) ; les axes par
-    cluster capturent des directions spécifiques à chaque sous-état sénescent.
+    Côté SÉNESCENT : moyenne (équipondérée) des centroïdes p16_groups
+    restants — donc en V4 c'est mean(c1, c2, c3) si c0 a basculé côté
+    quiescent.
+
+    Axes finaux (unitaires) :
+        axis_global         = unit( mean_k c_{p16_groups[k]}  −  c_quiescent )
+        axes_cluster[p16_k] = unit( c_{p16_k}  −  c_quiescent )  pour chaque k
+
+    Args:
+        p4_group : str ou liste — backward-compat. Si fourni, il est utilisé
+            comme groupe quiescent unique (V3.x baseline).
+        quiescent_groups : itérable de str (V4). Si fourni, il OVERRIDE
+            p4_group et le centroïde quiescent = moyenne sur cette liste.
+            Exemple V4 : ("P4", "P16_cluster_0").
+        p16_groups : itérable de str — clusters côté sénescent. En V4 on
+            passe typiquement ("P16_cluster_1", "P16_cluster_2", "P16_cluster_3")
+            quand c0 a basculé côté quiescent.
 
     Returns:
-        axis_global  : (latent_dim,) unit vector
-        axes_cluster : dict[cluster_name -> (latent_dim,) unit vector]
-        centers      : dict[group_name -> (latent_dim,)] pour inspection
+        axis_global   : (latent_dim,) unit vector
+        axes_cluster  : dict[cluster_name -> (latent_dim,) unit vector]
+            La clé est le NOM DU CLUSTER P16 ; l'axe pointe quiescent → ce
+            cluster spécifiquement.
+        centers       : dict[group_name -> (latent_dim,)] + clé spéciale
+            "_quiescent" = centroïde quiescent agrégé.
     """
+    # Normalise la spec quiescent (V3 single str ↔ V4 liste)
+    if quiescent_groups is None:
+        quiescent_list = ([p4_group] if isinstance(p4_group, str)
+                          else list(p4_group))
+    else:
+        quiescent_list = list(quiescent_groups)
+    p16_list = list(p16_groups)
+
     expr_by_gene = group_expr.set_index("gene").reindex(gene_symbols).fillna(0.0)
     centers: dict[str, np.ndarray] = {}
-    for g in [p4_group, *p16_groups]:
+    for g in set(quiescent_list + p16_list):
         w = expr_by_gene[f"mean_{g}"].to_numpy().astype(np.float32)
         w_sum = float(w.sum()) + 1e-8
         centers[g] = (w[:, None] * mu_base).sum(axis=0) / w_sum
+
+    # Centroïde quiescent agrégé (équipondéré sur les groupes listés)
+    quiescent_center = np.mean(np.stack([centers[g] for g in quiescent_list]),
+                               axis=0)
+    centers["_quiescent"] = quiescent_center
 
     def unit(v: np.ndarray, name: str) -> np.ndarray:
         n = float(np.linalg.norm(v))
         if n < 1e-6:
             print(f"[warn] axis '{name}' almost zero (‖·‖={n:.2e}) — "
-                  "P4 et P16 confondus dans le latent ? Projection peu fiable.")
+                  "quiescent et sénescent confondus dans le latent ? "
+                  "Projection peu fiable.")
         return (v / (n + 1e-8)).astype(np.float32)
 
-    p16_mean = np.mean(np.stack([centers[g] for g in p16_groups]), axis=0)
-    axis_global = unit(p16_mean - centers[p4_group], "global")
+    p16_mean = np.mean(np.stack([centers[g] for g in p16_list]), axis=0)
+    axis_global = unit(p16_mean - quiescent_center, "global")
     axes_cluster = {
-        g: unit(centers[g] - centers[p4_group], g) for g in p16_groups
+        g: unit(centers[g] - quiescent_center, g) for g in p16_list
     }
+    print(f"  [axes] quiescent = mean({quiescent_list}) ; "
+          f"sénescent = mean({p16_list})")
     return axis_global, axes_cluster, centers
 
 
@@ -671,8 +710,18 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
 # --------------------------------------------------------------------------- #
 # Reusable API — called both by main() and by perturb_top_genes.py (--all-*).
 # --------------------------------------------------------------------------- #
-def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None):
+def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None,
+                     quiescent_groups=None, p16_groups=None):
     """Compute the baseline once; reused across many perturbations.
+
+    Args:
+        quiescent_groups : optionnel. Liste de groupes côté quiescent pour
+            l'axe de sénescence (V4 : ("P4", "P16_cluster_0")). Si None,
+            défaut historique = ("P4",).
+        p16_groups : optionnel. Liste des clusters P16 côté sénescent. Si
+            quiescent_groups inclut "P16_cluster_0", on le retire
+            automatiquement de p16_groups (sauf si l'utilisateur a fourni
+            sa propre liste).
 
     Returns:
         spec         : (n_genes,) baseline vgae_specificity aligned on node idx.
@@ -680,7 +729,7 @@ def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None):
         base_rank    : (n_genes,) ordinal rank of base_imp (1 = best).
         z_cg_base    : (5, hidden) cell_group hidden states from the baseline pass.
         mu_base      : (n_genes, latent) embedding baseline — shift gene-weighted.
-        axis_global  : (latent,) axe sénescence P4 -> mean(P16). None si group_expr absent.
+        axis_global  : (latent,) axe quiescent -> mean(sénescent). None si group_expr absent.
         axes_cluster : dict[P16_cluster_k -> (latent,)] axes par cluster. None idem.
     """
     spec_map = dict(zip(baseline_df["gene"].astype(str),
@@ -696,8 +745,22 @@ def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None):
     # Axes sénescence (option 2). Invariants sur toutes les perturbations —
     # calculés une fois à partir de mu_base + expression par groupe.
     if group_expr is not None:
+        # Auto-derive p16_groups si non fourni : retire les clusters qui
+        # ont basculé côté quiescent_groups (ex. V4 : c0 retiré du côté
+        # sénescent quand inclus côté quiescent).
+        if p16_groups is None:
+            default_p16 = ["P16_cluster_0", "P16_cluster_1",
+                           "P16_cluster_2", "P16_cluster_3"]
+            if quiescent_groups is not None:
+                p16_groups = [g for g in default_p16
+                              if g not in set(quiescent_groups)]
+            else:
+                p16_groups = default_p16
         axis_global, axes_cluster, _centers = compute_senescence_axes(
-            mu_base, group_expr, gene_symbols)
+            mu_base, group_expr, gene_symbols,
+            p16_groups=tuple(p16_groups),
+            quiescent_groups=(tuple(quiescent_groups)
+                              if quiescent_groups is not None else None))
         print(f"  axis_global ‖·‖ pre-unit = {np.linalg.norm(axis_global):.4f} "
               f"(1.0 attendu post-normalisation)")
     else:
@@ -980,7 +1043,17 @@ def main():
     ap.add_argument("--summary-only", action="store_true",
                     help="Skip writing delta_ranking.csv / cell_group_shift.tsv "
                          "/ delta_ora_*.tsv. Only summary.json is written.")
+    # V4 — axe sénescence : groupes côté quiescent / sénescent.
+    ap.add_argument("--quiescent-groups", default="P4",
+                    help="liste séparée par virgules (défaut V3 : 'P4' ; "
+                         "recommandé V4 : 'P4,P16_cluster_0').")
+    ap.add_argument("--p16-groups", default=None,
+                    help="liste séparée par virgules ; auto-dérivé si None.")
     args = ap.parse_args()
+    _q = (tuple(s.strip() for s in args.quiescent_groups.split(",") if s.strip())
+          if args.quiescent_groups else None)
+    _p = (tuple(s.strip() for s in args.p16_groups.split(",") if s.strip())
+          if args.p16_groups else None)
 
     targets: list[str] = []
     if args.genes:
@@ -1016,7 +1089,8 @@ def main():
           f"tag={tag} | out={out_dir}")
 
     spec, base_imp, base_rank, z_cg_base, mu_base, axis_global, axes_cluster = prepare_baseline(
-        model, data, baseline, gene_symbols, group_expr)
+        model, data, baseline, gene_symbols, group_expr,
+        quiescent_groups=_q, p16_groups=_p)
 
     print("Loading REACTOME + background ...")
     reactome = load_reactome_gmt()

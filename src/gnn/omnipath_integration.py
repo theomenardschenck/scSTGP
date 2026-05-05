@@ -1,18 +1,71 @@
 """
-OmniPath Integration Module for GNN VGAE
-=========================================
-Charge et intègre OmniPath pour 3 types de données :
-1. Signaling dirigé (kinase-substrat) avec activation/inhibition
-2. Augmentation PPI (complément de STRING)
-3. TF-target DoRothEA (complément pySCENIC)
-4. PTM et features enrichies
+OmniPath integration — V4 (signed/directed edges + curated TFs).
+================================================================
+Rewrite complete pour omnipath-py >= 1.0 (l'ancienne API
+`OmnipathInteractions.get(...)` n'existe plus).
+
+3 sources de données prises en charge, chacune cachée sur disque
+sous forme TSV pour pouvoir tourner sur les compute nodes du cluster
+Nautilus (qui n'ont pas accès Internet) :
+
+    1. SIGNALING DIRIGÉ (kinase-substrat + causal signaling) :
+       — agrégat OmniPath `omnipath` filtré sur consensus_direction=True.
+       — sign = is_stimulation − is_inhibition ∈ {−1, 0, +1}.
+       — score = curation_effort normalisé.
+       — cache : data/omnipath/signaling_omnipath.tsv.gz
+
+    2. TF→target curé (CollecTRI, fallback DoRothEA) :
+       — CollecTRI = méta-ressource 2023 (Müller-Dott et al., Genome Biol)
+         qui agrège DoRothEA + ChEA3 + ENCODE + 11 autres → ~1186 TFs vs
+         ~50 SCENIC, chaque interaction porte un mode-of-regulation (mor).
+       — sign = mor ∈ {−1, +1}.
+       — cache : data/omnipath/tf_collectri.tsv.gz (ou tf_dorothea.tsv.gz)
+
+    3. PPI causal SIGNÉ (SIGNOR 3.0 via OmniPath) :
+       — sources='SIGNOR', interaction signée + dirigée curée
+         (Lo Surdo et al., Nucleic Acids Res 2023).
+       — sign = is_stimulation − is_inhibition.
+       — cache : data/omnipath/signed_ppi_signor.tsv.gz
+
+Toutes les fonctions retournent (edge_src, edge_dst, edge_attr,
+metadata_df). edge_attr a la forme (n_edges, 2) : [score, sign] avec
+score ∈ [0, 1] et sign ∈ {−1, 0, +1}. Si la source est indisponible,
+elles renvoient des arrays vides — le caller doit gérer ce cas.
+
+Usage typique côté pipeline :
+
+    from omnipath_integration import (
+        load_signaling_directed, load_collectri_tf_target,
+        load_signed_ppi_signor,
+    )
+    src, dst, attr, _ = load_signaling_directed(
+        cache_dir="data/omnipath",
+        available_genes=available_set,
+        gene_to_idx=gene_to_idx,
+        download_if_missing=False,   # True uniquement sur le frontal
+    )
+
+Pré-télécharger une fois sur le frontal (qui a Internet) avec
+`scripts/cache_omnipath.py`, puis les jobs SLURM lisent juste les TSV.
+
+Références :
+- Türei D. et al., "Integrated intra- and intercellular signaling
+  knowledge for multicellular omics analysis", Nat Commun 2021.
+- Müller-Dott S. et al., "Expanding the coverage of regulons from
+  high-confidence prior knowledge for accurate estimation of
+  transcription factor activities" — CollecTRI, Genome Biol 2023.
+- Lo Surdo P. et al., "SIGNOR 3.0, the SIGnaling Network Open
+  Resource 3.0", Nucleic Acids Res 2023.
 """
 
+from __future__ import annotations
+
 import os
+import warnings
+from typing import Iterable, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-import torch
-from typing import Tuple, Dict, Optional, Set
 
 try:
     import omnipath as op
@@ -21,261 +74,446 @@ except ImportError:
     OMNIPATH_AVAILABLE = False
 
 
-def load_omnipath_signaling(available_genes, gene_to_idx, organism=9606):
-    """
-    Charge interactions kinase-substrat (signaling dirigé).
-    
-    Feature d'arête : [confiance, is_activation, is_inhibition]
-    
-    Biologie :
-    - Interaction dirigée : kinase A → substrat B (phosphorylation)
-    - is_activation : 1 si activation, 0 sinon
-    - is_inhibition : 1 si inhibition, 0 sinon
-    - Permet au GNN de distinguer activation vs inhibition
-    
-    Exemple : MAPK1 → MBP (phosphorylation, activation probable)
-    """
-    if not OMNIPATH_AVAILABLE:
-        print("⚠️ OmniPath non installé")
-        return np.array([]), np.array([]), np.array([]), pd.DataFrame()
-    
-    print("\n  Chargement OmniPath : Signaling (kinase-substrat)...")
-    
+# Schéma commun aux 3 caches (5 colonnes minimales)
+_CACHE_COLS = ["source_symbol", "target_symbol", "score", "sign", "n_resources"]
+
+
+# --------------------------------------------------------------------------- #
+# Helpers — cache lecture/écriture, normalisation
+# --------------------------------------------------------------------------- #
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _cache_path(cache_dir: str, name: str) -> str:
+    return os.path.join(cache_dir, name)
+
+
+def _read_cache(path: str) -> Optional[pd.DataFrame]:
+    """Retourne le DataFrame caché ou None si absent/corrompu."""
+    if not os.path.exists(path):
+        return None
     try:
-        signaling = op.interactions.OmnipathInteractions.get(
-            organism=organism,
-            sources='omnipath',
-            interaction_types=['kinase-substrate'],
-            confidence_level='high',
-        )
-        
-        if signaling is None or len(signaling) == 0:
-            print("    → Aucune donnée kinase-substrat")
-            return np.array([]), np.array([]), np.array([]), pd.DataFrame()
-        
-        # Filtrer sur gènes disponibles
-        signaling_filt = signaling[
-            signaling['genesymbol_a'].isin(available_genes) &
-            signaling['genesymbol_b'].isin(available_genes)
-        ].copy()
-        
-        sig_src, sig_dst, sig_attrs = [], [], []
-        metadata = []
-        
-        for _, row in signaling_filt.iterrows():
-            kinase = row['genesymbol_a']
-            substrate = row['genesymbol_b']
-            
-            if kinase not in gene_to_idx or substrate not in gene_to_idx:
-                continue
-            
-            src_idx = gene_to_idx[kinase]
-            dst_idx = gene_to_idx[substrate]
-            confidence = float(row.get('score', 0.5))
-            
-            # is_stimulation : 1=activation, 0=inhibition, NaN=unknown
-            is_stim = row.get('is_stimulation', np.nan)
-            is_activation = 1.0 if is_stim == 1 else 0.0
-            is_inhibition = 1.0 if is_stim == 0 else 0.0
-            
-            sig_src.append(src_idx)
-            sig_dst.append(dst_idx)
-            sig_attrs.append([confidence, is_activation, is_inhibition])
-            
-            effect = 'activation' if is_stim == 1 else ('inhibition' if is_stim == 0 else 'unknown')
-            metadata.append({
-                'kinase': kinase,
-                'substrate': substrate,
-                'confidence': confidence,
-                'effect': effect,
-            })
-        
-        if sig_src:
-            edge_src = np.array(sig_src, dtype=np.int64)
-            edge_dst = np.array(sig_dst, dtype=np.int64)
-            edge_attr = np.array(sig_attrs, dtype=np.float32)
-            
-            # Normaliser chaque colonne
-            for col in range(edge_attr.shape[1]):
-                col_max = edge_attr[:, col].max()
-                if col_max > 0:
-                    edge_attr[:, col] /= col_max
-            
-            print(f"    ✓ {len(sig_src)} arêtes signaling")
-            print(f"      - activation: {int(edge_attr[:, 1].sum())}")
-            print(f"      - inhibition: {int(edge_attr[:, 2].sum())}")
-            
-            return edge_src, edge_dst, edge_attr, pd.DataFrame(metadata)
-        else:
-            return np.array([]), np.array([]), np.array([]), pd.DataFrame()
-    
+        df = pd.read_csv(path, sep="\t", compression="infer")
     except Exception as e:
-        print(f"    ⚠️ Erreur: {e}")
-        return np.array([]), np.array([]), np.array([]), pd.DataFrame()
+        warnings.warn(f"OmniPath cache illisible ({path}): {e}", RuntimeWarning)
+        return None
+    if not all(c in df.columns for c in _CACHE_COLS):
+        warnings.warn(f"OmniPath cache schéma invalide ({path})", RuntimeWarning)
+        return None
+    return df
 
 
-def load_omnipath_ppi(available_genes, gene_to_idx, organism=9606, min_confidence=0.7):
+def _write_cache(df: pd.DataFrame, path: str) -> None:
+    _ensure_dir(os.path.dirname(path))
+    df[_CACHE_COLS].to_csv(path, sep="\t", index=False, compression="gzip")
+
+
+def _normalize_score(values: pd.Series) -> np.ndarray:
+    """Min-max sur (0, 1] avec garde contre série vide / constante."""
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.size == 0:
+        return arr
+    vmax = float(np.nanmax(arr))
+    if vmax <= 0 or not np.isfinite(vmax):
+        return np.ones_like(arr, dtype=np.float32)
+    return np.clip(arr / vmax, 0.0, 1.0)
+
+
+def _stim_inhib_to_sign(is_stim: pd.Series, is_inhib: pd.Series) -> np.ndarray:
+    """sign = stim − inhib  ∈ {−1, 0, +1}.
+
+    OmniPath retourne 0/1 (parfois NaN si effet inconnu) — on coerce en 0
+    pour les NaN. Si stim ET inhib sont à 1 (rare, conflits de curation),
+    on laisse 0 (ambigu).
     """
-    Charge PPI d'OmniPath (complément ou remplacement de STRING).
-    
-    Non dirigé (A ↔ B).
-    Feature : score de confiance.
+    s = pd.to_numeric(is_stim, errors="coerce").fillna(0).astype(np.int8)
+    i = pd.to_numeric(is_inhib, errors="coerce").fillna(0).astype(np.int8)
+    sign = (s - i).astype(np.int8)
+    sign = np.where((s == 1) & (i == 1), 0, sign)
+    return sign.astype(np.float32)
+
+
+def _project_to_graph(
+    df: pd.DataFrame,
+    available_genes: Iterable[str],
+    gene_to_idx: dict,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
+    """Projette les paires symbol→symbol sur les indices du graphe.
+
+    Filtre :
+      - gènes présents dans `available_genes` ET dans `gene_to_idx`
+      - paires (src == dst) éliminées (self-loop pas pertinent ici)
+
+    Retourne : edge_src, edge_dst, edge_attr=[score, sign], metadata_df
+    Toutes vides si aucun lien ne survit au filtrage.
     """
+    avail = set(available_genes)
+    keep = (
+        df["source_symbol"].isin(avail)
+        & df["target_symbol"].isin(avail)
+        & (df["source_symbol"] != df["target_symbol"])
+    )
+    sub = df.loc[keep].copy()
+    if sub.empty:
+        return (np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+                np.zeros((0, 2), dtype=np.float32),
+                sub)
+
+    src_idx = sub["source_symbol"].map(gene_to_idx).to_numpy(dtype=np.int64)
+    dst_idx = sub["target_symbol"].map(gene_to_idx).to_numpy(dtype=np.int64)
+    score = _normalize_score(sub["score"])
+    sign = sub["sign"].astype(np.float32).to_numpy()
+    attr = np.stack([score, sign], axis=1).astype(np.float32)
+
+    # Dédup : si un même (src, dst) existe plusieurs fois (resources
+    # multiples), on agrège — score = max, sign = vote majoritaire (signe
+    # du sum).
+    pair_key = src_idx.astype(np.int64) * (max(int(dst_idx.max()) + 1, 1)) + dst_idx
+    unique_keys, inv = np.unique(pair_key, return_inverse=True)
+    if unique_keys.size != src_idx.size:
+        agg_src = np.empty(unique_keys.size, dtype=np.int64)
+        agg_dst = np.empty(unique_keys.size, dtype=np.int64)
+        agg_attr = np.zeros((unique_keys.size, 2), dtype=np.float32)
+        sign_sums = np.zeros(unique_keys.size, dtype=np.float32)
+        for k, group_idx in enumerate(np.split(np.argsort(inv),
+                                               np.cumsum(np.bincount(inv))[:-1])):
+            agg_src[k] = src_idx[group_idx[0]]
+            agg_dst[k] = dst_idx[group_idx[0]]
+            agg_attr[k, 0] = score[group_idx].max()
+            sign_sums[k] = sign[group_idx].sum()
+        agg_attr[:, 1] = np.sign(sign_sums)  # ∈ {−1, 0, +1}
+        return agg_src, agg_dst, agg_attr, sub
+
+    return src_idx, dst_idx, attr, sub
+
+
+# --------------------------------------------------------------------------- #
+# Fetchers — chacun frappe l'API web, normalise au schéma _CACHE_COLS,
+# et écrit le TSV. Renvoie None si omnipath indisponible ou échec.
+# --------------------------------------------------------------------------- #
+def _fetch_signaling_omnipath(organism: int = 9606) -> Optional[pd.DataFrame]:
+    """Signaling dirigé OmniPath (kinase-substrat + causal)."""
     if not OMNIPATH_AVAILABLE:
-        return np.array([]), np.array([]), np.array([])
-    
-    print("\n  Chargement OmniPath : PPI...")
-    
+        return None
     try:
-        ppi = op.interactions.OmnipathInteractions.get(
+        df = op.interactions.OmniPath.get(
             organism=organism,
-            sources='omnipath',
-            interaction_types='ppi',
+            directed=True,
+            genesymbols=True,
         )
-        
-        if ppi is None or len(ppi) == 0:
-            print("    → Aucune PPI trouvée")
-            return np.array([]), np.array([]), np.array([])
-        
-        ppi_filt = ppi[
-            (ppi['score'] >= min_confidence) &
-            ppi['genesymbol_a'].isin(available_genes) &
-            ppi['genesymbol_b'].isin(available_genes)
-        ].copy()
-        
-        ppi_src, ppi_dst, ppi_w = [], [], []
-        
-        for _, row in ppi_filt.iterrows():
-            g1, g2 = row['genesymbol_a'], row['genesymbol_b']
-            if g1 in gene_to_idx and g2 in gene_to_idx:
-                i, j = gene_to_idx[g1], gene_to_idx[g2]
-                score = float(row.get('score', 0.5))
-                
-                ppi_src.extend([i, j])
-                ppi_dst.extend([j, i])
-                ppi_w.extend([score, score])
-        
-        if ppi_src:
-            edge_src = np.array(ppi_src, dtype=np.int64)
-            edge_dst = np.array(ppi_dst, dtype=np.int64)
-            edge_attr = np.array(ppi_w, dtype=np.float32)
-            edge_attr /= (edge_attr.max() + 1e-8)
-            
-            print(f"    ✓ {len(ppi_filt)} interactions ({len(ppi_src)} arêtes bidirectionnelles)")
-            
-            return edge_src, edge_dst, edge_attr
-        else:
-            return np.array([]), np.array([]), np.array([])
-    
     except Exception as e:
-        print(f"    ⚠️ Erreur: {e}")
-        return np.array([]), np.array([]), np.array([])
+        warnings.warn(f"OmniPath fetch signaling KO : {e}", RuntimeWarning)
+        return None
+    if df is None or df.empty:
+        return None
+
+    # On garde uniquement les liens consensus-dirigés
+    if "consensus_direction" in df.columns:
+        df = df[df["consensus_direction"] == True]  # noqa: E712
+
+    score_col = (
+        "curation_effort" if "curation_effort" in df.columns
+        else "n_references" if "n_references" in df.columns
+        else None
+    )
+    if score_col is None:
+        df = df.assign(_score=1.0)
+        score_col = "_score"
+
+    sign = _stim_inhib_to_sign(
+        df.get("consensus_stimulation", df.get("is_stimulation", 0)),
+        df.get("consensus_inhibition", df.get("is_inhibition", 0)),
+    )
+    n_res = (
+        df["n_resources"].astype(int)
+        if "n_resources" in df.columns
+        else (df["n_references"].astype(int) if "n_references" in df.columns
+              else pd.Series(np.ones(len(df), dtype=int)))
+    )
+    out = pd.DataFrame({
+        "source_symbol": df["source_genesymbol"].astype(str),
+        "target_symbol": df["target_genesymbol"].astype(str),
+        "score": df[score_col].astype(float),
+        "sign": sign,
+        "n_resources": n_res.values,
+    })
+    return out
 
 
-def load_omnipath_tf_target(available_genes, gene_to_idx, organism=9606):
-    """
-    Charge interactions TF-cible d'OmniPath (DoRothEA).
-    
-    Dirigé : TF → cible.
-    Complément pySCENIC (basé sur données scRNA-seq).
-    DoRothEA = annotations curatées multi-source.
-    """
+def _fetch_collectri(organism: int = 9606) -> Optional[pd.DataFrame]:
+    """CollecTRI TF→target (méta-ressource curée 2023, ~1186 TFs)."""
     if not OMNIPATH_AVAILABLE:
-        return np.array([]), np.array([]), np.array([])
-    
-    print("\n  Chargement OmniPath : TF-target (DoRothEA)...")
-    
-    try:
-        tf_target = op.interactions.OmnipathInteractions.get(
-            organism=organism,
-            sources='dorothea',
-            confidence_level='high',
-        )
-        
-        if tf_target is None or len(tf_target) == 0:
-            print("    → Aucune relation TF-target trouvée")
-            return np.array([]), np.array([]), np.array([])
-        
-        tf_target_filt = tf_target[
-            tf_target['genesymbol_a'].isin(available_genes) &
-            tf_target['genesymbol_b'].isin(available_genes)
-        ].copy()
-        
-        tf_src, tf_dst, tf_w = [], [], []
-        
-        for _, row in tf_target_filt.iterrows():
-            tf, cible = row['genesymbol_a'], row['genesymbol_b']
-            if tf in gene_to_idx and cible in gene_to_idx:
-                i, j = gene_to_idx[tf], gene_to_idx[cible]
-                score = float(row.get('score', 0.5))
-                
-                tf_src.append(i)
-                tf_dst.append(j)
-                tf_w.append(score)
-        
-        if tf_src:
-            edge_src = np.array(tf_src, dtype=np.int64)
-            edge_dst = np.array(tf_dst, dtype=np.int64)
-            edge_attr = np.array(tf_w, dtype=np.float32)
-            edge_attr /= (edge_attr.max() + 1e-8)
-            
-            print(f"    ✓ {len(tf_target_filt)} relations TF→cible (DoRothEA)")
-            
-            return edge_src, edge_dst, edge_attr
-        else:
-            return np.array([]), np.array([]), np.array([])
-    
-    except Exception as e:
-        print(f"    ⚠️ Erreur: {e}")
-        return np.array([]), np.array([]), np.array([])
-
-
-def enrich_gene_features(available_genes, gene_symbols, gene_to_idx, organism=9606):
-    """
-    Enrichit les features de gènes avec données OmniPath.
-    
-    Features ajoutables :
-    - is_kinase : gène code une kinase
-    - is_tf_omnipath : TF selon OmniPath (plus large que pySCENIC)
-    """
-    if not OMNIPATH_AVAILABLE:
-        return {}
-    
-    print("\n  Enrichissement features OmniPath...")
-    
-    features = {}
-    
-    # is_kinase
-    try:
-        kinases_op = op.interactions.OmnipathInteractions.get(
-            organism=organism,
-            interaction_types='kinase-substrate',
-        )
-        if kinases_op is not None and len(kinases_op) > 0:
-            kinase_set = set(kinases_op['genesymbol_a'].unique()) & set(gene_symbols)
-            features['is_kinase'] = np.array(
-                [1.0 if g in kinase_set else 0.0 for g in gene_symbols],
-                dtype=np.float32
+        return None
+    df = None
+    # Endpoint dédié si dispo dans la version installée
+    if hasattr(op.interactions, "CollecTRI"):
+        try:
+            df = op.interactions.CollecTRI.get(
+                organism=organism,
+                genesymbols=True,
             )
-            print(f"    ✓ is_kinase: {features['is_kinase'].sum():.0f}")
-    except Exception as e:
-        print(f"    ⚠️ is_kinase: {e}")
-    
-    # is_tf_omnipath
-    try:
-        tf_op = op.interactions.OmnipathInteractions.get(
-            organism=organism,
-            sources='dorothea',
-        )
-        if tf_op is not None and len(tf_op) > 0:
-            tf_set = set(tf_op['genesymbol_a'].unique()) & set(gene_symbols)
-            features['is_tf_omnipath'] = np.array(
-                [1.0 if g in tf_set else 0.0 for g in gene_symbols],
-                dtype=np.float32
+        except Exception as e:
+            warnings.warn(f"CollecTRI fetch direct KO : {e}", RuntimeWarning)
+    # Fallback : via AllInteractions filtré sur la ressource CollecTRI
+    if df is None or df.empty:
+        try:
+            all_int = op.interactions.AllInteractions.get(
+                organism=organism,
+                genesymbols=True,
+                resources=["CollecTRI"],
             )
-            print(f"    ✓ is_tf_omnipath: {features['is_tf_omnipath'].sum():.0f}")
-    except Exception as e:
-        print(f"    ⚠️ is_tf_omnipath: {e}")
-    
-    return features
+            df = all_int
+        except Exception as e:
+            warnings.warn(f"CollecTRI fallback AllInteractions KO : {e}",
+                          RuntimeWarning)
+            return None
+    if df is None or df.empty:
+        return None
 
+    sign = _stim_inhib_to_sign(
+        df.get("is_stimulation", df.get("consensus_stimulation", 0)),
+        df.get("is_inhibition",  df.get("consensus_inhibition",  0)),
+    )
+    n_res = (df["n_resources"].astype(int) if "n_resources" in df.columns
+             else pd.Series(np.ones(len(df), dtype=int)))
+    score_col = ("curation_effort" if "curation_effort" in df.columns
+                 else "n_references" if "n_references" in df.columns else None)
+    score = (df[score_col].astype(float)
+             if score_col is not None else pd.Series(np.ones(len(df))))
+    out = pd.DataFrame({
+        "source_symbol": df["source_genesymbol"].astype(str),
+        "target_symbol": df["target_genesymbol"].astype(str),
+        "score": score.values,
+        "sign": sign,
+        "n_resources": n_res.values,
+    })
+    return out
+
+
+def _fetch_dorothea(
+    organism: int = 9606,
+    levels: Iterable[str] = ("A", "B", "C"),
+) -> Optional[pd.DataFrame]:
+    """DoRothEA TF→target (legacy fallback si CollecTRI absent)."""
+    if not OMNIPATH_AVAILABLE:
+        return None
+    try:
+        df = op.interactions.Dorothea.get(
+            organism=organism,
+            dorothea_levels=list(levels),
+            genesymbols=True,
+        )
+    except Exception as e:
+        warnings.warn(f"DoRothEA fetch KO : {e}", RuntimeWarning)
+        return None
+    if df is None or df.empty:
+        return None
+
+    sign = _stim_inhib_to_sign(
+        df.get("is_stimulation", 0),
+        df.get("is_inhibition", 0),
+    )
+    # Confiance DoRothEA : level A=1.0, B=0.75, C=0.5, D=0.25, E=0
+    level_map = {"A": 1.0, "B": 0.75, "C": 0.5, "D": 0.25, "E": 0.0}
+    score = (df["dorothea_level"].astype(str).str[0].map(level_map).fillna(0.5)
+             if "dorothea_level" in df.columns else pd.Series(np.ones(len(df))))
+    n_res = (df["n_resources"].astype(int) if "n_resources" in df.columns
+             else pd.Series(np.ones(len(df), dtype=int)))
+    out = pd.DataFrame({
+        "source_symbol": df["source_genesymbol"].astype(str),
+        "target_symbol": df["target_genesymbol"].astype(str),
+        "score": score.values,
+        "sign": sign,
+        "n_resources": n_res.values,
+    })
+    return out
+
+
+def _fetch_signor_signed_ppi(organism: int = 9606) -> Optional[pd.DataFrame]:
+    """PPI signé/dirigé curé SIGNOR 3.0."""
+    if not OMNIPATH_AVAILABLE:
+        return None
+    try:
+        df = op.interactions.AllInteractions.get(
+            organism=organism,
+            genesymbols=True,
+            resources=["SIGNOR"],
+            directed=True,
+        )
+    except Exception as e:
+        warnings.warn(f"SIGNOR fetch KO : {e}", RuntimeWarning)
+        return None
+    if df is None or df.empty:
+        return None
+
+    sign = _stim_inhib_to_sign(
+        df.get("consensus_stimulation", df.get("is_stimulation", 0)),
+        df.get("consensus_inhibition",  df.get("is_inhibition",  0)),
+    )
+    score_col = ("curation_effort" if "curation_effort" in df.columns
+                 else "n_references" if "n_references" in df.columns else None)
+    score = (df[score_col].astype(float)
+             if score_col is not None else pd.Series(np.ones(len(df))))
+    n_res = (df["n_resources"].astype(int) if "n_resources" in df.columns
+             else pd.Series(np.ones(len(df), dtype=int)))
+    out = pd.DataFrame({
+        "source_symbol": df["source_genesymbol"].astype(str),
+        "target_symbol": df["target_genesymbol"].astype(str),
+        "score": score.values,
+        "sign": sign,
+        "n_resources": n_res.values,
+    })
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# API publique — appelée par gnn_vgae.py (et scripts/cache_omnipath.py)
+# --------------------------------------------------------------------------- #
+def _load_or_fetch(
+    cache_dir: str,
+    cache_name: str,
+    fetcher,
+    download_if_missing: bool,
+    label: str,
+) -> Optional[pd.DataFrame]:
+    """Lit le cache ; si absent et autorisé, télécharge + écrit."""
+    path = _cache_path(cache_dir, cache_name)
+    cached = _read_cache(path)
+    if cached is not None:
+        print(f"  [omnipath] {label} : cache TSV ({len(cached)} liens)")
+        return cached
+    if not download_if_missing:
+        print(f"  [omnipath] {label} : cache absent, download désactivé "
+              f"→ skip ({path})")
+        return None
+    print(f"  [omnipath] {label} : téléchargement en cours…")
+    fetched = fetcher()
+    if fetched is None or fetched.empty:
+        print(f"  [omnipath] {label} : aucune donnée récupérée")
+        return None
+    _write_cache(fetched, path)
+    print(f"  [omnipath] {label} : {len(fetched)} liens téléchargés "
+          f"→ cache écrit ({path})")
+    return fetched
+
+
+def load_signaling_directed(
+    cache_dir: str,
+    available_genes: Iterable[str],
+    gene_to_idx: dict,
+    download_if_missing: bool = False,
+    organism: int = 9606,
+):
+    """Signaling dirigé OmniPath (kinase-substrat + causal).
+
+    Returns:
+        edge_src, edge_dst : (n,) np.int64 (indices du graphe)
+        edge_attr          : (n, 2) np.float32 — colonnes [score, sign]
+        metadata_df        : DataFrame des liens projetés
+    """
+    df = _load_or_fetch(
+        cache_dir, "signaling_omnipath.tsv.gz",
+        lambda: _fetch_signaling_omnipath(organism=organism),
+        download_if_missing, "signaling",
+    )
+    if df is None:
+        return (np.array([], dtype=np.int64), np.array([], dtype=np.int64),
+                np.zeros((0, 2), dtype=np.float32), pd.DataFrame())
+    return _project_to_graph(df, available_genes, gene_to_idx)
+
+
+def load_collectri_tf_target(
+    cache_dir: str,
+    available_genes: Iterable[str],
+    gene_to_idx: dict,
+    download_if_missing: bool = False,
+    organism: int = 9606,
+    fallback_dorothea: bool = True,
+):
+    """TF→target curé : CollecTRI, fallback DoRothEA.
+
+    Returns: idem load_signaling_directed.
+    """
+    df = _load_or_fetch(
+        cache_dir, "tf_collectri.tsv.gz",
+        lambda: _fetch_collectri(organism=organism),
+        download_if_missing, "TF/CollecTRI",
+    )
+    if df is None and fallback_dorothea:
+        df = _load_or_fetch(
+            cache_dir, "tf_dorothea.tsv.gz",
+            lambda: _fetch_dorothea(organism=organism),
+            download_if_missing, "TF/DoRothEA(fallback)",
+        )
+    if df is None:
+        return (np.array([], dtype=np.int64), np.array([], dtype=np.int64),
+                np.zeros((0, 2), dtype=np.float32), pd.DataFrame())
+    return _project_to_graph(df, available_genes, gene_to_idx)
+
+
+def load_signed_ppi_signor(
+    cache_dir: str,
+    available_genes: Iterable[str],
+    gene_to_idx: dict,
+    download_if_missing: bool = False,
+    organism: int = 9606,
+):
+    """PPI signé/dirigé curé SIGNOR 3.0.
+
+    Returns: idem load_signaling_directed.
+    """
+    df = _load_or_fetch(
+        cache_dir, "signed_ppi_signor.tsv.gz",
+        lambda: _fetch_signor_signed_ppi(organism=organism),
+        download_if_missing, "SIGNOR",
+    )
+    if df is None:
+        return (np.array([], dtype=np.int64), np.array([], dtype=np.int64),
+                np.zeros((0, 2), dtype=np.float32), pd.DataFrame())
+    return _project_to_graph(df, available_genes, gene_to_idx)
+
+
+# --------------------------------------------------------------------------- #
+# Fusion utilitaire — combine signaling + SIGNOR en un seul edge_type
+# (les deux portent la sémantique "lien causal signé dirigé").
+# --------------------------------------------------------------------------- #
+def merge_signed_directed(
+    *triples,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Concatène plusieurs (src, dst, attr=[score,sign]) en un seul.
+
+    Si la même paire (src, dst) apparaît plusieurs fois, on garde le score
+    max et le signe par vote majoritaire (somme des signes). Utile pour
+    fusionner kinase-substrat OmniPath + SIGNOR causal.
+    """
+    triples = [t for t in triples if len(t[0]) > 0]
+    if not triples:
+        return (np.array([], dtype=np.int64),
+                np.array([], dtype=np.int64),
+                np.zeros((0, 2), dtype=np.float32))
+    src = np.concatenate([t[0] for t in triples]).astype(np.int64)
+    dst = np.concatenate([t[1] for t in triples]).astype(np.int64)
+    attr = np.concatenate([t[2] for t in triples], axis=0).astype(np.float32)
+
+    if src.size == 0:
+        return src, dst, attr
+
+    key = src * (int(dst.max()) + 1) + dst
+    uniq, inv = np.unique(key, return_inverse=True)
+    if uniq.size == src.size:
+        return src, dst, attr
+
+    out_src = np.empty(uniq.size, dtype=np.int64)
+    out_dst = np.empty(uniq.size, dtype=np.int64)
+    out_attr = np.zeros((uniq.size, 2), dtype=np.float32)
+    sign_sum = np.zeros(uniq.size, dtype=np.float32)
+    for k, group in enumerate(np.split(np.argsort(inv),
+                                       np.cumsum(np.bincount(inv))[:-1])):
+        out_src[k] = src[group[0]]
+        out_dst[k] = dst[group[0]]
+        out_attr[k, 0] = attr[group, 0].max()
+        sign_sum[k] = attr[group, 1].sum()
+    out_attr[:, 1] = np.sign(sign_sum)
+    return out_src, out_dst, out_attr
