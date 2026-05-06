@@ -113,30 +113,61 @@ class VGAERankingSource(RankingSource):
         return LoadedRanking(df=out, score_col=self.score_col, grain=self.grain)
 
 
-# Stub à implémenter quand on branchera les rankings de perturb_report.
-# class PerturbDriverRankingSource(RankingSource):
-#     """cross_seed_gene_ranking.tsv produit par `perturb_report --cross-seed`.
-#
-#     Grain: per_ablation (pas per_seed). Score canonique configurable parmi
-#     {driver_score, validation_score, discovery_score}.
-#     """
-#     name = 'perturb_driver'
-#     grain = 'per_ablation'
-#     def __init__(self, score_col: str = 'driver_score',
-#                  report_subdir: str = 'cross_seed_report'):
-#         self.score_col = score_col
-#         self.report_subdir = report_subdir
-#     def locate(self, base_dir: Path, ablation: str) -> Optional[Path]:
-#         p = base_dir / ablation / self.report_subdir / 'cross_seed_gene_ranking.tsv'
-#         return p if p.exists() else None
-#     def load(...): ...
+class PerturbDriverRankingSource(RankingSource):
+    """`cross_seed_gene_ranking.tsv` produit par `perturb_report --cross-seed`.
+
+    Grain: per_ablation (déjà agrégé sur les seeds par perturb_report).
+    Score canonique configurable parmi {driver_score, validation_score,
+    discovery_score}. Le « run » manipulé par compare_runs au plus haut
+    niveau correspond ici à un nom d'ablation (ex. ``full``,
+    ``no-coexpr``).
+
+    Layout attendu : ``<base_dir>/<ablation>/<report_subdir>/<file_name>``.
+    """
+
+    name = 'perturb_driver'
+    grain = 'per_ablation'
+    score_col = 'driver_score'
+    file_name = 'cross_seed_gene_ranking.tsv'
+    report_subdir = 'cross_seed_report'
+
+    def __init__(self, score_col: str = 'driver_score',
+                 report_subdir: str = 'cross_seed_report'):
+        self.score_col = score_col
+        self.report_subdir = report_subdir
+
+    def locate(self, base_dir: Path, ablation: str) -> Optional[Path]:
+        p = base_dir / ablation / self.report_subdir / self.file_name
+        return p if p.exists() else None
+
+    def load(self, base_dir: Path, ablation: str) -> Optional[LoadedRanking]:
+        path = self.locate(base_dir, ablation)
+        if path is None:
+            return None
+        raw = pd.read_csv(path, sep='\t', index_col='target')
+        if self.score_col not in raw.columns:
+            return None
+        # Le rang est implicite (ordre du TSV, déjà trié par driver_score).
+        out = pd.DataFrame({
+            'score': raw[self.score_col],
+            'rank': np.arange(1, len(raw) + 1),
+        }, index=raw.index)
+        # On préserve les colonnes utiles pour l'agrégation cross-ablation.
+        for c in ('evidence_tier', 'is_de_significant', 'n_aging_dbs',
+                  'is_hub_inflated', 'is_low_purity_signal',
+                  'canon_cosine', 'target_ppi_degree',
+                  'de_log2fc_p4_vs_p16', 'de_neglog10_padj',
+                  'direction', 'is_tf'):
+            if c in raw.columns:
+                out[c] = raw[c]
+        return LoadedRanking(df=out, score_col=self.score_col, grain=self.grain)
 
 
 SOURCES: dict[str, Callable[..., RankingSource]] = {
     'vgae': VGAERankingSource,
-    # 'perturb_driver': PerturbDriverRankingSource,
-    # 'perturb_validation': lambda: PerturbDriverRankingSource('validation_score'),
-    # 'perturb_discovery': lambda: PerturbDriverRankingSource('discovery_score'),
+    'perturb_driver': PerturbDriverRankingSource,
+    'perturb_validation': lambda: PerturbDriverRankingSource('validation_score'),
+    'perturb_discovery': lambda: PerturbDriverRankingSource('discovery_score'),
 }
 
 
@@ -156,13 +187,21 @@ def parse_ablation_seed(name: str) -> tuple[str, Optional[int]]:
 
 
 def discover_runs(base_dir: Path, source: RankingSource,
-                  pattern: str = '*.s*') -> list[str]:
-    """Globe les sous-répertoires correspondant à `pattern` (à la racine
-    et un niveau plus bas) et garde ceux qui exposent un fichier de
-    ranking valide pour `source`. Couvre les layouts plat et nested.
+                  pattern: Optional[str] = None) -> list[str]:
+    """Globe les sous-répertoires et garde ceux qui exposent un fichier de
+    ranking valide pour `source`.
+
+    - per_seed sources : pattern par défaut ``*.s*`` (cherche à la racine
+      et un niveau plus bas — couvre layouts plat et nested).
+    - per_ablation sources : pattern par défaut ``*`` (chaque sous-dir de
+      base_dir est candidat ablation).
     """
+    if pattern is None:
+        pattern = '*.s*' if source.grain == 'per_seed' else '*'
+
     seen: dict[str, str] = {}  # nom de run → premier match (déduplique)
-    for glob in (pattern, f'*/{pattern}'):
+    globs = [pattern, f'*/{pattern}'] if source.grain == 'per_seed' else [pattern]
+    for glob in globs:
         for p in sorted(base_dir.glob(glob)):
             if not p.is_dir():
                 continue
@@ -384,6 +423,153 @@ class RunComparator:
               f"référence={reference_run}, union_top={union_top})")
         return out_path
 
+    # ---- Cross-ablation robustness (per_ablation grain only) -------------
+
+    def cross_ablation_robustness(self,
+                                  baseline: str = 'full',
+                                  out_path: Optional[Path] = None,
+                                  coexpr_degree: Optional[dict] = None,
+                                  ppi_degree: Optional[dict] = None,
+                                  ) -> pd.DataFrame:
+        """Synthèse par gène à travers toutes les ablations chargées.
+
+        Disponible uniquement pour grain ``per_ablation`` (les rankings
+        de ``perturb_report``). Génère un TSV avec :
+          - `n_ablations_strong` : #ablations où tier ∈ {A_confirmed, B_discovery}
+          - `tier_consensus` : tier majoritaire (mode) sur toutes les ablations
+          - `tier_robustness` : fraction d'ablations confirmant le consensus
+          - `<ablation>_tier`, `<ablation>_driver_score` pour chaque ablation
+          - colonnes du baseline : evidence_tier, driver_score, canon_cosine,
+            is_de_significant, n_aging_dbs, direction
+          - `coexpr_degree`, `target_ppi_degree` (si fournis)
+
+        Tri : par n_ablations_strong DESC, puis driver_score baseline DESC.
+        """
+        if self.source.grain != 'per_ablation':
+            raise RuntimeError(
+                "cross_ablation_robustness exige une source per_ablation "
+                f"(reçue: {self.source.grain}).")
+        if baseline not in self.rankings:
+            raise ValueError(f"Baseline '{baseline}' absent parmi {self.runs}")
+
+        # Union des gènes vus dans au moins une ablation
+        all_genes: set[str] = set()
+        for r in self.runs:
+            all_genes.update(self.rankings[r].index)
+
+        STRONG = {'A_confirmed', 'B_discovery'}
+        rows = []
+        for g in all_genes:
+            row: dict[str, object] = {'gene': g}
+            tiers_seen = []
+            n_strong = 0
+            for r in self.runs:
+                df = self.rankings[r]
+                if g not in df.index:
+                    row[f'{r}_tier'] = '_absent'
+                    row[f'{r}_driver_score'] = np.nan
+                    continue
+                t = str(df.at[g, 'evidence_tier']) if 'evidence_tier' in df.columns else ''
+                row[f'{r}_tier'] = t
+                row[f'{r}_driver_score'] = float(df.at[g, 'score'])
+                tiers_seen.append(t)
+                if t in STRONG:
+                    n_strong += 1
+
+            # Consensus : tier modal (en cas d'égalité, priorité D > A > B > C > E)
+            tier_priority = {'D_hub': 0, 'A_confirmed': 1, 'B_discovery': 2,
+                             'C_effector': 3, 'E_noise': 4, '_absent': 5}
+            counts: dict[str, int] = {}
+            for t in tiers_seen:
+                counts[t] = counts.get(t, 0) + 1
+            if counts:
+                # Tri : (count desc, priority asc → tier le plus fort en premier)
+                consensus = sorted(counts.items(),
+                                   key=lambda kv: (-kv[1], tier_priority.get(kv[0], 99)))[0][0]
+                robust = counts[consensus] / max(len(tiers_seen), 1)
+            else:
+                consensus = '_absent'
+                robust = 0.0
+
+            row['n_ablations_strong'] = n_strong
+            row['tier_consensus'] = consensus
+            row['tier_robustness'] = round(robust, 3)
+
+            # Snapshot baseline (pour DE / aging / fonction)
+            base_df = self.rankings[baseline]
+            if g in base_df.index:
+                for c in ('score', 'evidence_tier', 'is_de_significant',
+                          'n_aging_dbs', 'canon_cosine', 'target_ppi_degree',
+                          'de_log2fc_p4_vs_p16', 'de_neglog10_padj',
+                          'direction', 'is_tf'):
+                    if c in base_df.columns:
+                        row[f'baseline_{c}'] = base_df.at[g, c]
+                # Renommer baseline_score → baseline_driver_score
+                if 'baseline_score' in row:
+                    row['baseline_driver_score'] = row.pop('baseline_score')
+            else:
+                row['baseline_driver_score'] = np.nan
+                row['baseline_evidence_tier'] = '_absent'
+
+            if coexpr_degree is not None:
+                row['coexpr_degree'] = int(coexpr_degree.get(g, 0))
+            if ppi_degree is not None and 'baseline_target_ppi_degree' not in row:
+                row['target_ppi_degree'] = int(ppi_degree.get(g, 0))
+
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        # Ordre de colonnes lisible
+        front = ['gene', 'tier_consensus', 'tier_robustness',
+                 'n_ablations_strong', 'baseline_driver_score',
+                 'baseline_evidence_tier', 'baseline_canon_cosine',
+                 'baseline_is_de_significant', 'baseline_n_aging_dbs',
+                 'baseline_de_log2fc_p4_vs_p16', 'baseline_de_neglog10_padj',
+                 'baseline_direction', 'baseline_is_tf',
+                 'baseline_target_ppi_degree']
+        if coexpr_degree is not None:
+            front.append('coexpr_degree')
+        front = [c for c in front if c in df.columns]
+        per_ab = sorted([c for c in df.columns if c.endswith('_tier')
+                         and not c.startswith('baseline_')
+                         and not c.startswith('tier_')])
+        per_ds = sorted([c for c in df.columns if c.endswith('_driver_score')
+                         and c != 'baseline_driver_score'])
+        rest = [c for c in df.columns if c not in front + per_ab + per_ds]
+        df = df[front + per_ab + per_ds + rest]
+
+        df = df.sort_values(
+            ['n_ablations_strong', 'baseline_driver_score'],
+            ascending=[False, False])
+
+        if out_path is not None:
+            df.to_csv(out_path, sep='\t', index=False)
+            print(f"✓ Cross-ablation robustness : {out_path} "
+                  f"({len(df)} gènes, {len(self.runs)} ablations)")
+        return df
+
+
+# ---------------------------------------------------------------------------
+# Coexpression / PPI degree helpers (optional enrichments)
+# ---------------------------------------------------------------------------
+
+def load_coexpr_degree(adj_path: Path,
+                       top_quantile: float = 0.98) -> dict[str, int]:
+    """Compte le degré de chaque gène dans le réseau coexpression
+    GRNBoost2 filtré au quantile top_quantile (V3.6 default = 0.98).
+
+    Utilisé pour enrichir le ranking cross-ablation : un gène à degree
+    GRN élevé risque d'être un coexpression-hub (tier A artificiellement
+    porté par GRNBoost2, cf. analyse §17 V3.6 du rapport).
+    """
+    if not adj_path.exists():
+        return {}
+    adj = pd.read_csv(adj_path)
+    thresh = adj['importance'].quantile(top_quantile)
+    top = adj[adj['importance'] >= thresh]
+    deg = pd.concat([top['TF'], top['target']]).value_counts().to_dict()
+    return {str(k): int(v) for k, v in deg.items()}
+
 
 # ---------------------------------------------------------------------------
 # Figures
@@ -558,15 +744,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--no-table', action='store_true',
                    help='Ne pas exporter la table résumé large.')
 
+    # Cross-ablation robustness (per_ablation grain only)
+    p.add_argument('--cross-ablation', action='store_true',
+                   help='Génère cross_ablation_robustness.tsv (uniquement '
+                        'pour les sources per_ablation : perturb_driver, '
+                        'perturb_validation, perturb_discovery).')
+    p.add_argument('--coexpr-adjacencies',
+                   default='output/pyscenic/adjacencies.csv',
+                   help='CSV GRNBoost2 (pour la colonne coexpr_degree). '
+                        'Mettre une chaîne vide pour désactiver.')
+    p.add_argument('--coexpr-top-quantile', type=float, default=0.98,
+                   help='Quantile de filtrage GRNBoost2 (cohérent avec '
+                        'gnn_vgae.py). Défaut 0.98.')
+
     return p
 
 
 def resolve_runs(args, base_dir: Path, source: RankingSource) -> list[str]:
     if args.auto_discover:
-        runs = discover_runs(base_dir, source, args.discover_pattern)
+        # Si l'utilisateur n'a pas surchargé le pattern et la source est
+        # per_ablation, basculer sur le pattern par défaut de discover_runs
+        # (sinon `*.s*` rate les dossiers d'ablation).
+        pattern = args.discover_pattern
+        if (pattern == '*.s*' and source.grain == 'per_ablation'):
+            pattern = None  # discover_runs choisira '*'
+        runs = discover_runs(base_dir, source, pattern)
         if not runs:
             raise SystemExit(f"❌ Aucun run découvert dans {base_dir} "
-                             f"(pattern={args.discover_pattern}, source={source.name})")
+                             f"(pattern={pattern!r}, source={source.name})")
         return runs
     if args.runs:
         return list(args.runs)
@@ -661,6 +866,43 @@ def main() -> None:
             reference_run=args.reference_run,
             union_top=not args.no_union_top,
         )
+
+    # ----- Cross-ablation robustness (per_ablation only)
+    if args.cross_ablation:
+        if source.grain != 'per_ablation':
+            print(f"⚠️  --cross-ablation ignoré (source {source.name} a grain "
+                  f"{source.grain}, requis: per_ablation)")
+        else:
+            print_section('🧬 ROBUSTESSE CROSS-ABLATION')
+            coexpr_lookup: Optional[dict] = None
+            if args.coexpr_adjacencies:
+                adj_p = Path(args.coexpr_adjacencies)
+                coexpr_lookup = load_coexpr_degree(adj_p, args.coexpr_top_quantile)
+                if coexpr_lookup:
+                    print(f"   coexpr_degree chargé : {len(coexpr_lookup)} gènes "
+                          f"(top {(1 - args.coexpr_top_quantile)*100:.0f}% GRN)")
+                else:
+                    print(f"   ⚠️  Pas de coexpr_degree (fichier: {adj_p})")
+            cab = cmp.cross_ablation_robustness(
+                baseline=args.baseline,
+                out_path=out_dir / 'cross_ablation_robustness.tsv',
+                coexpr_degree=coexpr_lookup,
+            )
+            # Aperçu
+            n_max = len(cmp.runs)
+            dist = cab['n_ablations_strong'].value_counts().sort_index(ascending=False)
+            print(f"   Distribution n_ablations_strong (sur {n_max}) :")
+            for n_strong, n_genes in dist.items():
+                print(f"     {n_strong}/{n_max}: {n_genes} gènes")
+            top_robust = cab[cab['n_ablations_strong'] == n_max]
+            print(f"\n   Drivers A/B dans {n_max}/{n_max} ablations "
+                  f"({len(top_robust)}) :")
+            cols_show = ['gene', 'tier_consensus', 'baseline_driver_score',
+                         'baseline_is_de_significant', 'baseline_n_aging_dbs']
+            if 'coexpr_degree' in cab.columns:
+                cols_show.append('coexpr_degree')
+            if not top_robust.empty:
+                print(top_robust[cols_show].head(15).to_string(index=False))
 
     # ----- Figures
     if not args.no_figures:
