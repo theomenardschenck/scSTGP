@@ -578,6 +578,12 @@ def main():
                          "sénescent. Si non fourni, dérivé automatiquement "
                          "de --quiescent-groups (P16_cluster_0..3 moins "
                          "ceux passés côté quiescent).")
+    ap.add_argument("--out-suffix", default="",
+                    help="suffixe ajouté au préfixe d'output (avant '_<mode>.tsv'). "
+                         "Évite d'écraser les TSV V3 quand on relance la même "
+                         "perturbation avec un axe V4 différent. "
+                         "Exemple : '--out-suffix _axisV4' → "
+                         "perturbation_all_genes_axisV4_knockout.tsv.")
     args = ap.parse_args()
 
     run_dir: Path = args.run_dir
@@ -595,14 +601,15 @@ def main():
         ctx = _load_model_and_baseline(run_dir, args.hidden, args.latent,
                                        args.n_layers, args.n_heads,
                                        quiescent_groups=_q, p16_groups=_p)
+        _suffix = args.out_suffix  # "" si non fourni → comportement V3 inchangé
         if args.all_genes:
             run_all_genes(ctx, modes, args.oe_factor,
                           args.top_k, args.fdr,
-                          out_prefix=run_dir / "perturbation_all_genes")
+                          out_prefix=run_dir / f"perturbation_all_genes{_suffix}")
         if args.all_pathways:
             run_all_pathways(ctx, modes, args.oe_factor,
                              args.top_k, args.fdr,
-                             out_prefix=run_dir / "perturbation_all_pathways",
+                             out_prefix=run_dir / f"perturbation_all_pathways{_suffix}",
                              pw_min_size=args.pw_min_size,
                              pw_max_size=args.pw_max_size)
         return

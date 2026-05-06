@@ -42,20 +42,46 @@ SOURCES = {
                   opi._fetch_signor_signed_ppi),
 }
 
+EPILOG = """\
+Si omnipathdb.org est en panne (502/500 chronique) :
+
+  Plan B — SIGNOR direct (serveur INDÉPENDANT, hors OmniPath) :
+    1. Télécharger : wget 'https://signor.uniroma2.it/getData.php?organism=9606' \\
+         -O /tmp/signor.tsv
+    2. Importer    : python scripts/cache_omnipath.py \\
+         --import-signor /tmp/signor.tsv --cache-dir data/omnipath
+
+  Plan C — CollecTRI seul (déjà téléchargé). C'est suffisant pour
+  lancer V4 avec --use-omnipath-tf-curated, qui apporte le gain TFs ×20.
+"""
+
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__,
+    p = argparse.ArgumentParser(description=__doc__, epilog=EPILOG,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--cache-dir", default="data/omnipath",
                    help="dossier de sortie (défaut : data/omnipath)")
     p.add_argument("--only", default="signaling,collectri,signor",
                    help="liste séparée par virgules : signaling, collectri, "
                         "dorothea, signor (défaut : signaling,collectri,signor)")
-    p.add_argument("--organism", type=int, default=9606,
-                   help="taxon NCBI (défaut : 9606 = humain)")
+    p.add_argument("--organism", default="human",
+                   choices=["human", "mouse", "rat"],
+                   help="organisme (défaut : human). omnipath-py n'accepte "
+                        "pas les NCBI taxon IDs.")
     p.add_argument("--force", action="store_true",
                    help="re-télécharger même si le cache existe")
+    p.add_argument("--import-signor", metavar="TSV", default=None,
+                   help="bypass omnipath : importe un dump natif SIGNOR "
+                        "téléchargé manuellement depuis "
+                        "https://signor.uniroma2.it/getData.php (TSV).")
     args = p.parse_args()
+
+    # Mode import direct — ne fait rien d'autre.
+    if args.import_signor:
+        os.makedirs(args.cache_dir, exist_ok=True)
+        n = opi.import_signor_native_tsv(args.import_signor, args.cache_dir)
+        print(f"\n[cache_omnipath] SIGNOR importé manuellement : {n} liens")
+        return
 
     if not opi.OMNIPATH_AVAILABLE:
         sys.exit("ERREUR : module `omnipath` non installé. "

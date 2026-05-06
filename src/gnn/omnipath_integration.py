@@ -61,8 +61,9 @@ Références :
 from __future__ import annotations
 
 import os
+import time
 import warnings
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -72,6 +73,37 @@ try:
     OMNIPATH_AVAILABLE = True
 except ImportError:
     OMNIPATH_AVAILABLE = False
+
+
+# omnipathdb.org renvoie régulièrement des 502/500 transitoires (le service
+# n'est pas un CDN — c'est un Flask devant une DB). Retry avec backoff
+# exponentiel résout l'écrasante majorité des cas.
+_RETRY_DELAYS = (2, 5, 10, 20, 40)  # secondes — total max ~77s
+
+
+def _retry_fetch(label: str, fn: Callable[[], pd.DataFrame],
+                 retries: Iterable[int] = _RETRY_DELAYS) -> Optional[pd.DataFrame]:
+    """Retry exponentiel sur les transients OmniPath (502/500)."""
+    delays = list(retries)
+    last_exc: Optional[Exception] = None
+    for attempt in range(len(delays) + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if attempt >= len(delays):
+                break
+            wait = delays[attempt]
+            print(f"    [{label}] échec tentative {attempt + 1}/"
+                  f"{len(delays) + 1} ({type(e).__name__}) — retry dans "
+                  f"{wait}s")
+            time.sleep(wait)
+    if last_exc is not None:
+        warnings.warn(f"{label} : abandon après "
+                      f"{len(delays) + 1} tentatives — "
+                      f"{type(last_exc).__name__}",
+                      RuntimeWarning)
+    return None
 
 
 # Schéma commun aux 3 caches (5 colonnes minimales)
@@ -193,19 +225,18 @@ def _project_to_graph(
 # Fetchers — chacun frappe l'API web, normalise au schéma _CACHE_COLS,
 # et écrit le TSV. Renvoie None si omnipath indisponible ou échec.
 # --------------------------------------------------------------------------- #
-def _fetch_signaling_omnipath(organism: int = 9606) -> Optional[pd.DataFrame]:
+def _fetch_signaling_omnipath(organism: str = "human") -> Optional[pd.DataFrame]:
     """Signaling dirigé OmniPath (kinase-substrat + causal)."""
     if not OMNIPATH_AVAILABLE:
         return None
-    try:
-        df = op.interactions.OmniPath.get(
+    df = _retry_fetch(
+        "signaling/OmniPath",
+        lambda: op.interactions.OmniPath.get(
             organism=organism,
             directed=True,
             genesymbols=True,
-        )
-    except Exception as e:
-        warnings.warn(f"OmniPath fetch signaling KO : {e}", RuntimeWarning)
-        return None
+        ),
+    )
     if df is None or df.empty:
         return None
 
@@ -242,33 +273,28 @@ def _fetch_signaling_omnipath(organism: int = 9606) -> Optional[pd.DataFrame]:
     return out
 
 
-def _fetch_collectri(organism: int = 9606) -> Optional[pd.DataFrame]:
+def _fetch_collectri(organism: str = "human") -> Optional[pd.DataFrame]:
     """CollecTRI TF→target (méta-ressource curée 2023, ~1186 TFs)."""
     if not OMNIPATH_AVAILABLE:
         return None
     df = None
     # Endpoint dédié si dispo dans la version installée
     if hasattr(op.interactions, "CollecTRI"):
-        try:
-            df = op.interactions.CollecTRI.get(
-                organism=organism,
-                genesymbols=True,
-            )
-        except Exception as e:
-            warnings.warn(f"CollecTRI fetch direct KO : {e}", RuntimeWarning)
+        df = _retry_fetch(
+            "CollecTRI",
+            lambda: op.interactions.CollecTRI.get(
+                organism=organism, genesymbols=True),
+        )
     # Fallback : via AllInteractions filtré sur la ressource CollecTRI
     if df is None or df.empty:
-        try:
-            all_int = op.interactions.AllInteractions.get(
+        df = _retry_fetch(
+            "CollecTRI/AllInteractions",
+            lambda: op.interactions.AllInteractions.get(
                 organism=organism,
                 genesymbols=True,
                 resources=["CollecTRI"],
-            )
-            df = all_int
-        except Exception as e:
-            warnings.warn(f"CollecTRI fallback AllInteractions KO : {e}",
-                          RuntimeWarning)
-            return None
+            ),
+        )
     if df is None or df.empty:
         return None
 
@@ -293,21 +319,20 @@ def _fetch_collectri(organism: int = 9606) -> Optional[pd.DataFrame]:
 
 
 def _fetch_dorothea(
-    organism: int = 9606,
+    organism: str = "human",
     levels: Iterable[str] = ("A", "B", "C"),
 ) -> Optional[pd.DataFrame]:
     """DoRothEA TF→target (legacy fallback si CollecTRI absent)."""
     if not OMNIPATH_AVAILABLE:
         return None
-    try:
-        df = op.interactions.Dorothea.get(
+    df = _retry_fetch(
+        "DoRothEA",
+        lambda: op.interactions.Dorothea.get(
             organism=organism,
             dorothea_levels=list(levels),
             genesymbols=True,
-        )
-    except Exception as e:
-        warnings.warn(f"DoRothEA fetch KO : {e}", RuntimeWarning)
-        return None
+        ),
+    )
     if df is None or df.empty:
         return None
 
@@ -331,20 +356,24 @@ def _fetch_dorothea(
     return out
 
 
-def _fetch_signor_signed_ppi(organism: int = 9606) -> Optional[pd.DataFrame]:
-    """PPI signé/dirigé curé SIGNOR 3.0."""
+def _fetch_signor_signed_ppi(organism: str = "human") -> Optional[pd.DataFrame]:
+    """PPI signé/dirigé curé SIGNOR 3.0.
+
+    On cible le dataset OmniPath (où SIGNOR est intégré) plutôt que
+    AllInteractions, qui scannerait 11 datasets et pousserait le serveur
+    omnipathdb.org en 502 sur les requêtes plus longues.
+    """
     if not OMNIPATH_AVAILABLE:
         return None
-    try:
-        df = op.interactions.AllInteractions.get(
+    df = _retry_fetch(
+        "SIGNOR",
+        lambda: op.interactions.OmniPath.get(
             organism=organism,
             genesymbols=True,
             resources=["SIGNOR"],
             directed=True,
-        )
-    except Exception as e:
-        warnings.warn(f"SIGNOR fetch KO : {e}", RuntimeWarning)
-        return None
+        ),
+    )
     if df is None or df.empty:
         return None
 
@@ -366,6 +395,106 @@ def _fetch_signor_signed_ppi(organism: int = 9606) -> Optional[pd.DataFrame]:
         "n_resources": n_res.values,
     })
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Imports manuels — fallback quand omnipathdb.org est en panne (502 chronique).
+# Convertit un dump natif (SIGNOR, OmniPath dump CSV) vers notre schéma.
+# --------------------------------------------------------------------------- #
+def import_signor_native_tsv(signor_tsv_path: str, cache_dir: str,
+                              cache_name: str = "signed_ppi_signor.tsv.gz",
+                              taxon: int = 9606) -> int:
+    """Convertit un dump SIGNOR (signor.uniroma2.it) → notre cache TSV.
+
+    SIGNOR direct download : `https://signor.uniroma2.it/getData.php`
+    (serveur indépendant d'OmniPath — bypass les 502 d'omnipathdb.org).
+
+    Schéma SIGNOR natif (>20 colonnes) — on garde :
+        ENTITYA  : symbole gène source (HGNC)
+        TYPEA    : doit être 'protein' (filtre les complex/chemical)
+        ENTITYB  : symbole gène cible
+        TYPEB    : idem
+        EFFECT   : 'up-regulates*' → +1 ; 'down-regulates*' → −1 ; sinon 0
+        DIRECT   : 't' = direct (on garde uniquement les directs)
+        TAX_ID   : 9606 = humain
+        SCORE    : confiance SIGNOR (0..1)
+
+    Args:
+        signor_tsv_path : chemin vers le TSV natif téléchargé manuellement.
+        cache_dir       : dossier de cache OmniPath (où écrire).
+        cache_name      : nom du fichier de cache écrit.
+        taxon           : filtre TAX_ID (9606 par défaut).
+
+    Returns: nombre de liens écrits.
+    """
+    # Schéma officiel SIGNOR Release (28 colonnes) — ordonnées.
+    # Le endpoint getData.php?organism=… renvoie du TSV SANS en-tête,
+    # alors que le ZIP "All data" sur le site a un header. On gère les
+    # deux cas.
+    # 29 colonnes dans le dump getData.php (SIGNOR_ID/SCORE inversés
+    # par rapport à la doc Release officielle, + 1 colonne trailing vide).
+    # Vérifié empiriquement sur Release ~3.1 (mai 2026).
+    SIGNOR_COLS = [
+        "ENTITYA", "TYPEA", "IDA", "DATABASEA",
+        "ENTITYB", "TYPEB", "IDB", "DATABASEB",
+        "EFFECT", "MECHANISM", "RESIDUE", "SEQUENCE",
+        "TAX_ID", "CELL_DATA", "TISSUE_DATA",
+        "MODULATOR_COMPLEX", "TARGET_COMPLEX",
+        "MODIFICATIONA", "MODASEQ", "MODIFICATIONB", "MODBSEQ",
+        "PMID", "DIRECT", "NOTES", "ANNOTATOR", "SENTENCE",
+        "SIGNOR_ID", "SCORE", "_TRAILING",
+    ]
+    # Détection en lisant la première ligne — si elle contient 'ENTITYA',
+    # c'est un header, sinon on injecte SIGNOR_COLS.
+    with open(signor_tsv_path) as fh:
+        first = fh.readline()
+    has_header = "ENTITYA" in first.split("\t")
+    df = pd.read_csv(
+        signor_tsv_path, sep="\t", low_memory=False,
+        header=0 if has_header else None,
+        names=None if has_header else SIGNOR_COLS,
+    )
+
+    needed = {"ENTITYA", "ENTITYB", "EFFECT", "TYPEA", "TYPEB",
+              "DIRECT", "TAX_ID"}
+    miss = needed - set(df.columns)
+    if miss:
+        raise ValueError(
+            f"Colonnes SIGNOR manquantes après lecture : {miss}. "
+            f"Format inattendu (vu {len(df.columns)} colonnes au lieu "
+            f"de {len(SIGNOR_COLS)}). Vérifie que le fichier vient bien "
+            f"de signor.uniroma2.it/getData.php ou du ZIP officiel.")
+
+    # TAX_ID peut être numérique (9606, -1, 9606.0) → cast tolérant.
+    tax_num = pd.to_numeric(df["TAX_ID"], errors="coerce").fillna(-1).astype(int)
+    df = df[(df["TYPEA"].astype(str).str.lower() == "protein")
+            & (df["TYPEB"].astype(str).str.lower() == "protein")
+            & (tax_num == int(taxon))
+            & (df["DIRECT"].astype(str).str.lower().isin(["t", "true", "1"]))
+            ].copy()
+
+    # EFFECT → sign : up → +1, down → −1, sinon 0
+    eff = df["EFFECT"].astype(str).str.lower()
+    sign = np.where(eff.str.startswith("up-regulates"), 1.0,
+            np.where(eff.str.startswith("down-regulates"), -1.0, 0.0)
+           ).astype(np.float32)
+    score = pd.to_numeric(df.get("SCORE"), errors="coerce").fillna(0.5)
+
+    out = pd.DataFrame({
+        "source_symbol": df["ENTITYA"].astype(str),
+        "target_symbol": df["ENTITYB"].astype(str),
+        "score": score.astype(float).values,
+        "sign": sign,
+        "n_resources": np.ones(len(df), dtype=int),
+    })
+    # Dedup : même paire (src, dst) avec scores divergents → max
+    out = (out.sort_values("score", ascending=False)
+              .drop_duplicates(["source_symbol", "target_symbol"]))
+
+    path = _cache_path(cache_dir, cache_name)
+    _write_cache(out, path)
+    print(f"  [import SIGNOR] {len(out)} liens → {path}")
+    return len(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -404,7 +533,7 @@ def load_signaling_directed(
     available_genes: Iterable[str],
     gene_to_idx: dict,
     download_if_missing: bool = False,
-    organism: int = 9606,
+    organism: str = "human",
 ):
     """Signaling dirigé OmniPath (kinase-substrat + causal).
 
@@ -429,7 +558,7 @@ def load_collectri_tf_target(
     available_genes: Iterable[str],
     gene_to_idx: dict,
     download_if_missing: bool = False,
-    organism: int = 9606,
+    organism: str = "human",
     fallback_dorothea: bool = True,
 ):
     """TF→target curé : CollecTRI, fallback DoRothEA.
@@ -458,7 +587,7 @@ def load_signed_ppi_signor(
     available_genes: Iterable[str],
     gene_to_idx: dict,
     download_if_missing: bool = False,
-    organism: int = 9606,
+    organism: str = "human",
 ):
     """PPI signé/dirigé curé SIGNOR 3.0.
 

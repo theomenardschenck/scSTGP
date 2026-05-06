@@ -1677,7 +1677,19 @@ class HeteroEncoder(nn.Module):
             else:
                 x_dict = self.convs[i](x_dict, active_edges)
 
-            for key in x_dict:
+            # HeteroConv supprime du dict les types de noeuds sans arête
+            # entrante (ex : --no-cell-group-edges → cell_group n'a aucune
+            # arête vers lui → drop). On les restaure depuis x_prev en
+            # identité (pas de BN/ReLU pour ne pas pourrir les stats).
+            for key, prev in x_prev.items():
+                if key not in x_dict:
+                    x_dict[key] = prev
+
+            for key in list(x_dict.keys()):
+                if key not in x_prev:
+                    continue
+                if x_dict[key] is x_prev[key]:
+                    continue  # identité restaurée → on saute BN/ReLU/dropout
                 # BatchNorm : normalise les activations (mean=0, var=1)
                 x_dict[key] = self.norms[i][key](x_dict[key])
                 # ReLU : non-linéarité (permet au réseau d'apprendre des

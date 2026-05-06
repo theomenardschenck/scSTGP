@@ -170,12 +170,28 @@ class HeteroEncoder(nn.Module):
                                        edge_attr_dict=active_attrs)
             else:
                 x_dict = self.convs[i](x_dict, active)
-            for key in x_dict:
+            # Restaurer les types de noeuds que HeteroConv aurait retirés
+            # faute d'arêtes entrantes (ex : --no-cell-group-edges → aucune
+            # arête pointe vers "cell_group", donc HeteroConv le drop). On
+            # propage l'état précédent en identité, BatchNorm/ReLU non appliqués
+            # à ce niveau pour ne pas modifier des stats sans flux entrant.
+            for key, prev in x_prev.items():
+                if key not in x_dict:
+                    x_dict[key] = prev
+            for key in list(x_dict.keys()):
+                if key not in x_prev:
+                    continue
+                # Skip BN/ReLU/dropout pour les clés restaurées en identité
+                if x_dict[key] is x_prev[key]:
+                    continue
                 x_dict[key] = self.norms[i][key](x_dict[key])
                 x_dict[key] = F.relu(x_dict[key])
                 x_dict[key] = self.dropout(x_dict[key])
                 x_dict[key] = x_dict[key] + x_prev[key]
-        self.last_cell_group_h = x_dict["cell_group"].detach().clone()
+        self.last_cell_group_h = (
+            x_dict["cell_group"].detach().clone()
+            if "cell_group" in x_dict else None
+        )
         return self.mu_head(x_dict["gene"]), self.logvar_head(x_dict["gene"])
 
 
