@@ -56,9 +56,29 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[2]
-# ROOT cluster :
-# ROOT = Path("/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/")
+def _find_project_root(start: Path, fallback_levels: int = 2) -> Path:
+    """Remonte les ancêtres jusqu'à trouver `data/databases/`.
+
+    Robuste aux deux layouts du projet :
+        local   : src/validation/ora_consensus.py → parents[2] = projet
+        cluster : src/ora_consensus.py            → parents[1] = projet
+    Un override env GNN_PROJECT_ROOT court-circuite la détection (utile en
+    cas de structure exotique). Fallback : parents[fallback_levels] si
+    rien n'est trouvé sur la remontée.
+    """
+    import os
+    env = os.environ.get("GNN_PROJECT_ROOT")
+    if env:
+        return Path(env).resolve()
+    start_resolved = start.resolve()
+    for p in [start_resolved] + list(start_resolved.parents):
+        if (p / "data" / "databases").is_dir():
+            return p
+    return start_resolved.parents[fallback_levels]
+
+
+ROOT = _find_project_root(Path(__file__))
+# Override possible : GNN_PROJECT_ROOT=/LAB-DATA/GLiCID/users/.../gnn/ python ...
 GMT_PATH = ROOT / "data/databases/c2.cp.reactome.symbols.gmt"
 DE_PATH = ROOT / "data/RNAseq/GSE98440_diff_expr_analysis_afterNorm_HUVEC_2reps.txt"
 DATA_DIR = ROOT / "data"

@@ -103,6 +103,11 @@ class HeteroEncoder(nn.Module):
         (("gene", "expressed_in", "cell_group"), 7),
         (("gene", "coexpression", "gene"), 1),
         (("gene", "metabolic_cocatalysis", "gene"), 2),
+        # OmniPath V4 — DOIT rester synchro avec gnn_vgae.HeteroEncoder.
+        # edge_attr=[score, sign∈{−1,0,+1}], dim=2.
+        (("gene", "signaling", "gene"), 2),
+        (("gene", "tf_curated", "gene"), 2),
+        (("gene", "tf_curated_by", "gene"), 2),
     ]
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,

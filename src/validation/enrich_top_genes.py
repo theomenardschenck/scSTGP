@@ -45,7 +45,22 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-ROOT = Path(__file__).resolve().parents[1]
+def _find_project_root(start: Path, fallback_levels: int = 1) -> Path:
+    """Trouve le projet en cherchant data/databases/ vers le haut.
+    Robuste à src/validation/foo.py (local) et src/foo.py (cluster flat).
+    Override env GNN_PROJECT_ROOT possible."""
+    import os
+    env = os.environ.get("GNN_PROJECT_ROOT")
+    if env:
+        return Path(env).resolve()
+    s = start.resolve()
+    for p in [s] + list(s.parents):
+        if (p / "data" / "databases").is_dir():
+            return p
+    return s.parents[fallback_levels]
+
+
+ROOT = _find_project_root(Path(__file__))
 CACHE_PATH = ROOT / "data/cache/mygene_cache.tsv"
 
 sns.set_style("whitegrid")

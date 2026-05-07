@@ -32,7 +32,22 @@ import pandas as pd
 from scipy import stats
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+def _find_project_root(start: Path, fallback_levels: int = 2) -> Path:
+    """Trouve le projet en cherchant data/databases/ vers le haut.
+    Robuste à src/validation/foo.py (local, parents[2]) et src/foo.py
+    (cluster flat, parents[1]). Override env GNN_PROJECT_ROOT possible."""
+    import os
+    env = os.environ.get("GNN_PROJECT_ROOT")
+    if env:
+        return Path(env).resolve()
+    s = start.resolve()
+    for p in [s] + list(s.parents):
+        if (p / "data" / "databases").is_dir():
+            return p
+    return s.parents[fallback_levels]
+
+
+REPO_ROOT = _find_project_root(Path(__file__))
 DATA_DIR = REPO_ROOT / "data"
 DB_DIR = DATA_DIR / "databases"
 

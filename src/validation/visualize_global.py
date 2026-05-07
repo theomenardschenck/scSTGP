@@ -48,7 +48,22 @@ import pandas as pd
 import seaborn as sns
 from scipy.stats import spearmanr
 
-ROOT = Path(__file__).resolve().parents[1]
+def _find_project_root(start: Path, fallback_levels: int = 1) -> Path:
+    """Trouve le projet en cherchant data/databases/ vers le haut.
+    Robuste à src/validation/foo.py (local) et src/foo.py (cluster flat).
+    Override env GNN_PROJECT_ROOT possible."""
+    import os
+    env = os.environ.get("GNN_PROJECT_ROOT")
+    if env:
+        return Path(env).resolve()
+    s = start.resolve()
+    for p in [s] + list(s.parents):
+        if (p / "data" / "databases").is_dir():
+            return p
+    return s.parents[fallback_levels]
+
+
+ROOT = _find_project_root(Path(__file__))
 RUNS_ROOT = ROOT / "output/gnn_vgae"
 GMT_PATH = ROOT / "data/databases/c2.cp.reactome.symbols.gmt"
 OUT_ROOT_DEFAULT = RUNS_ROOT / "global_figures"

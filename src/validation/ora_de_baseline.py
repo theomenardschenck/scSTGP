@@ -44,7 +44,22 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
+def _find_project_root(start: Path, fallback_levels: int = 1) -> Path:
+    """Trouve le projet en cherchant data/databases/ vers le haut.
+    Robuste à src/validation/foo.py (local) et src/foo.py (cluster flat).
+    Override env GNN_PROJECT_ROOT possible."""
+    import os
+    env = os.environ.get("GNN_PROJECT_ROOT")
+    if env:
+        return Path(env).resolve()
+    s = start.resolve()
+    for p in [s] + list(s.parents):
+        if (p / "data" / "databases").is_dir():
+            return p
+    return s.parents[fallback_levels]
+
+
+ROOT = _find_project_root(Path(__file__))
 DE_PATH = ROOT / "data/RNAseq/GSE98440_diff_expr_analysis_afterNorm_HUVEC_2reps.txt"
 GMT_PATH = ROOT / "data/databases/c2.cp.reactome.symbols.gmt"
 VGAE_DIR = ROOT / "output/gnn_vgae"

@@ -511,6 +511,12 @@ def fig_movers(table: pd.DataFrame, out: Path, title: str):
 def fig_updown(table: pd.DataFrame, out: Path, title: str):
     if table.empty:
         return
+    if len(table) > _HEATMAP_MAX_RUNS:
+        # Bar plot avec 10k+ barres : figsize × 0.35 explose. Skip en
+        # mode --all ; les bars top-N sont gérées par filter_top_polar.
+        print(f"  [skip] fig_updown : {len(table)} entries > "
+              f"{_HEATMAP_MAX_RUNS} (utiliser filter_top_polar en amont).")
+        return
     fig, ax = plt.subplots(figsize=(max(7, 0.35 * len(table)), 5))
     x = np.arange(len(table))
     w = 0.4
@@ -532,6 +538,12 @@ def fig_updown(table: pd.DataFrame, out: Path, title: str):
 def fig_pathway_heatmap(runs: list[Path], out: Path, title: str,
                         top_per_run: int = 5, max_pathways: int = 30):
     if not runs:
+        return
+    if len(runs) > _HEATMAP_MAX_RUNS:
+        # Mode --all (10k+ runs) : figsize=0.4×N → matplotlib OOM. Le
+        # ranking exhaustif vit déjà dans les TSV agrégés.
+        print(f"  [skip] fig_pathway_heatmap : {len(runs)} runs > "
+              f"{_HEATMAP_MAX_RUNS} (heatmap inutile à cette échelle).")
         return
     per_run = {run.name: load_top_ora(run, k=top_per_run) for run in runs}
     picked: list[str] = []
@@ -583,10 +595,22 @@ def _jaccard_matrix(sets: dict[str, set[str]]) -> tuple[np.ndarray, list[str]]:
     return m, names
 
 
+_HEATMAP_MAX_RUNS = 80  # Au-delà, figsize × cellules → OOM matplotlib
+                         # (10504 runs × 0.35 inch × 100 DPI = 367k pixels carrés).
+
+
 def fig_riser_overlap(runs: list[Path], out: Path, title: str,
                       k: int, min_baseline_pct: float,
                       blocklist: set[str]):
     if not runs:
+        return
+    if len(runs) > _HEATMAP_MAX_RUNS:
+        # Mode --all (10k+ perturbations) : la heatmap N×N n'a pas de sens
+        # à cette échelle, et matplotlib alloue ~540 Go pour la figure.
+        # On skip proprement, le ranking exhaustif est déjà couvert par
+        # top_transition_drivers.tsv et les figures bar/clustermap dédiées.
+        print(f"  [skip] fig_riser_overlap : {len(runs)} runs > "
+              f"{_HEATMAP_MAX_RUNS} (heatmap N×N inutile à cette échelle).")
         return
     sets = {run.name: load_top_risers(run, k, min_baseline_pct, blocklist)
             for run in runs}
@@ -617,6 +641,10 @@ def fig_riser_clustermap(runs: list[Path], out: Path, title: str,
     """Hierarchical clustermap of top-k riser Jaccard. Returns the
     distance-based cluster label table."""
     if not runs:
+        return pd.DataFrame()
+    if len(runs) > _HEATMAP_MAX_RUNS:
+        print(f"  [skip] fig_riser_clustermap : {len(runs)} runs > "
+              f"{_HEATMAP_MAX_RUNS} (clustermap N×N → OOM matplotlib).")
         return pd.DataFrame()
     sets = {run.name: load_top_risers(run, k, min_baseline_pct, blocklist)
             for run in runs}
@@ -2716,22 +2744,63 @@ def _load_summaries_from_tsvs(tsvs: list[Path]) -> list[tuple[str, dict]]:
     return out
 
 
-def _collect_seed_summaries(p: Path) -> list[tuple[str, dict]]:
+def _matches_axis_suffix(tsv_name: str, axis_tag: str | None) -> bool:
+    """Filtre un nom de TSV par axe de sénescence (V3 vs V4).
+
+    Convention nommage produite par perturb_top_genes.py :
+      sans suffixe (V3) : perturbation_all_<target>_<mode>.tsv
+      avec --out-suffix _axisV4 : perturbation_all_<target>_axisV4_<mode>.tsv
+
+    Args:
+        axis_tag : None  → match tout (legacy)
+                   ""    → seulement les TSV sans suffixe d'axe (V3)
+                   "axisV4" → seulement les TSV avec _axisV4_
+
+    Returns: True si le TSV passe le filtre.
+    """
+    if axis_tag is None:
+        return True
+    stem = tsv_name[:-len(".tsv")] if tsv_name.endswith(".tsv") else tsv_name
+    parts = stem.split("_")
+    # Schéma : ['perturbation', 'all', '<target>', ('<axis>',) '<mode>']
+    if len(parts) < 4 or parts[0] != "perturbation" or parts[1] != "all":
+        return False
+    if len(parts) == 4:
+        actual = ""              # pas de suffixe d'axe
+    elif len(parts) == 5:
+        actual = parts[3]        # axisV3 / axisV4 / autre
+    else:
+        return False             # nom inattendu, on ne risque pas
+    return actual == axis_tag
+
+
+def _collect_seed_summaries(
+    p: Path,
+    axis_tag: str | None = None,
+) -> list[tuple[str, dict]]:
     """Given a seed-ish path (seed root OR perturbation/ subdir), return
     (tag, summary) pairs.
 
     Priority: ALL-mode TSVs first (richer & avoids the 10k-folder materialise
     hit); per-target summary.json folders as fallback. Checks both `p` and
     `p/perturbation` to cover either layout convention.
+
+    Args:
+        axis_tag : None=tout, ""=V3 (sans suffixe), "axisV4"=V4 only.
+            Évite de mélanger V3 et V4 dans un même cross-seed quand un run
+            contient les deux côte à côte (--axis both).
     """
     if not p.exists():
         return []
     for candidate in (p, p / "perturbation"):
         if not candidate.is_dir():
             continue
-        tsvs = sorted(candidate.glob("perturbation_all_*.tsv"))
+        all_tsvs = sorted(candidate.glob("perturbation_all_*.tsv"))
+        tsvs = [t for t in all_tsvs if _matches_axis_suffix(t.name, axis_tag)]
         if tsvs:
-            print(f"  {p.name}: TSV source ({len(tsvs)} file(s) in {candidate.name}/)")
+            filt_msg = f" [axis={axis_tag!r}]" if axis_tag is not None else ""
+            print(f"  {p.name}: TSV source ({len(tsvs)} file(s) in "
+                  f"{candidate.name}/){filt_msg}")
             return _load_summaries_from_tsvs(tsvs)
     for candidate in (p, p / "perturbation"):
         if not candidate.is_dir():
@@ -2785,11 +2854,16 @@ def run_cross_seed(args) -> None:
     seed_summaries: list[list[tuple[str, dict]]] = []
     kept_paths: list[Path] = []
 
+    # Filtre d'axe : permet de séparer V3 (suffix vide) et V4 (axisV4) quand
+    # les runs contiennent les deux côte à côte (--axis both côté grid).
+    axis_tag = getattr(args, "axis_tag", None)
+
     # 1. Collecte des données à travers les différentes seeds
-    print(f"[CROSS-SEED] Collecting summaries for {len(raw_paths)} seed(s):")
+    print(f"[CROSS-SEED] Collecting summaries for {len(raw_paths)} seed(s)"
+          + (f" [axis={axis_tag!r}]" if axis_tag is not None else "") + ":")
     for p in raw_paths:
         # collect_seed_summaries cherche soit des dossiers individuels, soit des TSV --all
-        sums = _collect_seed_summaries(p)
+        sums = _collect_seed_summaries(p, axis_tag=axis_tag)
         if not sums:
             print(f" {p.name}: [skip] no summaries or TSVs found")
             continue
@@ -3611,6 +3685,12 @@ def main():
                     help="Auto-apply --top-per-side filtering to bar "
                          "figures when a mode has more runs than this "
                          "(default 60).")
+    ap.add_argument("--axis-tag", default=None,
+                    help="--cross-seed only : filtre les TSV consommés selon "
+                         "l'axe de sénescence. Empty string '' = V3 (suffixe "
+                         "absent dans le nom de TSV, défaut historique). "
+                         "'axisV4' = lit uniquement perturbation_all_*_axisV4_*.tsv. "
+                         "None (défaut) = aucun filtre, lit tout (legacy).")
     ap.add_argument("--min-robustness", type=float, default=0.5,
                     help="--cross-seed only: min fraction of seeds the "
                          "target must appear in (default 0.5).")

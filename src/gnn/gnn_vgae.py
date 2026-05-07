@@ -1254,8 +1254,14 @@ if MODULES["use_omnipath_signaling"] or MODULES["use_omnipath_tf_curated"]:
             load_collectri_tf_target,
             load_signed_ppi_signor,
             merge_signed_directed,
+            silence_omnipath_logging,
         )
         _OPI = True
+        # Coupe le bruit quand on sait qu'on ne télécharge pas. Les compute
+        # nodes Nautilus déclenchent des centaines de "WARNING:root:Failed
+        # to download" sinon, à cause des metadata pre-fetches d'omnipath-py.
+        if not CLI_ARGS.omnipath_download_if_missing:
+            silence_omnipath_logging()
     except ImportError as _e:
         print(f"    [warn] import omnipath_integration KO ({_e}) — "
               f"aucune arête OmniPath ne sera ajoutée.")

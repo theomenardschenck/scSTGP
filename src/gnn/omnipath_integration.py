@@ -75,6 +75,27 @@ except ImportError:
     OMNIPATH_AVAILABLE = False
 
 
+def silence_omnipath_logging():
+    """Coupe les WARNING bruyants d'omnipath-py / urllib3 / requests.
+
+    omnipath-py tente des fetches metadata `/queries/{enzsub,interactions,
+    complexes,annotations,intercell}` au premier `.get()`, même quand on lit
+    juste depuis le cache disque. Sur les compute nodes Nautilus (proxy 403,
+    pas d'Internet), ces tentatives génèrent des centaines de lignes
+    `WARNING:root:Failed to download from ...` dans les logs SLURM. Comme
+    notre code gère parfaitement le fallback (cache → vide → arêtes vides),
+    ces warnings sont du bruit pur. On les coupe quand on sait qu'on ne
+    télécharge pas.
+
+    Usage côté caller (gnn_vgae.py) :
+        if not download_if_missing:
+            silence_omnipath_logging()
+    """
+    import logging
+    for name in ("omnipath", "urllib3", "requests", "root"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
 # omnipathdb.org renvoie régulièrement des 502/500 transitoires (le service
 # n'est pas un CDN — c'est un Flask devant une DB). Retry avec backoff
 # exponentiel résout l'écrasante majorité des cas.
@@ -173,17 +194,23 @@ def _project_to_graph(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
     """Projette les paires symbol→symbol sur les indices du graphe.
 
-    Filtre :
-      - gènes présents dans `available_genes` ET dans `gene_to_idx`
-      - paires (src == dst) éliminées (self-loop pas pertinent ici)
+    Filtre STRICT sur `gene_to_idx` : `available_genes` est l'ensemble
+    des ~30 000 gènes mesurés en scRNA-seq, mais seuls les ~10 000
+    survivants au filtre topologique (connectivité PPI/SCENIC/REACTOME)
+    sont effectivement dans le graphe. Les autres seraient mappés vers
+    `NaN` puis cast en `INT64_MIN = -9223372036854775808` par
+    `to_numpy(dtype=int64)`, ce qui crashait GATConv.
+
+    L'argument `available_genes` est conservé pour rétrocompat de
+    signature mais ignoré : `gene_to_idx.keys()` est la source de vérité.
 
     Retourne : edge_src, edge_dst, edge_attr=[score, sign], metadata_df
     Toutes vides si aucun lien ne survit au filtrage.
     """
-    avail = set(available_genes)
+    in_graph = set(gene_to_idx.keys())
     keep = (
-        df["source_symbol"].isin(avail)
-        & df["target_symbol"].isin(avail)
+        df["source_symbol"].isin(in_graph)
+        & df["target_symbol"].isin(in_graph)
         & (df["source_symbol"] != df["target_symbol"])
     )
     sub = df.loc[keep].copy()
@@ -195,6 +222,16 @@ def _project_to_graph(
 
     src_idx = sub["source_symbol"].map(gene_to_idx).to_numpy(dtype=np.int64)
     dst_idx = sub["target_symbol"].map(gene_to_idx).to_numpy(dtype=np.int64)
+    # Sanity : après filtrage strict sur gene_to_idx.keys(), aucun NaN/INT64_MIN
+    # ne doit subsister. Garde-fou explicite pour détecter une régression future.
+    if (src_idx < 0).any() or (dst_idx < 0).any():
+        raise ValueError(
+            f"_project_to_graph : indices négatifs détectés "
+            f"(src min={src_idx.min()}, dst min={dst_idx.min()}). "
+            f"Symptôme classique : gène présent dans le TSV mais pas dans "
+            f"gene_to_idx → NaN → INT64_MIN. Vérifie l'alignement gene_to_idx "
+            f"vs cache OmniPath."
+        )
     score = _normalize_score(sub["score"])
     sign = sub["sign"].astype(np.float32).to_numpy()
     attr = np.stack([score, sign], axis=1).astype(np.float32)
