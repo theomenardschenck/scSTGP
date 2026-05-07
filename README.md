@@ -172,7 +172,7 @@ En attendant :
 
 ```bibtex
 @unpublished{menard2026vgae_huvec,
-  author = {Ménard, Théo and Petry, Sylvain},
+  author = {Menard, Théo and Maillasson, Mike},
   title  = {VGAE-based gene prioritization in HUVEC cellular senescence},
   year   = {2026},
   note   = {M2 internship, Université de Nantes}
@@ -199,4 +199,4 @@ Liste complète : §"Articles de référence" du rapport.
 
 ## Contact
 
-Théo Ménard — `menard.teo@gmail.com`
+Théo Menard — `theo.menard@etu.univ-nantes.fr`
