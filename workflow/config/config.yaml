@@ -1,0 +1,141 @@
+# ──────────────────────────────────────────────────────────────────
+# Configuration exemple — pipeline VGAE HUVEC sénescence (V3.6 baseline)
+# ──────────────────────────────────────────────────────────────────
+# Cf. gnn_huvec/docs/pipeline_design.md §5 pour le schéma complet.
+# Cette config reproduit le run V3.6 baseline 10 seeds + perturbation.
+#
+# Usage :
+#   snakemake --use-conda --cores 8 --configfile workflow/config/config.yaml
+#
+# NOTE 2026-05-07 : le Snakefile est une ébauche, certaines rules
+# pointent encore vers les scripts monolithiques actuels.
+
+run:
+  name: "huvec_v36_baseline"
+  description: "VGAE V3.6 — 10 seeds, all-genes perturbation, ablation full"
+
+input:
+  rna_type: scrna
+  rna_path: "data/gnn_data/HUVEC_seurat_processed.rds"
+  metadata: "data/gnn_data/HUVEC_metadata.tsv"
+  degs_path: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
+  conditions:
+    column: "timepoint"
+    reference: "P4"
+    target: "P16"
+  optional:
+    chip_seq: null
+    atac_seq: null
+
+preprocessing:
+  do_clustering: true
+  clustering:
+    method: "louvain"
+    resolution: 0.8
+    cluster_only_target: true   # P4 monolithique, P16 → 4 clusters
+  qc:
+    min_cells_per_gene: 3
+    min_genes_per_cell: 200
+    max_pct_mt: 20
+
+differential:
+  method: "mast"
+  contrasts:
+    - {ref: "P4", target: "P16"}
+  significance:
+    fdr_threshold: 0.05
+    rank_threshold: 1000
+
+annotations:
+  pyscenic:
+    enabled: true
+    species: "human"
+    auc_threshold: 0.05
+  humess:
+    enabled: true
+    config_path: "humess/config_huvec.json"
+  databases:
+    string:
+      enabled: true
+      version: "12.0"
+      score_threshold: 700
+    reactome:
+      enabled: true
+      version: "2024"
+      max_pathway_size: 200
+    omnipath:
+      signaling: false           # V4 only
+      tf_curated: false          # V4 only
+      cache_dir: "data/omnipath/"
+
+graph:
+  edge_sources:
+    ppi: true
+    reactome: true
+    coexpr: true
+    scenic_regulons: true
+    humess_edges: true
+    cell_group_edges: true
+    omnipath_signaling: false
+    tf_curated: false
+  node_features:
+    exclude: []
+
+models:
+  vgae:
+    enabled: true
+    n_seeds: 10
+    hidden_dim: 64
+    n_layers: 3
+    n_heads: 8
+    epochs: 500
+    lr: 0.0005
+    kl_weight_max: 0.5
+    free_bits: 0.5
+  gnn_lite:
+    enabled: true
+    hidden_dim: 64
+    n_layers: 3
+  baselines:
+    mlp: true
+    stat: true
+    deepwalk: true
+
+perturbation:
+  enabled: true
+  modes: [KO, KD, OE]
+  scope: all_genes
+  axis:
+    reference_groups: ["P4"]
+    target_groups: null          # auto = tous les autres cell_groups
+
+validation:
+  ora:
+    aging_dbs:
+      - "data/dbs/SenMayo.tsv"
+      - "data/dbs/CellAge.tsv"
+      - "data/dbs/GenAge.tsv"
+      - "data/dbs/Fridman.tsv"
+    reactome: true
+    consensus_min_shared: 2
+  cluster_annotation:
+    enabled: true
+    signatures: ["SenMayo", "CellAge", "HALLMARK", "REACTOME"]
+
+comparison:
+  enabled: false
+  internal: true
+  external:
+    decoupler_ulm: false
+    dreamwalk: false
+    sctenifoldknk: false
+    celloracle: false
+
+output:
+  base_dir: "output/run_huvec_v36_baseline"
+  generate_html_report: true
+  figures:
+    - "cross_seed_top_drivers"
+    - "ora_aging_barplot"
+    - "umap_cell_groups"
+    - "evidence_tier_distribution"
