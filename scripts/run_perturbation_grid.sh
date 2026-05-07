@@ -21,11 +21,17 @@
 #       --pattern '<base>/full.s*' --axis v4
 #       → V3.7 : perturbe la baseline V3.6 (déjà entraînée) avec le NOUVEL axe
 #
-# Chaînage automatique perturb_report --all :
-#   Après chaque perturb_top_genes, on lance `src/perturb_report.py --all`
-#   sur le TSV produit pour générer le dossier report/ (ou report_axisV4/
-#   selon l'axe). Désactive avec --skip-report si tu veux générer les
-#   reports en batch séparé après coup.
+# Chaînage automatique :
+#   1. Après chaque perturb_top_genes : `src/perturb_report.py --all` →
+#      report par seed dans report/ (ou report_axisV4/ selon l'axe).
+#      Désactive avec --skip-report.
+#   2. Après que TOUTES les perturbations soient finies (dépendance SLURM
+#      afterok) : `src/perturb_report.py --cross-seed` par catégorie de
+#      modèles. Une catégorie = même tag sans le seed (v4-full.s1, .s2,
+#      .s3 → catégorie "v4-full"). Le cross-seed est lancé pour chaque
+#      (catégorie × axe) avec --axis-tag pour ne pas mélanger V3 et V4.
+#      Sortie : `<OUT_DIR_BASE>/cross_seed_<category>[_axisV4]/`.
+#      Désactive avec --skip-cross-seed.
 #
 # Usage générique :
 #   bash scripts/run_perturbation_grid.sh                          # axe V3 (legacy)
@@ -36,7 +42,8 @@
 #   bash scripts/run_perturbation_grid.sh --dry-run
 #   bash scripts/run_perturbation_grid.sh --max-parallel 5
 #   bash scripts/run_perturbation_grid.sh --time 1-00:00:00
-#   bash scripts/run_perturbation_grid.sh --skip-report             # désactive le chaînage
+#   bash scripts/run_perturbation_grid.sh --skip-report             # pas de report/ par seed
+#   bash scripts/run_perturbation_grid.sh --skip-cross-seed          # pas de cross_seed_<cat>/
 #
 # Doc GLiCID : https://doc.glicid.fr/GLiCID-PUBLIC/quickstart_advanced_user.html
 # =============================================================================
@@ -48,13 +55,14 @@ OUT_DIR_BASE_DEFAULT="/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae"
 OUT_DIR_BASE="${OUT_DIR_BASE:-$OUT_DIR_BASE_DEFAULT}"
 DEFAULT_PATTERN="${OUT_DIR_BASE}/*.s*"
 
-DEFAULT_MODES=(knockout)
+DEFAULT_MODES=(knockout knockdown overexpress)   # 3 modes — cohérent avec V3.3 cross-seed
 DEFAULT_AXIS="v3"           # backward-compat : axe historique P4 quiescent
 MAX_PARALLEL=10
 TIME_LIMIT="0-12:00:00"
 DRY_RUN=0
 ALSO_PATHWAYS=0
 SKIP_REPORT=0               # par défaut : on chaîne perturb_report --all après
+SKIP_CROSS_SEED=0           # par défaut : cross-seed report auto post-perturb
 
 # --- Parsing CLI ------------------------------------------------------------
 PATTERN=""
@@ -72,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --also-pathways)  ALSO_PATHWAYS=1; shift ;;
         --axis)           AXIS="$2"; shift 2 ;;
         --skip-report)    SKIP_REPORT=1; shift ;;
+        --skip-cross-seed) SKIP_CROSS_SEED=1; shift ;;
         -h|--help)
             sed -n '2,40p' "$0"; exit 0 ;;
         *) echo "Argument inconnu : $1"; exit 1 ;;
@@ -181,8 +190,8 @@ cat > "$SBATCH_SCRIPT" <<EOF
 #SBATCH --time=$TIME_LIMIT
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
-#SBATCH --mem-per-cpu=16G
+#SBATCH --cpus-per-task=4
+#SBATCH --mem-per-cpu=24G
 #SBATCH --qos=short
 #SBATCH --array=$ARRAY_RANGE
 
@@ -256,6 +265,102 @@ chmod +x "$SBATCH_SCRIPT"
 echo "[grid] sbatch script : $SBATCH_SCRIPT"
 echo
 
+# --- Préparation du job cross-seed dépendant -------------------------------
+# Une "catégorie" = même tag de config sans le seed.
+# Ex : v4-full.s1, v4-full.s2, v4-full.s3 → catégorie "v4-full"
+# Pour chaque catégorie ayant ≥ 2 seeds × chaque axe, on lance un
+# `perturb_report.py --cross-seed`.
+declare -A CATEGORIES=()
+for r in "${VALID_RUNS[@]}"; do
+    name=$(basename "$r")
+    cat="${name%.s*}"               # strip suffixe ".s<N>"
+    CATEGORIES["$cat"]+="$r "
+done
+
+CS_CONFIGS_FILE="$LOG_DIR/cross_seed_configs.tsv"
+> "$CS_CONFIGS_FILE"
+if [[ $SKIP_CROSS_SEED -eq 0 ]]; then
+    for cat in "${!CATEGORIES[@]}"; do
+        runs="${CATEGORIES[$cat]}"
+        # shellcheck disable=SC2206
+        runs_arr=($runs)
+        n_seeds=${#runs_arr[@]}
+        if [[ $n_seeds -lt 2 ]]; then
+            echo "[grid cross-seed] $cat : $n_seeds seed (besoin ≥ 2) → skip"
+            continue
+        fi
+        for spec in "${AXIS_SPECS[@]}"; do
+            sfx="${spec%%::*}"      # "axisV4" ou ""
+            out_sfx=""
+            [[ -n "$sfx" ]] && out_sfx="_${sfx}"
+            # axis_tag passé à perturb_report : "" en V3, "axisV4" en V4
+            printf '%s\t%s\t%s\t%s\n' \
+                "$cat" "$runs" "$out_sfx" "$sfx" >> "$CS_CONFIGS_FILE"
+        done
+    done
+fi
+CS_N=$(wc -l < "$CS_CONFIGS_FILE")
+echo "[grid] cross-seed : $CS_N tâche(s) (catégories ${!CATEGORIES[@]})"
+
+# --- Génération du sbatch cross-seed (dépendant) ---------------------------
+CS_SBATCH_SCRIPT=""
+if [[ $CS_N -gt 0 ]]; then
+    CS_SBATCH_SCRIPT="$LOG_DIR/sbatch_cross_seed.sh"
+    cat > "$CS_SBATCH_SCRIPT" <<EOF
+#!/usr/bin/env bash
+#SBATCH --job-name=vgae_cs_${AXIS}
+#SBATCH --comment="VGAE cross-seed report (axis=${AXIS})"
+#SBATCH --output=$LOG_DIR/cs_%x_%A_%a.out
+#SBATCH --error=$LOG_DIR/cs_%x_%A_%a.err
+#SBATCH --time=0-04:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem-per-cpu=24G
+#SBATCH --qos=short
+#SBATCH --array=0-$((CS_N - 1))%5
+
+set -euo pipefail
+
+cd "$PROJECT_DIR"
+
+LINE=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$CS_CONFIGS_FILE")
+CAT=\$(echo "\$LINE" | cut -f1)
+RUNS=\$(echo "\$LINE" | cut -f2)
+OUT_SUFFIX=\$(echo "\$LINE" | cut -f3)
+AXIS_TAG=\$(echo "\$LINE" | cut -f4)
+
+# Dossier de sortie : <OUT_DIR_BASE>/cross_seed_<category>[_axisV4]/
+REPORT_DIR="${OUT_DIR_BASE}/cross_seed_\${CAT}\${OUT_SUFFIX}"
+mkdir -p "\$REPORT_DIR"
+
+echo "[\$(date +%T)] cross-seed task \$SLURM_ARRAY_TASK_ID"
+echo "  category    : \$CAT"
+echo "  runs        : \$RUNS"
+echo "  axis-tag    : '\$AXIS_TAG'"
+echo "  report-dir  : \$REPORT_DIR"
+echo "  node        : \$(hostname)"
+
+EXTRA_ARGS=()
+# AXIS_TAG="" pour V3 (legacy, pas de filtre) ; "axisV4" pour V4
+# (filtre les TSV pour ne pas mélanger axes côte à côte).
+if [[ -n "\$AXIS_TAG" ]]; then
+    EXTRA_ARGS+=(--axis-tag "\$AXIS_TAG")
+fi
+
+# shellcheck disable=SC2086
+python3 src/perturb_report.py \\
+    --cross-seed \$RUNS \\
+    --report-dir "\$REPORT_DIR" \\
+    "\${EXTRA_ARGS[@]}"
+
+echo "[\$(date +%T)] cross-seed task \$SLURM_ARRAY_TASK_ID terminée."
+EOF
+    chmod +x "$CS_SBATCH_SCRIPT"
+    echo "[grid] sbatch cross-seed : $CS_SBATCH_SCRIPT"
+fi
+echo
+
 # --- Soumission ------------------------------------------------------------
 if [[ $DRY_RUN -eq 1 ]]; then
     echo "[DRY-RUN] sbatch $SBATCH_SCRIPT"
@@ -266,6 +371,14 @@ if [[ $DRY_RUN -eq 1 ]]; then
     echo
     echo "[DRY-RUN] Aperçu du sbatch script (head) :"
     head -25 "$SBATCH_SCRIPT"
+    if [[ -n "$CS_SBATCH_SCRIPT" ]]; then
+        echo
+        echo "[DRY-RUN] cross-seed configs ($CS_N lignes) :"
+        cat "$CS_CONFIGS_FILE"
+        echo
+        echo "[DRY-RUN] cross-seed sbatch (head) :"
+        head -30 "$CS_SBATCH_SCRIPT"
+    fi
     exit 0
 fi
 
@@ -274,3 +387,12 @@ echo "[grid] soumis : job array $JOB_ID (= ${N_TASKS} tâches, ${MAX_PARALLEL} m
 echo "[grid] suivi   : squeue -j $JOB_ID    (ou squeue -u \$USER)"
 echo "[grid] cancel  : scancel $JOB_ID"
 echo "[grid] logs    : $LOG_DIR/vgae_perturb_${AXIS}_${JOB_ID}_<task>.{out,err}"
+
+# Soumission du cross-seed dépendant — ne tourne que si tous les jobs perturb
+# ont réussi (afterok). Si tu veux le lancer même en cas d'échec partiel,
+# remplace par "afterany" ; ou re-soumets manuellement plus tard.
+if [[ -n "$CS_SBATCH_SCRIPT" ]]; then
+    CS_JOB_ID=$(sbatch --parsable --dependency=afterok:$JOB_ID "$CS_SBATCH_SCRIPT")
+    echo "[grid] cross-seed soumis : job $CS_JOB_ID (dépendance afterok:$JOB_ID)"
+    echo "[grid] cross-seed logs   : $LOG_DIR/cs_vgae_cs_${AXIS}_${CS_JOB_ID}_<task>.{out,err}"
+fi
