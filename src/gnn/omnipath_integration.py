@@ -645,6 +645,61 @@ def load_signed_ppi_signor(
 # Fusion utilitaire — combine signaling + SIGNOR en un seul edge_type
 # (les deux portent la sémantique "lien causal signé dirigé").
 # --------------------------------------------------------------------------- #
+def get_omnipath_endpoints(
+    cache_dir: str,
+    sources: Iterable[str] = ("signaling", "signor", "collectri"),
+    download_if_missing: bool = False,
+) -> set[str]:
+    """V4.1 : retourne l'union des symboles de gène présents dans les caches
+    OmniPath actifs.
+
+    Utilisé par gnn_vgae.py SECTION 2.5 pour étendre la sélection des gènes
+    (gene_to_idx) AVANT qu'on construise les arêtes. Sans ça, un TF
+    CollecTRI absent de PPI/SCENIC/coexpr/REACTOME serait éliminé en
+    section 3 avant même que `_project_to_graph` puisse l'ajouter — perte
+    de ~700 TFs sur les ~1186 disponibles (cf. TODO V4.1).
+
+    Sources reconnues :
+        "signaling" → signaling_omnipath.tsv.gz
+        "signor"    → signed_ppi_signor.tsv.gz
+        "collectri" → tf_collectri.tsv.gz (fallback tf_dorothea.tsv.gz)
+
+    Args:
+        cache_dir : dossier des TSV pré-téléchargés.
+        sources   : sous-ensemble à charger. Par défaut : toutes.
+        download_if_missing : autorise un fetch web si cache manquant.
+
+    Returns:
+        Set de gene_symbols (chaînes HGNC, ENTITYA + ENTITYB).
+    """
+    file_map = {
+        "signaling": ("signaling_omnipath.tsv.gz", _fetch_signaling_omnipath),
+        "signor":    ("signed_ppi_signor.tsv.gz",  _fetch_signor_signed_ppi),
+        "collectri": ("tf_collectri.tsv.gz",       _fetch_collectri),
+    }
+    # CollecTRI a un fallback DoRothEA — on essaye dorothea seulement si
+    # collectri échoue ET qu'il est demandé.
+    endpoints: set[str] = set()
+    for s in sources:
+        if s not in file_map:
+            warnings.warn(f"get_omnipath_endpoints : source inconnue {s!r}",
+                          RuntimeWarning)
+            continue
+        cache_name, fetcher = file_map[s]
+        df = _load_or_fetch(cache_dir, cache_name, fetcher,
+                            download_if_missing, label=s)
+        if df is None and s == "collectri":
+            # Fallback DoRothEA
+            df = _load_or_fetch(cache_dir, "tf_dorothea.tsv.gz",
+                                _fetch_dorothea, download_if_missing,
+                                label="dorothea(fallback)")
+        if df is None or df.empty:
+            continue
+        endpoints |= set(df["source_symbol"].astype(str).unique())
+        endpoints |= set(df["target_symbol"].astype(str).unique())
+    return endpoints
+
+
 def merge_signed_directed(
     *triples,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
