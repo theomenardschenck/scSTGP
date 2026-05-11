@@ -138,6 +138,17 @@ def _parse_cli_args():
                    help="autorise le téléchargement à la volée si le cache "
                         "est absent (à n'utiliser que sur le frontal qui a "
                         "Internet ; OFF sur les compute nodes)")
+    # V4.1 : include OmniPath endpoints in the selected gene set.
+    p.add_argument("--include-omnipath-genes", dest="include_omnipath_genes",
+                   action="store_true", default=False,
+                   help="V4.1 : étend la sélection des gènes en section 3 avec "
+                        "les endpoints d'OmniPath (CollecTRI + signaling) qui "
+                        "sont aussi présents dans le scRNA-seq. Sans ce flag, "
+                        "OmniPath ne fait qu'ajouter des arêtes entre gènes "
+                        "déjà sélectionnés via PPI/SCENIC/coexpr/REACTOME ; "
+                        "résultat : ~700 TFs CollecTRI sont perdus. "
+                        "Requiert --use-omnipath-signaling et/ou "
+                        "--use-omnipath-tf-curated.")
 
     # --- Exclusion fine de features de noeud gene ---
     # Liste possible : is_tf, variance, ppi_degree, reg_degree,
@@ -195,6 +206,7 @@ MODULES = {
     "use_cell_group_edges":      CLI_ARGS.use_cell_group_edges,
     "use_omnipath_signaling":    CLI_ARGS.use_omnipath_signaling,
     "use_omnipath_tf_curated":   CLI_ARGS.use_omnipath_tf_curated,
+    "include_omnipath_genes":    CLI_ARGS.include_omnipath_genes,
 }
 
 # Matrice « feature → activée ? » — recoupe les modules et l'option
@@ -237,6 +249,7 @@ def _build_run_tag():
     if not MODULES["use_cell_group_edges"]: parts.append("no-cgrp")
     if MODULES["use_omnipath_signaling"]:   parts.append("op-sig")
     if MODULES["use_omnipath_tf_curated"]:  parts.append("op-tf")
+    if MODULES["include_omnipath_genes"]:   parts.append("op-genes")
     if _EXCLUDED_FEATURES:                  parts.append("ex-" + "-".join(sorted(_EXCLUDED_FEATURES)))
     if CLI_ARGS.ppi_score_thresh != 900:    parts.append(f"ppi{CLI_ARGS.ppi_score_thresh}")
     if abs(CLI_ARGS.coexpr_top_quantile - 0.98) > 1e-9:
@@ -566,6 +579,53 @@ else:
     adjacencies_filtered = pd.DataFrame(columns=["TF", "target", "importance"])
 
 # =============================================================================
+# 2.5. PRÉ-CHARGEMENT OMNIPATH (V4.1) — pour étendre gene_to_idx
+# =============================================================================
+# Charge les caches OmniPath UNE FOIS, avant la section 3 (sélection des
+# gènes), pour pouvoir étendre `selected_genes` avec les endpoints d'OmniPath.
+# Sans ce pré-chargement, section 6g intervient TROP TARD : `gene_to_idx`
+# est déjà figé sur PPI/SCENIC/coexpr/REACTOME/HuMess, et `_project_to_graph`
+# filtre strictement → ~700 TFs CollecTRI étaient éliminés silencieusement.
+#
+# Note : le set retourné inclut TOUS les symboles présents dans les caches
+# OmniPath actifs. L'intersection avec `available_set` (gènes scRNA-mesurés)
+# se fait en section 3 — on n'invente pas de gènes hors mesure.
+omnipath_endpoints: set[str] = set()
+if (MODULES["include_omnipath_genes"]
+        and (MODULES["use_omnipath_signaling"]
+             or MODULES["use_omnipath_tf_curated"])):
+    print("\n" + "=" * 70)
+    print("2.5. Pré-chargement OmniPath (V4.1) — pour expansion gene_to_idx")
+    print("=" * 70)
+    try:
+        from omnipath_integration import (
+            get_omnipath_endpoints as _opi_endpoints,
+            silence_omnipath_logging as _silence_opi,
+        )
+        if not CLI_ARGS.omnipath_download_if_missing:
+            _silence_opi()
+        # Sources actives selon les flags
+        _opi_sources = []
+        if MODULES["use_omnipath_signaling"]:
+            _opi_sources.extend(["signaling", "signor"])
+        if MODULES["use_omnipath_tf_curated"]:
+            _opi_sources.append("collectri")
+        omnipath_endpoints = _opi_endpoints(
+            cache_dir=OMNIPATH_CACHE_DIR,
+            sources=_opi_sources,
+            download_if_missing=CLI_ARGS.omnipath_download_if_missing,
+        )
+        print(f"  Endpoints OmniPath uniques (avant intersection scRNA) : "
+              f"{len(omnipath_endpoints)}")
+    except ImportError as _e:
+        print(f"  [warn] import omnipath_integration KO ({_e}) — "
+              f"--include-omnipath-genes inactif.")
+elif MODULES["include_omnipath_genes"]:
+    print("\n[warn] --include-omnipath-genes activé mais aucune source "
+          "OmniPath active (--use-omnipath-signaling / --use-omnipath-tf-curated). "
+          "Le flag est ignoré.")
+
+# =============================================================================
 # 3. SÉLECTION DES GÈNES — BASÉE SUR LA CONNECTIVITÉ (pas les DEGs)
 # =============================================================================
 # JUSTIFICATION : dans un GNN, le message passing propage l'information le
@@ -685,13 +745,19 @@ else:
     print("  REACTOME : SKIP (--no-reactome)")
 
 # --- 3e. UNION FINALE : tous les gènes connectés par au moins un réseau ---
-# connected_genes = SCENIC ∪ GRNBoost2 ∪ PPI ∪ REACTOME
+# connected_genes = SCENIC ∪ GRNBoost2 ∪ PPI ∪ REACTOME (∪ OmniPath en V4.1)
 # (HuMess sera ajouté plus tard en section 6f, mais ses gènes sont typiquement
 # déjà dans l'un des réseaux ci-dessus.)
+# V4.1 : si --include-omnipath-genes, on ajoute les endpoints de signaling
+# (kinase-substrat + SIGNOR) et tf_curated (CollecTRI). L'intersection avec
+# `available_set` garantit qu'on n'invente pas de gènes hors scRNA-mesurés.
 # gene_symbols : array trié de tous les gènes retenus (l'index dans cet
 #   array = l'identifiant du noeud dans le graphe PyG).
 # gene_to_idx : dictionnaire inverse, symbole → index dans le graphe.
 connected_genes = scenic_genes | coexpr_genes | ppi_genes | reactome_genes
+_connected_before_opi = set(connected_genes & available_set)
+if omnipath_endpoints:
+    connected_genes |= omnipath_endpoints
 gene_symbols = np.array(sorted(connected_genes & available_set))
 gene_to_idx = {g: i for i, g in enumerate(gene_symbols)}
 n_genes = len(gene_symbols)
@@ -701,6 +767,11 @@ print(f"    SCENIC       : {len(scenic_genes & set(gene_symbols))}")
 print(f"    Co-expression: {len(coexpr_genes & set(gene_symbols))}")
 print(f"    PPI          : {len(ppi_genes & set(gene_symbols))}")
 print(f"    REACTOME     : {len(reactome_genes & set(gene_symbols))}")
+if omnipath_endpoints:
+    _opi_in_graph = omnipath_endpoints & set(gene_symbols)
+    _opi_new = _opi_in_graph - _connected_before_opi
+    print(f"    OmniPath     : {len(_opi_in_graph)} "
+          f"(dont {len(_opi_new)} nouveaux ∉ des 4 sources V3)")
 
 # =============================================================================
 # 4. CALCUL DE L'EXPRESSION PAR GROUPE — FEATURES D'ARÊTES
@@ -1968,9 +2039,14 @@ for et_key in data.edge_types:
 
 # Historique pour les plots
 train_losses = []      # Loss totale à chaque epoch
+recon_losses = []      # Loss de reconstruction à chaque epoch
+kl_losses = []         # KL loss (non pondérée) à chaque epoch
+kl_betas = []          # β du KL annealing à chaque epoch
 test_aucs = []         # AUC test (évaluée toutes les 10 epochs)
+test_aps = []          # AP test (évaluée toutes les 10 epochs)
 eval_epochs = []       # Numéros d'epoch où on a évalué
 best_test_auc = 0.0    # Meilleure AUC test observée
+best_test_ap = 0.0     # AP au meilleur epoch (par AUC)
 best_epoch = 0         # Epoch correspondante
 # PATIENCE = 80 epochs : si l'AUC ne s'améliore pas pendant 80 epochs
 # (= 8 évaluations), on arrête. Le pic est typiquement autour de epoch 30-50.
@@ -2035,6 +2111,9 @@ for epoch in range(N_EPOCHS):
     torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
     optimizer.step()
     train_losses.append(loss.item())
+    recon_losses.append(recon_loss.item())
+    kl_losses.append(kl_loss.item())
+    kl_betas.append(kl_beta)
 
     # --- Évaluation sur les arêtes test (toutes les 10 epochs) ---
     # On évalue sur des arêtes que le modèle n'a PAS vues dans la loss.
@@ -2071,11 +2150,13 @@ for epoch in range(N_EPOCHS):
                 auc, ap = 0.5, 0.5  # Fallback si toutes les prédictions sont identiques
 
             test_aucs.append(auc)
+            test_aps.append(ap)
             eval_epochs.append(epoch)
 
             # Sauvegarder le meilleur modèle (par AUC test)
             if auc > best_test_auc:
                 best_test_auc = auc
+                best_test_ap = ap
                 best_epoch = epoch
                 patience_counter = 0  # Reset du compteur de patience
                 torch.save(model.state_dict(), os.path.join(OUT_DIR, "best_vgae.pt"))
@@ -3048,6 +3129,162 @@ print(f"  → gene_embeddings_vgae.csv ({gene_emb.shape})")
 # Poids du modèle PyTorch (pour réutilisation dans les perturbations)
 torch.save(model.state_dict(), os.path.join(OUT_DIR, "vgae_weights.pt"))
 print("  → vgae_weights.pt")
+
+# Sidecar JSON : historique d'entraînement + métriques finales — permet
+# aux scripts d'analyse cross-seed de reconstruire courbes loss/AUC/AP
+# sans devoir reparser log.txt. Format human-readable, indépendant de torch.
+import json as _json
+
+# --- Stats d'arêtes (V4.1) : breakdown par type + signe + couverture vs PPI ---
+# Pour chaque edge_type construit en section 6/7, on rapporte :
+#   - n_edges (taille du edge_index)
+#   - n_pos / n_neg / n_unsigned (si edge_attr[:,1] = sign)
+# Et aux niveaux agrégés :
+#   - n_signed_total = somme des arêtes des types signés (signaling, tf_curated)
+#   - frac_signed   = n_signed / total (mesure le poids causal du graphe)
+#   - signed_non_ppi : arêtes signées dont la paire (a,b) n'a PAS d'arête PPI
+#       → quantifie ce qu'OmniPath apporte au-delà de STRING (apport causal pur).
+def _edge_stats(ei, attr=None):
+    """Compte arêtes d'un type, et breakdown +/−/0 si attr[:,1]=sign."""
+    n = int(ei.shape[1]) if ei.numel() > 0 else 0
+    out = {"n_edges": n}
+    if (attr is not None and attr.numel() > 0
+            and attr.dim() == 2 and attr.shape[1] >= 2):
+        # convention V4 : colonne 1 = sign ∈ {−1, 0, +1}
+        sign_col = attr[:, 1]
+        out["n_pos"]      = int((sign_col > 0).sum())
+        out["n_neg"]      = int((sign_col < 0).sum())
+        out["n_unsigned"] = int((sign_col == 0).sum())
+    return out
+
+
+# Catalogue { edge_type_name : (edge_index, edge_attr_ou_None) }. None pour
+# les types sans edge_attr (same_pathway) ou non instanciés.
+_edge_catalog = {
+    "ppi":                   (edge_index_ppi,         edge_attr_ppi),
+    "same_pathway":          (edge_index_pathway,     None),
+    "regulates":             (edge_index_regulates,   edge_attr_regulates),
+    "coexpression":          (edge_index_coexpr,      coexpr_w_tensor),
+    "metabolic_cocatalysis": (edge_index_cocat,       edge_attr_cocat),
+    "signaling":             (edge_index_signaling,   edge_attr_signaling),
+    "tf_curated":            (edge_index_tf_curated,  edge_attr_tf_curated),
+    "expresses":             (edge_index_expresses,   edge_attr_expresses),
+}
+_per_type = {name: _edge_stats(ei, attr)
+             for name, (ei, attr) in _edge_catalog.items()}
+
+# Agrégats : types qui portent un signe biologique (causal/régulatoire)
+_signed_types = ("signaling", "tf_curated", "regulates")
+_signed_total_edges = sum(_per_type[t]["n_edges"] for t in _signed_types)
+_total_gene_gene = sum(_per_type[t]["n_edges"] for t in
+                       ("ppi", "same_pathway", "regulates", "coexpression",
+                        "metabolic_cocatalysis", "signaling", "tf_curated"))
+
+# Couverture vs PPI : combien d'arêtes signées (signaling / tf_curated) NE
+# sont PAS doublées par une arête PPI (bidirectionnelle) ? Mesure l'apport
+# causal pur d'OmniPath au-delà de STRING.
+_ppi_pairs: set[tuple[int, int]] = set()
+if edge_index_ppi.numel() > 0:
+    _ppi_pairs = {(int(s), int(d)) for s, d in zip(
+        edge_index_ppi[0].tolist(), edge_index_ppi[1].tolist())}
+
+
+def _count_non_ppi(ei) -> int:
+    """Nb d'arêtes signées dont aucune des deux orientations n'est dans PPI."""
+    if ei.numel() == 0 or not _ppi_pairs:
+        return int(ei.shape[1]) if ei.numel() > 0 else 0
+    cnt = 0
+    for s, d in zip(ei[0].tolist(), ei[1].tolist()):
+        if (int(s), int(d)) not in _ppi_pairs and (int(d), int(s)) not in _ppi_pairs:
+            cnt += 1
+    return cnt
+
+
+_signaling_non_ppi  = _count_non_ppi(edge_index_signaling)
+_tf_curated_non_ppi = _count_non_ppi(edge_index_tf_curated)
+
+# Logs console — utile pour diag interactif sans ouvrir le JSON
+print("\n  Stats arêtes (V4.1) :")
+for name, st in _per_type.items():
+    extra = ""
+    if "n_pos" in st:
+        extra = (f"  [+:{st['n_pos']} −:{st['n_neg']} "
+                 f"0:{st['n_unsigned']}]")
+    print(f"    {name:<22} : {st['n_edges']:>8}{extra}")
+if _per_type["signaling"]["n_edges"] > 0 or _per_type["tf_curated"]["n_edges"] > 0:
+    print(f"  Couverture causale OmniPath hors PPI :")
+    print(f"    signaling non-PPI  : {_signaling_non_ppi} "
+          f"/ {_per_type['signaling']['n_edges']}")
+    print(f"    tf_curated non-PPI : {_tf_curated_non_ppi} "
+          f"/ {_per_type['tf_curated']['n_edges']}")
+if _total_gene_gene > 0:
+    print(f"  frac signed / total gene-gene : "
+          f"{_signed_total_edges / _total_gene_gene:.3f}")
+
+_edge_stats_block = {
+    "per_type": _per_type,
+    "aggregates": {
+        "n_signed_total":   int(_signed_total_edges),
+        "n_gene_gene_total": int(_total_gene_gene),
+        "frac_signed_of_gene_gene": (
+            float(_signed_total_edges / _total_gene_gene)
+            if _total_gene_gene > 0 else 0.0),
+    },
+    "omnipath_vs_ppi": {
+        "signaling_total":      _per_type["signaling"]["n_edges"],
+        "signaling_non_ppi":    int(_signaling_non_ppi),
+        "tf_curated_total":     _per_type["tf_curated"]["n_edges"],
+        "tf_curated_non_ppi":   int(_tf_curated_non_ppi),
+    },
+    "include_omnipath_genes":   bool(MODULES["include_omnipath_genes"]),
+    "n_omnipath_endpoints_in_graph": int(
+        len(set(omnipath_endpoints) & set(gene_symbols))
+        if omnipath_endpoints else 0),
+}
+
+_metrics = {
+    "version": 1,
+    "seed": int(getattr(CLI_ARGS, "seed", 42)),
+    "run_tag": str(globals().get("RUN_TAG", "")),
+    "best_epoch": int(best_epoch + 1),  # 1-indexé pour cohérence avec les logs
+    "best_auc": float(best_test_auc),
+    "best_ap": float(best_test_ap),
+    "mlp_auc": float(mlp_auc),
+    "mlp_ap": float(mlp_ap),
+    "delta_auc_vgae_minus_mlp": float(best_test_auc - mlp_auc),
+    "n_epochs_planned": int(N_EPOCHS),
+    "n_epochs_run": int(len(train_losses)),
+    "early_stopped": bool(len(train_losses) < N_EPOCHS),
+    "patience": int(PATIENCE),
+    "n_genes": int(n_genes),
+    "n_train_edges": int(len(train_edges)),
+    "n_test_edges": int(len(test_edges)),
+    "history": {
+        "epoch": list(range(1, len(train_losses) + 1)),
+        "train_loss": [float(x) for x in train_losses],
+        "recon_loss": [float(x) for x in recon_losses],
+        "kl_loss": [float(x) for x in kl_losses],
+        "kl_beta": [float(x) for x in kl_betas],
+    },
+    "eval_history": {
+        "epoch": [int(e + 1) for e in eval_epochs],
+        "test_auc": [float(x) for x in test_aucs],
+        "test_ap": [float(x) for x in test_aps],
+    },
+    "hyperparams": {
+        "lr": float(LR),
+        "kl_beta_max": float(KL_BETA_MAX),
+        "kl_warmup_epochs": int(KL_WARMUP_EPOCHS),
+        "free_bits": float(FREE_BITS),
+        "latent_dim": int(LATENT_DIM),
+        "edge_sample_ratio": float(EDGE_SAMPLE_RATIO),
+        "grad_clip_norm": float(GRAD_CLIP_NORM),
+    },
+    "edge_stats": _edge_stats_block,
+}
+with open(os.path.join(OUT_DIR, "vgae_metrics.json"), "w") as _f:
+    _json.dump(_metrics, _f, indent=2)
+print("  → vgae_metrics.json")
 
 # Expression par groupe cellulaire — requis par gnn_perturbation.py pour le
 # shift pondéré au niveau gène. On exporte mean_expression et pct_expressing
