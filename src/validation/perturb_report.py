@@ -1918,6 +1918,189 @@ def _compute_evidence_tier(driver_score: float,
     return "E_noise"
 
 
+def _load_vgae_training_metrics(seed_paths: list[Path]) -> list[dict]:
+    """Load vgae_metrics.json from each seed root.
+
+    Returns one dict per seed (older runs without the JSON sidecar are
+    skipped silently — this keeps the cross-seed report backward-compatible
+    with V3.3 / V3.6 runs that predate the metrics export). Each dict has
+    an extra ``seed_dir`` key pointing to the run folder name for plotting.
+    """
+    import json as _json
+    out: list[dict] = []
+    for p in seed_paths:
+        f = p / "vgae_metrics.json"
+        if not f.exists():
+            continue
+        try:
+            with open(f) as fh:
+                m = _json.load(fh)
+            m["seed_dir"] = p.name
+            out.append(m)
+        except Exception as e:
+            print(f"[WARN] Failed to read {f}: {e}")
+    return out
+
+
+def _save_vgae_training_summary(metrics: list[dict], out_dir: Path) -> None:
+    """Write per-seed scalars to TSV + bundle full history into one JSON.
+
+    Two files in ``out_dir``:
+      * vgae_training_summary.tsv — one row per seed, scalar metrics
+        (best_epoch, best_auc, best_ap, mlp_auc, delta_auc, n_epochs_run,
+        early_stopped). Easy to read in spreadsheets / pandas.
+      * vgae_training_history.json — bundled per-epoch arrays for every
+        seed. Consumed by ``--figures-only`` so the curves can be redrawn
+        without re-loading every seed root.
+    """
+    import json as _json
+    if not metrics:
+        return
+    rows = []
+    for m in metrics:
+        rows.append({
+            "seed_dir": m.get("seed_dir"),
+            "seed": m.get("seed"),
+            "run_tag": m.get("run_tag", ""),
+            "best_epoch": m.get("best_epoch"),
+            "best_auc": m.get("best_auc"),
+            "best_ap": m.get("best_ap"),
+            "mlp_auc": m.get("mlp_auc"),
+            "mlp_ap": m.get("mlp_ap"),
+            "delta_auc_vgae_minus_mlp": m.get("delta_auc_vgae_minus_mlp"),
+            "n_epochs_run": m.get("n_epochs_run"),
+            "n_epochs_planned": m.get("n_epochs_planned"),
+            "early_stopped": m.get("early_stopped"),
+        })
+    pd.DataFrame(rows).to_csv(out_dir / "vgae_training_summary.tsv",
+                              sep="\t", index=False)
+    with open(out_dir / "vgae_training_history.json", "w") as fh:
+        _json.dump(metrics, fh)
+
+
+def _load_vgae_training_history(out_dir: Path) -> list[dict]:
+    """Re-read the bundled history written by _save_vgae_training_summary.
+
+    Used by --figures-only so the curves can be redrawn without revisiting
+    every seed root.
+    """
+    import json as _json
+    f = out_dir / "vgae_training_history.json"
+    if not f.exists():
+        return []
+    try:
+        with open(f) as fh:
+            return _json.load(fh)
+    except Exception as e:
+        print(f"[WARN] Failed to read {f}: {e}")
+        return []
+
+
+def fig_cross_seed_training_curves(metrics: list[dict], out: Path,
+                                    title: str) -> None:
+    """4-panel cross-seed training summary.
+
+    Panels:
+      (1) train loss vs epoch — one curve per seed, low alpha to show spread.
+      (2) test AUC vs epoch — markers at each eval point + best-epoch dot.
+      (3) test AP vs epoch — same layout as AUC.
+      (4) bar: best AUC per seed vs MLP baseline (mean + per-seed scatter).
+    """
+    if not metrics:
+        return
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    cmap = plt.get_cmap("tab10")
+    # Panel 1 — train loss
+    ax = axes[0, 0]
+    for i, m in enumerate(metrics):
+        h = m.get("history", {})
+        ep = h.get("epoch", [])
+        tl = h.get("train_loss", [])
+        if ep and tl:
+            ax.plot(ep, tl, color=cmap(i % 10), alpha=0.7, lw=1.2,
+                    label=m.get("seed_dir", f"seed{i}"))
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("train loss")
+    ax.set_title("Train loss vs epoch")
+    ax.legend(loc="upper right", fontsize=7, ncol=2)
+    ax.grid(alpha=0.3)
+
+    # Panel 2 — test AUC
+    ax = axes[0, 1]
+    for i, m in enumerate(metrics):
+        eh = m.get("eval_history", {})
+        ep = eh.get("epoch", [])
+        au = eh.get("test_auc", [])
+        if ep and au:
+            ax.plot(ep, au, marker="o", ms=3, color=cmap(i % 10), alpha=0.75,
+                    lw=1.2, label=m.get("seed_dir", f"seed{i}"))
+        be = m.get("best_epoch")
+        ba = m.get("best_auc")
+        if be is not None and ba is not None:
+            ax.scatter([be], [ba], color=cmap(i % 10), s=70,
+                       edgecolor="black", lw=0.8, zorder=5)
+    # MLP baseline (mean across seeds)
+    mlp_aucs = [m.get("mlp_auc") for m in metrics if m.get("mlp_auc") is not None]
+    if mlp_aucs:
+        ax.axhline(np.mean(mlp_aucs), color="#2ECC71", ls="--", lw=1.5,
+                   label=f"MLP baseline (mean={np.mean(mlp_aucs):.3f})")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("test AUC")
+    ax.set_title("Test AUC vs epoch (• = best)")
+    ax.legend(loc="lower right", fontsize=7, ncol=2)
+    ax.grid(alpha=0.3)
+
+    # Panel 3 — test AP
+    ax = axes[1, 0]
+    for i, m in enumerate(metrics):
+        eh = m.get("eval_history", {})
+        ep = eh.get("epoch", [])
+        ap = eh.get("test_ap", [])
+        if ep and ap:
+            ax.plot(ep, ap, marker="o", ms=3, color=cmap(i % 10), alpha=0.75,
+                    lw=1.2, label=m.get("seed_dir", f"seed{i}"))
+        be = m.get("best_epoch")
+        bp = m.get("best_ap")
+        if be is not None and bp is not None:
+            ax.scatter([be], [bp], color=cmap(i % 10), s=70,
+                       edgecolor="black", lw=0.8, zorder=5)
+    mlp_aps = [m.get("mlp_ap") for m in metrics if m.get("mlp_ap") is not None]
+    if mlp_aps:
+        ax.axhline(np.mean(mlp_aps), color="#2ECC71", ls="--", lw=1.5,
+                   label=f"MLP baseline (mean={np.mean(mlp_aps):.3f})")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("test AP")
+    ax.set_title("Test AP vs epoch (• = best)")
+    ax.legend(loc="lower right", fontsize=7, ncol=2)
+    ax.grid(alpha=0.3)
+
+    # Panel 4 — bar: VGAE best AUC per seed vs MLP
+    ax = axes[1, 1]
+    labels = [m.get("seed_dir", f"seed{i}") for i, m in enumerate(metrics)]
+    vgae = [m.get("best_auc", 0.0) for m in metrics]
+    mlp = [m.get("mlp_auc", 0.0) for m in metrics]
+    x = np.arange(len(labels))
+    w = 0.4
+    ax.bar(x - w / 2, vgae, w, label="VGAE", color="#3498DB")
+    ax.bar(x + w / 2, mlp, w, label="MLP", color="#2ECC71")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("test AUC")
+    ax.set_ylim(min(min(vgae + mlp) - 0.05, 0.5), 1.0)
+    ax.set_title("Best test AUC per seed vs MLP")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3, axis="y")
+    if vgae:
+        ax.axhline(np.mean(vgae), color="#3498DB", ls=":", lw=1,
+                   alpha=0.6)
+
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+    print(f"  → {out.name}")
+
+
 def _load_vgae_baselines(seed_paths: list[Path]) -> pd.DataFrame:
     """Load + average gene_ranking_vgae.csv across seeds.
 
@@ -2914,6 +3097,20 @@ def run_cross_seed(args) -> None:
     # 4b. Per-gene cross-mode ranking (aggregation over KO/KD/OE per gene).
     # Cross with VGAE baseline + DE info from gene_ranking_vgae.csv (per seed).
     seed_roots = [_normalize_seed_root(p) for p in kept_paths]
+
+    # Persist VGAE training metrics (loss / AUC / AP histories) as a sidecar
+    # so cross-seed figures (and --figures-only re-runs) can plot training
+    # curves without revisiting each seed root. Silent skip if every seed
+    # predates the vgae_metrics.json export (V3.6 and earlier).
+    vgae_metrics = _load_vgae_training_metrics(seed_roots)
+    if vgae_metrics:
+        _save_vgae_training_summary(vgae_metrics, out_dir)
+        print(f"Wrote vgae_training_summary.tsv "
+              f"({len(vgae_metrics)} seeds with metrics)")
+    else:
+        print("[INFO] No vgae_metrics.json found in seed roots — training "
+              "curve figures will be skipped (run gnn_vgae.py to (re)generate).")
+
     vgae_baseline = _load_vgae_baselines(seed_roots)
     if vgae_baseline.empty:
         print("[INFO] No gene_ranking_vgae.csv found in seed roots — "
@@ -3079,6 +3276,17 @@ def _render_cross_seed_figures(df: pd.DataFrame,
     Split out of run_cross_seed so ``--figures-only`` can call it after
     loading the existing TSVs without redoing the per-seed aggregation.
     """
+    # Training-curves figure (loss / AUC / AP per seed). Reads the bundled
+    # history JSON written during run_cross_seed; silent skip if absent
+    # (older runs without vgae_metrics.json sidecars).
+    metrics = _load_vgae_training_history(out_dir)
+    if metrics:
+        fig_cross_seed_training_curves(
+            metrics,
+            out_dir / "cross_seed_vgae_training.png",
+            f"Cross-seed VGAE training — {len(metrics)} seed(s)",
+        )
+
     # Filtres optionnels appliqués AVANT figures uniquement.
     df_fig = apply_figure_filters(df, args)
     if len(df_fig) < len(df):
