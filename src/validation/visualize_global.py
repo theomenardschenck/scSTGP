@@ -115,6 +115,119 @@ def load_embeddings(run_dir: Path) -> pd.DataFrame:
     return emb
 
 
+def load_post_perturb_ranking(version_dir: Path) -> pd.DataFrame | None:
+    """
+    Cherche `cross_seed_gene_ranking.tsv` sous `version_dir` (récursif, 1
+    niveau). Renvoie un DataFrame indexé par `target` avec au moins les
+    colonnes `driver_score`, `discovery_score`, `validation_score`,
+    `canon_diff`, `canon_cosine`, ou `None` si introuvable.
+
+    `version_dir` peut être :
+      - un dossier de run (gnn_vgae.py) qui a son propre report,
+      - un dossier de version (V3.6/) avec un `cross_seed_report/` enfant,
+      - le dossier `cross_seed_report` lui-même.
+    """
+    candidates = [
+        version_dir / "cross_seed_gene_ranking.tsv",
+        version_dir / "cross_seed_report" / "cross_seed_gene_ranking.tsv",
+        version_dir / "report" / "cross_seed_gene_ranking.tsv",
+    ]
+    # Recherche dans les enfants directs (cas où version_dir = dossier version)
+    if version_dir.is_dir():
+        for child in version_dir.iterdir():
+            if child.is_dir() and child.name.startswith("cross_seed"):
+                candidates.append(child / "cross_seed_gene_ranking.tsv")
+    # Recherche dans le parent (cas où version_dir = un run d'une version) :
+    # cherche des frères type `cross_seed_*` ou `cross_seed_report/`
+    parent = version_dir.parent
+    if parent.exists() and parent.is_dir():
+        for sib in parent.iterdir():
+            if sib == version_dir or not sib.is_dir():
+                continue
+            if sib.name.startswith("cross_seed"):
+                candidates.append(sib / "cross_seed_gene_ranking.tsv")
+    for p in candidates:
+        if p.exists():
+            df = pd.read_csv(p, sep="\t")
+            if "target" in df.columns:
+                return df.set_index("target")
+            if "gene_symbol" in df.columns:
+                return df.set_index("gene_symbol")
+            return df
+    return None
+
+
+def get_ranking_score(version_dir: Path,
+                      score_col: str = "driver_score") -> pd.Series:
+    """
+    Renvoie une Series gene → score, en privilégiant le ranking
+    post-perturbation (`driver_score` du cross_seed_gene_ranking.tsv).
+    Fallback : `vgae_importance` du `gene_ranking_vgae.csv` du run.
+
+    Le score est normalisé min-max [0, 1] pour comparabilité inter-versions.
+    """
+    df_post = load_post_perturb_ranking(version_dir)
+    if df_post is not None and score_col in df_post.columns:
+        s = df_post[score_col].astype(float)
+        src = f"post-perturb:{score_col}"
+    else:
+        # Fallback baseline VGAE (legacy)
+        # Si version_dir est un dossier version, prendre un sous-run quelconque
+        if (version_dir / "gene_ranking_vgae.csv").exists():
+            df = pd.read_csv(version_dir / "gene_ranking_vgae.csv")
+            s = df.set_index("gene")["vgae_importance"].astype(float)
+        else:
+            sub_runs = sorted(p for p in version_dir.iterdir()
+                              if p.is_dir()
+                              and (p / "gene_ranking_vgae.csv").exists())
+            if not sub_runs:
+                raise FileNotFoundError(
+                    f"No ranking found under {version_dir} (no cross_seed "
+                    f"report + no per-run gene_ranking_vgae.csv)."
+                )
+            df = pd.read_csv(sub_runs[0] / "gene_ranking_vgae.csv")
+            s = df.set_index("gene")["vgae_importance"].astype(float)
+        src = "baseline:vgae_importance"
+
+    lo, hi = s.min(), s.max()
+    if hi > lo:
+        s = (s - lo) / (hi - lo)
+    print(f"[ranking] {version_dir.name}: source = {src}, n_genes = {len(s)}")
+    return s.rename(version_dir.name)
+
+
+def detect_signed_ppi(data) -> dict[tuple[str, str, str], bool]:
+    """
+    Pour chaque edge_type avec edge_attr, détecte la présence d'une
+    composante signe (∈ {−1, 0, +1}).
+
+    Renvoie un dict edge_type → bool. Convention courante dans le projet :
+      - PPI legacy : edge_attr.shape[1] = 1 (score seul) → False.
+      - V4 'signaling' / 'tf_curated' : edge_attr.shape[1] = 2 (score, sign).
+      - 'metabolic_cocatalysis' : edge_attr.shape[1] = 2 (rev_score, ratio,
+        sans signe biologique) → traité comme False par défaut.
+    """
+    import torch  # local import to keep top-level light
+    out = {}
+    for et in data.edge_types:
+        store = data[et]
+        if not hasattr(store, "edge_attr") or store.edge_attr is None:
+            out[et] = False
+            continue
+        attr = store.edge_attr
+        if attr.dim() < 2 or attr.shape[1] < 2:
+            out[et] = False
+            continue
+        # 2e colonne ressemble-t-elle à un signe ∈ {−1, 0, +1} ?
+        col = attr[:, 1].detach().cpu().numpy() if hasattr(attr, "detach") \
+            else attr[:, 1]
+        unique = set(np.unique(np.round(col)).tolist())
+        is_sign = unique.issubset({-1.0, 0.0, 1.0}) and len(unique) > 1
+        # Restreint aux types qu'on sait signés (V4)
+        out[et] = is_sign and et[1] in ("signaling", "tf_curated", "tf_curated_by")
+    return out
+
+
 def load_reactome() -> dict[str, set[str]]:
     sets: dict[str, set[str]] = {}
     with open(GMT_PATH) as f:
@@ -227,7 +340,20 @@ def fig_umap(run_dir: Path,
 def fig_network(run_dir: Path,
                 out_dir: Path,
                 top_n: int = 100,
-                seed: int = 42) -> Path:
+                seed: int = 42,
+                score_col: str = "driver_score",
+                version_dir: Path | None = None) -> Path:
+    """Top-N network — basé sur le ranking POST-PERTURBATION par défaut.
+
+    `score_col` : 'driver_score' (défaut) | 'discovery_score' |
+                  'validation_score' | 'canon_diff' | 'canon_cosine'.
+    `version_dir` : dossier-parent contenant `cross_seed_gene_ranking.tsv`.
+                    Si None → `run_dir.parent`. Fallback `vgae_importance`
+                    si pas de ranking post-perturbation trouvé.
+
+    Détecte les arêtes signées V4 (signaling / tf_curated) et les colore
+    selon le signe (rouge=inhibition, vert=activation).
+    """
     import networkx as nx
     import torch
 
@@ -237,49 +363,95 @@ def fig_network(run_dir: Path,
 
     print(f"[network] Loading hetero graph from {graph_path} ...")
     data = torch.load(graph_path, weights_only=False)
-    ranking = load_ranking(run_dir)
+
+    if version_dir is None:
+        version_dir = run_dir.parent
+
+    try:
+        scores = get_ranking_score(version_dir, score_col=score_col)
+        score_label = f"post-perturb {score_col}"
+    except (FileNotFoundError, KeyError):
+        df = load_ranking(run_dir)
+        scores = df.set_index("gene")["vgae_importance"].astype(float)
+        lo, hi = scores.min(), scores.max()
+        if hi > lo:
+            scores = (scores - lo) / (hi - lo)
+        score_label = "baseline vgae_importance"
+
+    signed_types = detect_signed_ppi(data)
+    if any(signed_types.values()):
+        signed_str = ", ".join(et[1] for et, v in signed_types.items() if v)
+        print(f"[network] signed edge types detected: {signed_str}")
+    else:
+        print("[network] no signed edges (V3 or earlier graph)")
 
     # Recover gene ordering: embeddings file index is the graph node order
     emb = load_embeddings(run_dir)
     gene_symbols = list(emb.index)
     gene_to_idx = {g: i for i, g in enumerate(gene_symbols)}
 
-    # Pick top-N by importance
-    top = (ranking.sort_values("vgae_importance", ascending=False)
-                  .head(top_n)["gene"].astype(str).tolist())
+    # Pick top-N by score (post-perturb si dispo, sinon baseline)
+    common_genes = [g for g in scores.index if g in gene_to_idx]
+    scores_common = scores.loc[common_genes].sort_values(ascending=False)
+    top = scores_common.head(top_n).index.astype(str).tolist()
     top_set = set(top)
-    top_idx = {gene_to_idx[g] for g in top if g in gene_to_idx}
+    top_idx = {gene_to_idx[g] for g in top}
 
-    # Collect edges restricted to top-N
-    def edges_for(rel: tuple[str, str, str]) -> list[tuple[int, int]]:
+    # Collect edges restricted to top-N. Pour les types signés (V4
+    # signaling / tf_curated), on dispatche dans des "kinds" virtuels
+    # _activation / _inhibition selon le signe ∈ {−1, 0, +1}.
+    def edges_for(rel: tuple[str, str, str],
+                  split_sign: bool = False) -> dict[str, list[tuple[int, int]]]:
         if rel not in data.edge_types:
-            return []
+            return {}
         ei = data[rel].edge_index.cpu().numpy()
-        out = []
-        for s, d in zip(ei[0], ei[1]):
-            if int(s) in top_idx and int(d) in top_idx and int(s) != int(d):
-                pair = (int(min(s, d)), int(max(s, d)))
-                out.append(pair)
-        return list(set(out))
+        attr = (data[rel].edge_attr.cpu().numpy()
+                if split_sign and hasattr(data[rel], "edge_attr")
+                and data[rel].edge_attr is not None else None)
+        bucket: dict[str, set[tuple[int, int]]] = {
+            "activation": set(), "inhibition": set(), "unsigned": set(),
+        }
+        for k in range(ei.shape[1]):
+            s, d = int(ei[0, k]), int(ei[1, k])
+            if s not in top_idx or d not in top_idx or s == d:
+                continue
+            pair = (int(min(s, d)), int(max(s, d)))
+            if attr is None or attr.shape[1] < 2:
+                bucket["unsigned"].add(pair)
+                continue
+            sign = float(round(attr[k, 1]))
+            if sign > 0:
+                bucket["activation"].add(pair)
+            elif sign < 0:
+                bucket["inhibition"].add(pair)
+            else:
+                bucket["unsigned"].add(pair)
+        return {k: list(v) for k, v in bucket.items() if v}
 
     # All gene-gene relations we display. Order = priority when an edge
     # exists under several types: the earlier type wins the visible style,
     # and the rest are stored in the "extra" set for the tooltip/title.
-    # (regulates / regulated_by are merged since they're symmetric for drawing.)
-    edge_kinds = [
-        ("ppi",          ("gene", "ppi", "gene")),
-        ("cocat",        ("gene", "metabolic_cocatalysis", "gene")),
-        ("pathway",      ("gene", "same_pathway", "gene")),
-        ("regulates",    ("gene", "regulates", "gene")),
-        ("regulates",    ("gene", "regulated_by", "gene")),
-        ("coexpression", ("gene", "coexpression", "gene")),
+    # V4 signaling / tf_curated sont splittés activation/inhibition.
+    edge_kinds: list[tuple[str, tuple[str, str, str], bool]] = [
+        ("ppi",          ("gene", "ppi", "gene"), False),
+        ("cocat",        ("gene", "metabolic_cocatalysis", "gene"), False),
+        ("pathway",      ("gene", "same_pathway", "gene"), False),
+        ("regulates",    ("gene", "regulates", "gene"), False),
+        ("regulates",    ("gene", "regulated_by", "gene"), False),
+        ("coexpression", ("gene", "coexpression", "gene"), False),
+        ("signaling",    ("gene", "signaling", "gene"), True),
+        ("tf_curated",   ("gene", "tf_curated", "gene"), True),
+        ("tf_curated",   ("gene", "tf_curated_by", "gene"), True),
     ]
-    # Merge multi-type edges into a single graph. Each edge keeps the set of
-    # relations it belongs to.
     edge_sets: dict[str, list[tuple[int, int]]] = {}
-    for kind, rel in edge_kinds:
-        pairs = edges_for(rel)
-        edge_sets.setdefault(kind, []).extend(pairs)
+    for kind, rel, split in edge_kinds:
+        is_signed = signed_types.get(rel, False) and split
+        buckets = edges_for(rel, split_sign=is_signed)
+        for sign_kind, pairs in buckets.items():
+            display_kind = (f"{kind}_{sign_kind}"
+                            if is_signed and sign_kind != "unsigned"
+                            else kind)
+            edge_sets.setdefault(display_kind, []).extend(pairs)
 
     print(f"[network] top-{top_n} genes — edges by kind: "
           + ", ".join(f"{k}={len(set(v))}" for k, v in edge_sets.items()))
@@ -296,9 +468,8 @@ def fig_network(run_dir: Path,
             else:
                 G.add_edge(s, d, kinds={kind})
 
-    # Importance for sizing / coloring
-    imp = (ranking.set_index("gene")["vgae_importance"]
-                  .reindex(top).fillna(0.0).to_dict())
+    # Score for sizing / coloring — driver_score si dispo, sinon baseline
+    imp = scores.reindex(top).fillna(0.0).to_dict()
 
     # Layout — spring on the full graph, then an inverse-spring correction:
     # spring pulls connected nodes *close* and pushes disconnected nodes
@@ -358,6 +529,19 @@ def fig_network(run_dir: Path,
                          "label": "PPI"},
         "cocat":        {"color": "#d62728", "alpha": 1.0, "width": 2.4,
                          "label": "metabolic cocatalysis"},
+        # V4 signaling / tf_curated — signed
+        "signaling_activation":  {"color": "#2ca02c", "alpha": 0.95,
+                                  "width": 1.6, "label": "signaling +"},
+        "signaling_inhibition":  {"color": "#d62728", "alpha": 0.95,
+                                  "width": 1.6, "label": "signaling −"},
+        "signaling":             {"color": "#888888", "alpha": 0.7,
+                                  "width": 1.2, "label": "signaling (unsigned)"},
+        "tf_curated_activation": {"color": "#1a7f1a", "alpha": 0.95,
+                                  "width": 1.4, "label": "TF curated +"},
+        "tf_curated_inhibition": {"color": "#7f1a1a", "alpha": 0.95,
+                                  "width": 1.4, "label": "TF curated −"},
+        "tf_curated":            {"color": "#666666", "alpha": 0.7,
+                                  "width": 1.1, "label": "TF curated (unsigned)"},
     }
     # Draw in the defined order (faint relations first, so strong
     # relations are drawn on top).
@@ -384,7 +568,7 @@ def fig_network(run_dir: Path,
     sc = ax.scatter(xs, ys, s=sizes, c=colors, cmap="viridis",
                     edgecolor="black", linewidths=0.5, zorder=3)
     cb = plt.colorbar(sc, ax=ax, fraction=0.03, pad=0.02)
-    cb.set_label("vgae_importance")
+    cb.set_label(score_label)
 
     # Labels — only top-30 to avoid clutter, with a small offset
     label_top = set(top[:30])
@@ -396,12 +580,14 @@ def fig_network(run_dir: Path,
                         color="black", zorder=4,
                         path_effects=None)
 
-    title_counts = "  ·  ".join(
-        f"{kind}={kind_counts[kind]}"
-        for kind in ["ppi", "cocat", "pathway", "regulates", "coexpression"]
-    )
+    visible_kinds = [k for k in ["ppi", "cocat", "pathway", "regulates",
+                                 "coexpression",
+                                 "signaling_activation", "signaling_inhibition",
+                                 "tf_curated_activation", "tf_curated_inhibition"]
+                     if kind_counts.get(k, 0) > 0]
+    title_counts = "  ·  ".join(f"{k}={kind_counts[k]}" for k in visible_kinds)
     ax.set_title(
-        f"Top-{top_n} genes by VGAE importance — full gene-gene edge set\n"
+        f"Top-{top_n} genes by {score_label}\n"
         f"{run_dir.name}  ·  {G.number_of_edges()} unique edges  ·  "
         f"{title_counts}\n"
         f"{len(connected)} connected / {len(isolated)} isolated")
@@ -864,6 +1050,187 @@ def fig_perturbation(out_dir: Path, top_k: int = 15) -> Path:
 
 
 # --------------------------------------------------------------------------- #
+# Dispatcher analyze — 1 ou N versions
+# --------------------------------------------------------------------------- #
+def _first_run_with_graph(version_dir: Path) -> Path | None:
+    """Trouve un sous-run avec hetero_graph_vgae.pt sous une version."""
+    if (version_dir / "hetero_graph_vgae.pt").exists():
+        return version_dir
+    if not version_dir.is_dir():
+        return None
+    for child in sorted(version_dir.iterdir()):
+        if child.is_dir() and (child / "hetero_graph_vgae.pt").exists():
+            return child
+    return None
+
+
+def fig_cross_version_compare(versions: list[Path],
+                              out_dir: Path,
+                              score_col: str = "driver_score",
+                              top_n: int = 100) -> Path:
+    """
+    Comparaison N versions sur le ranking post-perturbation.
+
+    Génère :
+      Panel A — Heatmap Spearman ρ N×N entre versions sur les rangs
+      Panel B — Barplot taille du top-N et intersection toutes-versions
+      Panel C — UpSet-style : tableau d'overlap par paire (top-N)
+      Panel D — Top-30 movers : delta_rank entre 1ère et 2e version
+                (utile uniquement N=2 ; ignoré sinon)
+    """
+    import itertools
+
+    series = {}
+    for v in versions:
+        try:
+            s = get_ranking_score(v, score_col=score_col)
+            series[v.name] = s
+        except FileNotFoundError as e:
+            print(f"[cross-version] skip {v.name}: {e}")
+    if len(series) < 2:
+        raise RuntimeError("Need ≥2 versions with rankings to compare.")
+
+    # Aligned wide table
+    wide = pd.concat(series.values(), axis=1)
+    wide.columns = list(series.keys())
+    wide = wide.dropna(how="any")
+    ranks = wide.rank(ascending=False, method="min")
+
+    n = len(series)
+    fig = plt.figure(figsize=(7 + 3 * n, 9))
+    gs = fig.add_gridspec(2, 3, hspace=0.4, wspace=0.4)
+
+    # A — Spearman heatmap
+    ax = fig.add_subplot(gs[0, 0])
+    corr = wide.corr(method="spearman")
+    sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm",
+                vmin=-1, vmax=1, ax=ax, cbar_kws={"label": "Spearman ρ"})
+    ax.set_title(f"A — Cross-version Spearman ρ\n({score_col})")
+
+    # B — Top-N sizes + intersection
+    ax = fig.add_subplot(gs[0, 1])
+    tops = {name: set(s.nlargest(top_n).index) for name, s in series.items()}
+    inter_all = set.intersection(*tops.values())
+    counts = [len(t) for t in tops.values()] + [len(inter_all)]
+    names = list(tops.keys()) + ["∩ all"]
+    colors = sns.color_palette("Set2", n_colors=len(counts))
+    ax.bar(names, counts, color=colors, edgecolor="black")
+    for i, c in enumerate(counts):
+        ax.text(i, c + 0.5, str(c), ha="center", fontsize=8)
+    ax.set_title(f"B — Top-{top_n} size + intersection")
+    ax.set_ylabel("# genes")
+    ax.tick_params(axis="x", rotation=20, labelsize=8)
+
+    # C — pairwise overlaps
+    ax = fig.add_subplot(gs[0, 2])
+    pairs = list(itertools.combinations(tops.keys(), 2))
+    overlap_pct = []
+    pair_lbls = []
+    for a, b in pairs:
+        ov = len(tops[a] & tops[b])
+        overlap_pct.append(100 * ov / top_n)
+        pair_lbls.append(f"{a}\n∩\n{b}")
+    ax.barh(range(len(pairs)), overlap_pct,
+            color="#4C72B0", edgecolor="black")
+    ax.set_yticks(range(len(pairs)))
+    ax.set_yticklabels(pair_lbls, fontsize=7)
+    ax.set_xlabel(f"Overlap (% of top-{top_n})")
+    ax.set_xlim(0, 100)
+    ax.set_title("C — Pairwise top-N overlap")
+
+    # D — top movers between 1st 2 versions
+    ax = fig.add_subplot(gs[1, :])
+    if n >= 2:
+        v0, v1 = list(series.keys())[:2]
+        delta = ranks[v0] - ranks[v1]  # >0 si v0 classe plus bas (v1 mieux)
+        # Top 15 risers (v1 mieux) + top 15 fallers
+        risers = delta.nlargest(15)
+        fallers = delta.nsmallest(15)
+        bars = pd.concat([fallers, risers]).sort_values()
+        bcolors = ["#C44E52" if v < 0 else "#55A868" for v in bars.values]
+        ax.barh(bars.index, bars.values, color=bcolors, edgecolor="black")
+        ax.axvline(0, c="black", lw=0.8)
+        ax.set_xlabel(f"Δrank ({v0} − {v1})    + = climbed in {v1}")
+        ax.set_title(f"D — Top movers between {v0} and {v1} "
+                     f"({score_col}, {len(wide)} genes aligned)")
+        ax.tick_params(axis="y", labelsize=7)
+    else:
+        ax.axis("off")
+
+    fig.suptitle(f"Cross-version comparison — {n} versions × "
+                 f"{len(wide)} shared genes — score = {score_col}",
+                 fontsize=13, y=1.0)
+
+    path = out_dir / f"cross_version_{score_col}_top{top_n}.png"
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[cross-version] wrote {path}")
+
+    # Also export the wide table for downstream use
+    wide_tsv = out_dir / f"cross_version_{score_col}_scores.tsv"
+    wide.to_csv(wide_tsv, sep="\t", float_format="%.5f")
+    print(f"[cross-version] wrote {wide_tsv}")
+    return path
+
+
+def fig_analyze(versions: list[Path],
+                out_dir: Path,
+                score_col: str = "driver_score",
+                top_n: int = 100,
+                reference_run: Path | None = None,
+                pathways: list[str] | None = None) -> list[Path]:
+    """
+    Dispatcher — 1 version → analyse single-version (UMAP + network) ;
+    N versions → analyse cross-version (Spearman + overlap + movers).
+
+    Le ranking utilisé est le driver_score post-perturbation (par défaut)
+    chargé depuis `cross_seed_gene_ranking.tsv` ; fallback vgae_importance
+    si non trouvé.
+    """
+    pathways = pathways or DEFAULT_PATHWAYS
+    paths: list[Path] = []
+
+    if len(versions) == 0:
+        raise ValueError("--versions requires at least 1 path")
+
+    if len(versions) == 1:
+        v = versions[0]
+        print(f"[analyze] single-version mode: {v.name}")
+        run = reference_run or _first_run_with_graph(v)
+        if run is None:
+            raise FileNotFoundError(
+                f"No hetero_graph_vgae.pt found under {v} — "
+                f"pass --reference-run explicitly.")
+        sub_out = ensure_out_dir(out_dir / f"single_{v.name}")
+        paths.append(fig_umap(run, pathways, sub_out))
+        paths.append(fig_network(run, sub_out, top_n=top_n,
+                                 score_col=score_col, version_dir=v))
+        return paths
+
+    # N versions → comparison
+    print(f"[analyze] cross-version mode: {len(versions)} versions")
+    sub_out = ensure_out_dir(out_dir / "cross_version")
+    paths.append(fig_cross_version_compare(
+        versions, sub_out, score_col=score_col, top_n=top_n))
+
+    # Also render single-version network for each version, for visual reference
+    for v in versions:
+        run = _first_run_with_graph(v)
+        if run is None:
+            print(f"[analyze] no hetero_graph for {v.name}, skip network")
+            continue
+        v_out = ensure_out_dir(sub_out / v.name)
+        try:
+            paths.append(fig_network(run, v_out, top_n=top_n,
+                                     score_col=score_col, version_dir=v))
+        except Exception as exc:
+            print(f"[analyze] network failed for {v.name}: {exc}")
+
+    return paths
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def main():
@@ -899,6 +1266,27 @@ def main():
 
     sub.add_parser("all", help="Run every figure with defaults")
 
+    # ─ analyze : nouveau dispatcher 1 ou N versions ─────────────────────
+    sa = sub.add_parser(
+        "analyze",
+        help="Single-version analysis or cross-version comparison "
+             "(driver_score-based, sign-aware).")
+    sa.add_argument("--versions", nargs="+", required=True, type=Path,
+                    help="1 ou N dossiers de version (ou run). Single → "
+                         "umap + network ; N → comparaison cross-version.")
+    sa.add_argument("--score-col", default="driver_score",
+                    choices=["driver_score", "discovery_score",
+                             "validation_score", "canon_diff", "canon_cosine"],
+                    help="Colonne du cross_seed_gene_ranking.tsv à utiliser.")
+    sa.add_argument("--top-n", type=int, default=100,
+                    help="Top-N pour le network et l'overlap (défaut 100).")
+    sa.add_argument("--reference-run", type=Path, default=None,
+                    help="Sous-run d'une version (avec hetero_graph_vgae.pt) "
+                         "pour la figure network. Défaut : premier sous-run "
+                         "de la première version listée.")
+    sa.add_argument("--pathways", nargs="+", default=DEFAULT_PATHWAYS,
+                    help="Pathways REACTOME pour l'UMAP.")
+
     args = ap.parse_args()
     out_dir = ensure_out_dir(args.out_dir)
 
@@ -922,6 +1310,13 @@ def main():
         fig_consensus(out_dir, version="V3", top_n=100)
         fig_perturbation(out_dir, top_k=15)
         print(f"\n[all] Done — figures in {out_dir}")
+
+    elif args.cmd == "analyze":
+        fig_analyze(args.versions, out_dir,
+                    score_col=args.score_col,
+                    top_n=args.top_n,
+                    reference_run=args.reference_run,
+                    pathways=args.pathways)
 
 
 if __name__ == "__main__":
