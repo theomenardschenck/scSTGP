@@ -68,11 +68,40 @@ from typing import Callable, Iterable, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-try:
-    import omnipath as op
-    OMNIPATH_AVAILABLE = True
-except ImportError:
-    OMNIPATH_AVAILABLE = False
+# IMPORTANT (V4.1+) : on N'IMPORTE PAS `omnipath` au top du module.
+# Justification : sur les compute nodes Nautilus sans Internet, juste
+# `import omnipath` déclenche des metadata pre-fetches HTTP vers
+# omnipathdb.org (/queries/enzsub, /queries/interactions, etc.) qui
+# bouclent en 403/timeout × N endpoints × 5 retries = 30-40 min bloqués.
+# Or 99% des runs lisent juste du cache TSV (= pandas seul, omnipath
+# inutile). On lazy-importe à la demande dans `_lazy_import_omnipath()`
+# uniquement quand un fetcher web est appelé (cache absent + download
+# autorisé). Setting `GNN_OMNIPATH_OFFLINE=1` force le skip total des
+# fetchers (utile pour debug).
+op = None  # rempli au premier appel à _lazy_import_omnipath()
+OMNIPATH_AVAILABLE: Optional[bool] = None   # None = pas encore testé
+
+
+def _lazy_import_omnipath() -> bool:
+    """Importe `omnipath` à la première utilisation effective.
+
+    Returns: True si l'import a réussi, False sinon.
+    Side effect : peuple les globals `op` et `OMNIPATH_AVAILABLE`.
+    """
+    global op, OMNIPATH_AVAILABLE
+    if OMNIPATH_AVAILABLE is not None:
+        return OMNIPATH_AVAILABLE
+    if os.environ.get("GNN_OMNIPATH_OFFLINE") == "1":
+        # Mode offline forcé — court-circuite tout fetch web.
+        OMNIPATH_AVAILABLE = False
+        return False
+    try:
+        import omnipath as _op   # peut déclencher pre-fetches metadata
+        op = _op
+        OMNIPATH_AVAILABLE = True
+    except ImportError:
+        OMNIPATH_AVAILABLE = False
+    return OMNIPATH_AVAILABLE
 
 
 def silence_omnipath_logging():
@@ -264,7 +293,7 @@ def _project_to_graph(
 # --------------------------------------------------------------------------- #
 def _fetch_signaling_omnipath(organism: str = "human") -> Optional[pd.DataFrame]:
     """Signaling dirigé OmniPath (kinase-substrat + causal)."""
-    if not OMNIPATH_AVAILABLE:
+    if not _lazy_import_omnipath():
         return None
     df = _retry_fetch(
         "signaling/OmniPath",
@@ -312,7 +341,7 @@ def _fetch_signaling_omnipath(organism: str = "human") -> Optional[pd.DataFrame]
 
 def _fetch_collectri(organism: str = "human") -> Optional[pd.DataFrame]:
     """CollecTRI TF→target (méta-ressource curée 2023, ~1186 TFs)."""
-    if not OMNIPATH_AVAILABLE:
+    if not _lazy_import_omnipath():
         return None
     df = None
     # Endpoint dédié si dispo dans la version installée
@@ -360,7 +389,7 @@ def _fetch_dorothea(
     levels: Iterable[str] = ("A", "B", "C"),
 ) -> Optional[pd.DataFrame]:
     """DoRothEA TF→target (legacy fallback si CollecTRI absent)."""
-    if not OMNIPATH_AVAILABLE:
+    if not _lazy_import_omnipath():
         return None
     df = _retry_fetch(
         "DoRothEA",
@@ -400,7 +429,7 @@ def _fetch_signor_signed_ppi(organism: str = "human") -> Optional[pd.DataFrame]:
     AllInteractions, qui scannerait 11 datasets et pousserait le serveur
     omnipathdb.org en 502 sur les requêtes plus longues.
     """
-    if not OMNIPATH_AVAILABLE:
+    if not _lazy_import_omnipath():
         return None
     df = _retry_fetch(
         "SIGNOR",
