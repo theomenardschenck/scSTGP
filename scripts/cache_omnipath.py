@@ -83,8 +83,11 @@ def main():
         print(f"\n[cache_omnipath] SIGNOR importé manuellement : {n} liens")
         return
 
-    if not opi.OMNIPATH_AVAILABLE:
-        sys.exit("ERREUR : module `omnipath` non installé. "
+    # V4.1+ : omnipath est lazy-imported. Force le test ici puisque ce
+    # script existe précisément pour télécharger via la lib.
+    if not opi._lazy_import_omnipath():
+        sys.exit("ERREUR : module `omnipath` non installé OU "
+                 "GNN_OMNIPATH_OFFLINE=1. "
                  "Lance `pip install 'omnipath>=1.0.7'` dans l'env GNN.")
 
     os.makedirs(args.cache_dir, exist_ok=True)
