@@ -403,7 +403,7 @@ N_HEADS = 4
 DROPOUT = 0.2
 # N_EPOCHS : nombre maximal d'epochs (itérations complètes sur les données).
 #   L'early stopping arrêtera souvent avant (typiquement epoch 30-80).
-N_EPOCHS = 400
+N_EPOCHS = 500
 # LR : learning rate de l'optimiseur Adam. 0.005 est relativement élevé
 #   (typique des GNN qui convergent vite) mais compensé par le gradient
 #   clipping et le weight decay.
@@ -597,6 +597,11 @@ if (MODULES["include_omnipath_genes"]
     print("\n" + "=" * 70)
     print("2.5. Pré-chargement OmniPath (V4.1) — pour expansion gene_to_idx")
     print("=" * 70)
+    # Force le mode OFFLINE si l'utilisateur n'a pas autorisé le download :
+    # évite que `import omnipath` déclenche les metadata pre-fetches HTTP
+    # qui timeout 30+ min sur compute nodes Nautilus sans Internet.
+    if not CLI_ARGS.omnipath_download_if_missing:
+        os.environ["GNN_OMNIPATH_OFFLINE"] = "1"
     try:
         from omnipath_integration import (
             get_omnipath_endpoints as _opi_endpoints,
@@ -1319,6 +1324,10 @@ op_tf_attr = np.zeros((0, 2), dtype=np.float32)
 
 if MODULES["use_omnipath_signaling"] or MODULES["use_omnipath_tf_curated"]:
     print("\n  OmniPath (V4)…")
+    # Idem section 2.5 : force offline si download non autorisé (compute node).
+    # Idempotent (déjà fait en 2.5 si --include-omnipath-genes, no-op sinon).
+    if not CLI_ARGS.omnipath_download_if_missing:
+        os.environ["GNN_OMNIPATH_OFFLINE"] = "1"
     try:
         from omnipath_integration import (
             load_signaling_directed,
