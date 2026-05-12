@@ -1,7 +1,7 @@
 # ── Outputs et données (jamais versionnés) ──────────────────────────
 output/
 data/
-
+figures/
 # ── Python ──────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
