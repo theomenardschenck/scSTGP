@@ -453,6 +453,160 @@ def cmd_extract(args):
     print(f"[extract] done — {out_dir}")
 
 
+def compute_per_type_contribution(model, data, device: str = "cpu",
+                                  layer_idx: int | None = None,
+                                  ) -> pd.DataFrame:
+    """Computes ‖h_i^t‖_2 per (node, edge_type) at a given layer.
+
+    Reproduit le forward du HeteroEncoder layer par layer mais en
+    capturant la sortie de CHAQUE GATConv individuel AVANT l'agrégation
+    `HeteroConv(aggr="sum")`. Permet de comparer la magnitude effective
+    de la contribution de chaque edge_type au message-passing, par
+    opposition à α (concentration intra-type, §14bis.6).
+
+    Si layer_idx est None, on capture la DERNIÈRE couche.
+
+    Returns
+    -------
+    DataFrame long-format : (dst_node_type, node, edge_type, norm_l2,
+    norm_l2_normalized_by_dim).
+    """
+    import torch as _t
+    import torch.nn.functional as _F
+
+    encoder = model.encoder
+    encoder.eval()
+    n_layers = encoder.n_layers
+    if layer_idx is None:
+        layer_idx = n_layers - 1
+
+    # Initial projection
+    x_dict = {
+        "gene": _F.relu(encoder.gene_proj(data["gene"].x.to(device))),
+        "cell_group": _F.relu(encoder.cell_proj(data["cell_group"].x.to(device))),
+    }
+
+    edge_index_dict = {k: v.to(device) for k, v in data.edge_index_dict.items()}
+    edge_attr_dict = {}
+    for k in edge_index_dict:
+        if hasattr(data[k], "edge_attr") and data[k].edge_attr is not None:
+            edge_attr_dict[k] = data[k].edge_attr.to(device)
+
+    per_type_outputs: dict[tuple, _t.Tensor] = {}
+
+    # On reproduit le forward layer par layer mais en sauvant les
+    # sorties intermédiaires de la layer cible.
+    with _t.no_grad():
+        for i in range(n_layers):
+            hetero_conv = encoder.convs[i]
+            # Manuel : appliquer chaque GATConv séparément
+            new_per_type: dict[tuple, _t.Tensor] = {}
+            for edge_type, conv in hetero_conv.convs.items():
+                src_type, _rel, dst_type = edge_type
+                ei = edge_index_dict.get(edge_type)
+                if ei is None or ei.numel() == 0:
+                    continue
+                x_src = x_dict[src_type]
+                x_dst = x_dict[dst_type]
+                ed_dim = encoder.edge_dims.get(edge_type)
+                if ed_dim is not None and edge_attr_dict.get(edge_type) is not None:
+                    out = conv((x_src, x_dst), ei,
+                               edge_attr=edge_attr_dict[edge_type])
+                else:
+                    out = conv((x_src, x_dst), ei)
+                # Stocker la contribution pre-agrégation pour cette couche
+                if i == layer_idx:
+                    per_type_outputs[edge_type] = out.detach().cpu()
+                new_per_type.setdefault(dst_type, []).append(out)
+
+            # Agrégation HeteroConv-sum pour passer à la couche suivante
+            new_x_dict = {}
+            for node_type, outs in new_per_type.items():
+                stacked = _t.stack(outs, dim=0)
+                new_x_dict[node_type] = stacked.sum(dim=0)
+            # Garder les types non touchés
+            for k, v in x_dict.items():
+                if k not in new_x_dict:
+                    new_x_dict[k] = v
+
+            # Reproduire la norme + résiduel
+            x_prev = x_dict
+            x_dict = new_x_dict
+            for key in list(x_dict.keys()):
+                if key not in x_prev:
+                    continue
+                if x_dict[key] is x_prev[key]:
+                    continue
+                x_dict[key] = encoder.norms[i][key](x_dict[key])
+                x_dict[key] = _F.relu(x_dict[key])
+                # pas de dropout en eval
+                x_dict[key] = x_dict[key] + x_prev[key]
+
+    # Aggrégation L2 par (node, edge_type)
+    rows = []
+    n_genes = data["gene"].x.shape[0]
+    n_cells = data["cell_group"].x.shape[0]
+    for et, tensor in per_type_outputs.items():
+        src_type, _rel, dst_type = et
+        n_dst = n_genes if dst_type == "gene" else n_cells
+        # tensor a shape (n_dst, hidden). On calcule la norme par nœud.
+        norms = _t.linalg.norm(tensor, dim=1).numpy()
+        dim = tensor.shape[1]
+        for idx in range(n_dst):
+            rows.append({
+                "dst_node_type": dst_type,
+                "node_idx": idx,
+                "edge_type": f"{src_type}-{_rel}-{dst_type}",
+                "norm_l2": float(norms[idx]),
+                "norm_l2_normalized_by_dim": float(norms[idx] / np.sqrt(dim)),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def cmd_contribution(args):
+    """Calcule ‖h_i^t‖_2 par edge_type pour comparer les contributions
+    effectives au message-passing, complémentaire à l'attention α."""
+    run_dir = Path(args.run_dir).resolve()
+    out_dir = (Path(args.out_dir) if args.out_dir
+               else run_dir / "attention").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[contrib] loading run {run_dir.name} ...")
+    data, model, gene_symbols = load_run(run_dir, device=args.device)
+
+    print(f"[contrib] computing ‖h_i^t‖ at layer {args.layer if args.layer is not None else 'last'}...")
+    df = compute_per_type_contribution(model, data, device=args.device,
+                                       layer_idx=args.layer)
+
+    # Ajout du gene_symbol pour les nodes gene
+    sym_map = {i: g for i, g in enumerate(gene_symbols)}
+    df["node_name"] = df.apply(
+        lambda r: sym_map.get(r["node_idx"], f"{r['dst_node_type']}_{r['node_idx']}")
+        if r["dst_node_type"] == "gene"
+        else f"cell_group_{r['node_idx']}",
+        axis=1,
+    )
+
+    out_tsv = out_dir / "contribution_per_edge_type.tsv"
+    df.to_csv(out_tsv, sep="\t", index=False)
+    print(f"[contrib] wrote {out_tsv}  ({len(df)} rows)")
+
+    # Synthèse : norme moyenne par edge_type
+    summary = (df.groupby("edge_type")
+                 .agg(n_nodes=("node_idx", "size"),
+                      norm_mean=("norm_l2", "mean"),
+                      norm_median=("norm_l2", "median"),
+                      norm_p95=("norm_l2", lambda x: x.quantile(0.95)),
+                      norm_max=("norm_l2", "max"))
+                 .sort_values("norm_mean", ascending=False))
+    out_summary = out_dir / "contribution_summary.tsv"
+    summary.to_csv(out_summary, sep="\t")
+    print(f"\n[contrib] résumé ‖h_i^t‖ par edge_type :")
+    print(summary.to_string())
+    print(f"\n[contrib] wrote {out_summary}")
+
+
 def cmd_figure(args):
     df = pd.read_csv(args.attention_tsv, sep="\t")
     out_path = Path(args.out_path) if args.out_path else \
@@ -489,6 +643,18 @@ def main():
                     help="Aggregation across attention heads (default mean)")
     pe.add_argument("--device", default="cpu", help="cpu | cuda:0 | ...")
     pe.set_defaults(func=cmd_extract)
+
+    pc = sub.add_parser("contribution",
+                        help="Compute ‖h_i^t‖_2 per edge_type "
+                             "(complémentaire à l'attention α, cf. §14bis.6bis).")
+    pc.add_argument("--run-dir", required=True,
+                    help="Run dir containing hetero_graph_vgae.pt + vgae_weights.pt")
+    pc.add_argument("--out-dir", default=None,
+                    help="Output dir (default: <run-dir>/attention)")
+    pc.add_argument("--layer", type=int, default=None,
+                    help="Layer index (default: last)")
+    pc.add_argument("--device", default="cpu", help="cpu | cuda:0 | ...")
+    pc.set_defaults(func=cmd_contribution)
 
     pf = sub.add_parser("figure", help="Plot neighborhood figure from existing TSV.")
     pf.add_argument("--attention-tsv", required=True,
