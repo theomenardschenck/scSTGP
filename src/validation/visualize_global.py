@@ -1,38 +1,97 @@
 #!/usr/bin/env python3
 """
-visualize_global.py — Defense-ready cross-run visualisations.
+visualize_global.py — Figures de synthèse VGAE (single-version + cross-version).
 
-Produces global figures summarising the VGAE HUVEC senescence pipeline
-across multiple runs and versions (V2 without HuMess vs V3 with HuMess,
-three seeds each). Each subcommand generates one figure family.
+Génère les figures globales du pipeline VGAE HUVEC sénescence : UMAP du
+latent, réseau top-N par driver_score post-perturbation, comparaisons
+inter-versions, consensus cross-seed, vue d'ensemble perturbation.
 
-Subcommands
------------
-    umap            UMAP of gene embeddings colored by REACTOME pathway
-    network         Top-N gene network (PPI + metabolic cocatalysis)
-    v2_vs_v3        V2 vs V3 comparison panels (rank correlation, overlap, etc.)
-    consensus       Cross-seed V3 consensus (confidence A/B/C, stability)
+Tout est centré sur le **ranking post-perturbation** (`driver_score` du
+`cross_seed_gene_ranking.tsv` produit par `perturb_report.py
+--cross-seed`) ; fallback automatique sur `vgae_importance` si pas de
+report cross-seed trouvé.
+
+Sous-commandes
+--------------
+    analyze         (RECOMMANDÉ) Dispatcher 1 ou N versions :
+                    - 1 version  → UMAP + network top-N
+                    - N versions → 4 panneaux (Spearman ρ N×N, top-N
+                      sizes + intersection, pairwise overlap, top
+                      risers/fallers V0 vs V1) + TSV des scores alignés
+                    Score par défaut : driver_score. Sign-aware
+                    (signaling/tf_curated V4 split activation/inhibition).
+                    Arêtes orientées dessinées en flèches (src→dst), les
+                    *_by sont flippées pour pointer TF→target.
+
+    umap            UMAP latent en 3 panneaux : driver_score post-perturb
+                    (avec fallback vgae_importance), vgae_importance baseline,
+                    pathway REACTOME. Flags --score-col / --version-dir.
+    network         Top-N gene network (driver_score, sign-aware,
+                    arrows pour relations orientées)
+    v2_vs_v3        Comparaison V2 vs V3 (legacy, V2_*/V3_* hardcodés)
+    consensus       Consensus cross-seed (confidence A/B/C, stability)
     perturbation    Perturbation overview (before/after, key movers)
-    all             Run every subcommand with sensible defaults
+    all             Run every figure with defaults (legacy)
+
+Édge orientées (flèches)
+------------------------
+Le réseau distingue 2 familles d'arêtes :
+- **Orientées** (FancyArrowPatch src→dst) : `regulates` (pySCENIC TF
+  → target), `signaling` (V4 OmniPath kinase → substrat), `tf_curated`
+  (V4 CollecTRI TF → target). Les *_by transposées (regulated_by,
+  tf_curated_by) sont automatiquement flippées pour conserver la
+  direction canonique TF→target.
+- **Non-orientées** (lignes) : `ppi` (STRING), `coexpression`
+  (GRNBoost2), `same_pathway` (REACTOME), `metabolic_cocatalysis`
+  (HuMess).
+
+Paires bidirectionnelles (A→B ∧ B→A pour le même kind) sont courbées
+(rad=0.12) pour ne pas se chevaucher.
+
+Edges signées V4
+----------------
+Détecte automatiquement les edge_attr 2D avec composante signe ∈
+{−1, 0, +1} pour `signaling` et `tf_curated`. Les arêtes sont alors
+split en deux kinds visuels :
+- `<type>_activation` (vert, signe = +1)
+- `<type>_inhibition` (rouge, signe = −1)
+- unsigned (gris, signe = 0) — fallback pour V3 ou edges sans signe
 
 Usage
 -----
-    # Everything at once
-    python src/visualize_global.py all
+    # 1 version — UMAP + network top-100 par driver_score
+    python src/validation/visualize_global.py \\
+        --out-dir output/figures/V4_sig \\
+        analyze --versions output/gnn_vgae/V4.0/v4-sig.s1 --top-n 100
 
-    # Just the UMAP, with a specific run and pathway list
-    python src/visualize_global.py umap \\
-        --run-dir output/gnn_vgae/V3_Run3 \\
-        --pathways REACTOME_PEROXISOMAL_LIPID_METABOLISM \\
-                   REACTOME_ESCRT_DEPENDENT_MVB_BIOGENESIS \\
-                   REACTOME_POST_TRANSLATIONAL_MODIFICATION_GPI_ANCHOR_BIOSYNTHESIS
+    # N versions — comparaison cross-version (V3 vs V4 ablations)
+    python src/validation/visualize_global.py \\
+        --out-dir output/figures/cross \\
+        analyze --versions \\
+            output/gnn_vgae/V3.3/cross_seed_report \\
+            output/gnn_vgae/V4.0/cross_seed_v4-full_axisV4 \\
+            output/gnn_vgae/V4.0/cross_seed_v4-sig_axisV4 \\
+            output/gnn_vgae/V4.0/cross_seed_v4-tf_axisV4 \\
+        --score-col driver_score --top-n 100
 
-    # V2 vs V3 barplots over all available runs
-    python src/visualize_global.py v2_vs_v3
+    # Score alternatif (discovery, validation, ...)
+    python src/validation/visualize_global.py \\
+        --out-dir output/figures/discovery \\
+        analyze --versions output/gnn_vgae/V3.6/cross_seed_report \\
+        --score-col discovery_score
 
-Outputs
--------
-    output/gnn_vgae/global_figures/<figure_name>.png
+Sortie
+------
+    <out-dir>/single_<version>/        # mode 1 version
+        umap_<run>.png
+        network_top<N>_<run>.png
+    <out-dir>/cross_version/           # mode N versions
+        cross_version_<score>_top<N>.png
+        cross_version_<score>_scores.tsv
+        <version>/network_top<N>_<run>.png  # 1 network par version
+
+Cf. §19.9 du rapport pour la justification driver_score vs
+vgae_importance et §V4 pour la convention des edges signés.
 """
 
 from __future__ import annotations
@@ -254,7 +313,21 @@ def fig_umap(run_dir: Path,
              top_n_label: int = 15,
              n_neighbors: int = 30,
              min_dist: float = 0.2,
-             seed: int = 42) -> Path:
+             seed: int = 42,
+             score_col: str = "driver_score",
+             version_dir: Path | None = None) -> Path:
+    """UMAP du latent VGAE en 3 panneaux :
+      A — coloré par **driver_score** post-perturbation (défaut),
+          fallback `vgae_importance` si pas de cross-seed ranking.
+          score_col ∈ {driver_score, discovery_score, validation_score,
+          canon_diff, canon_cosine}.
+      B — coloré par `vgae_importance` baseline (référence centralité
+          graphe).
+      C — coloré par membership REACTOME (panel hérité).
+
+    `version_dir` (défaut `run_dir.parent`) sert à localiser
+    `cross_seed_gene_ranking.tsv` via `get_ranking_score`.
+    """
     import umap
 
     print(f"[umap] Loading embeddings from {run_dir.name} ...")
@@ -265,6 +338,24 @@ def fig_umap(run_dir: Path,
     common = [g for g in emb.index if g in ranking.index]
     emb = emb.loc[common]
     ranking = ranking.loc[common]
+
+    # Charger driver_score (ou autre score post-perturb) — fallback
+    # vgae_importance si pas de cross-seed ranking trouvé.
+    if version_dir is None:
+        version_dir = run_dir.parent
+    try:
+        scores = get_ranking_score(version_dir, score_col=score_col)
+        scores = scores.reindex(emb.index)
+        score_label = f"post-perturb {score_col}"
+        has_post_perturb = scores.notna().any()
+    except (FileNotFoundError, KeyError):
+        scores = pd.Series(np.nan, index=emb.index)
+        score_label = score_col
+        has_post_perturb = False
+
+    if not has_post_perturb:
+        print(f"[umap] no post-perturb {score_col} found, panel A falls "
+              f"back to vgae_importance only")
 
     print(f"[umap] {len(emb)} genes × {emb.shape[1]} dims — running UMAP ...")
     reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=min_dist,
@@ -277,37 +368,77 @@ def fig_umap(run_dir: Path,
         print(f"[umap] WARN — none of the requested pathways found in GMT; "
               f"falling back to DEFAULT_PATHWAYS filtered to existing.")
         pw_present = [p for p in DEFAULT_PATHWAYS if p in reactome]
-
-    # Colour palette
     palette = sns.color_palette("tab10", n_colors=len(pw_present))
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7.5))
+    # Layout 1×3 si on a un score post-perturbation distinct ; 1×2 sinon.
+    n_panels = 3 if has_post_perturb else 2
+    fig, axes = plt.subplots(1, n_panels, figsize=(8 * n_panels, 7.5))
+    if n_panels == 2:
+        axes = list(axes)
 
-    # Panel A : colored by importance (heatmap background)
-    ax = axes[0]
+    panel_idx = 0
+
+    # Panel A : coloré par driver_score (post-perturb) — seulement si dispo
+    if has_post_perturb:
+        ax = axes[panel_idx]
+        vals = scores.values
+        mask = ~np.isnan(vals)
+        # Background : gènes sans score (gris pâle)
+        if (~mask).any():
+            ax.scatter(xy[~mask, 0], xy[~mask, 1], s=4, c="#e0e0e0",
+                       alpha=0.4, linewidths=0)
+        # Foreground : trié par score croissant → top en dernier
+        idxs = np.where(mask)[0]
+        order = idxs[np.argsort(vals[idxs])]
+        sc = ax.scatter(xy[order, 0], xy[order, 1],
+                        c=vals[order],
+                        s=6, cmap="magma", alpha=0.85, linewidths=0)
+        cb = plt.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
+        cb.set_label(score_label)
+        # Annoter top-N par driver_score
+        top_genes = scores.dropna().nlargest(top_n_label).index
+        gene_to_i = {g: i for i, g in enumerate(emb.index)}
+        for g in top_genes:
+            if g in gene_to_i:
+                i = gene_to_i[g]
+                ax.annotate(g, (xy[i, 0], xy[i, 1]), fontsize=7,
+                            xytext=(3, 3), textcoords="offset points",
+                            color="black", fontweight="bold")
+        letter = chr(ord("A") + panel_idx)
+        ax.set_title(f"{letter} — UMAP coloré par {score_col} "
+                     f"(post-perturbation)\n"
+                     f"top-{top_n_label} drivers labellisés")
+        ax.set_xlabel("UMAP-1"); ax.set_ylabel("UMAP-2")
+        panel_idx += 1
+
+    # Panel B (ou A si pas de post-perturb) : vgae_importance baseline
+    ax = axes[panel_idx]
     order = ranking["vgae_importance"].argsort().values
     sc = ax.scatter(xy[order, 0], xy[order, 1],
                     c=ranking["vgae_importance"].iloc[order].values,
                     s=5, cmap="viridis", alpha=0.7, linewidths=0)
     cb = plt.colorbar(sc, ax=ax, fraction=0.04, pad=0.02)
     cb.set_label("vgae_importance")
-    # Annotate top-K
     top_genes = ranking.nlargest(top_n_label, "vgae_importance").index
+    gene_to_i = {g: i for i, g in enumerate(emb.index)}
     for g in top_genes:
-        i = list(emb.index).index(g)
-        ax.annotate(g, (xy[i, 0], xy[i, 1]), fontsize=7,
-                    xytext=(3, 3), textcoords="offset points",
-                    color="black")
-    ax.set_title(f"A — UMAP of VGAE latent space ({run_dir.name})\n"
-                 f"colored by importance, top-{top_n_label} labelled")
+        if g in gene_to_i:
+            i = gene_to_i[g]
+            ax.annotate(g, (xy[i, 0], xy[i, 1]), fontsize=7,
+                        xytext=(3, 3), textcoords="offset points",
+                        color="black")
+    letter = chr(ord("A") + panel_idx)
+    ax.set_title(f"{letter} — UMAP coloré par vgae_importance "
+                 f"(centralité baseline)\n"
+                 f"top-{top_n_label} labellisés")
     ax.set_xlabel("UMAP-1"); ax.set_ylabel("UMAP-2")
+    panel_idx += 1
 
-    # Panel B : colored by pathway membership
-    ax = axes[1]
+    # Dernier panel : coloré par pathway membership
+    ax = axes[panel_idx]
     ax.scatter(xy[:, 0], xy[:, 1], s=4, c="#d8d8d8", alpha=0.4, linewidths=0,
                label="other")
     gene_to_i = {g: i for i, g in enumerate(emb.index)}
-    legend_counts = []
     for pw, col in zip(pw_present, palette):
         idxs = [gene_to_i[g] for g in reactome[pw] if g in gene_to_i]
         if not idxs:
@@ -318,9 +449,8 @@ def fig_umap(run_dir: Path,
         ax.scatter(xy[idxs, 0], xy[idxs, 1], s=18, color=col,
                    alpha=0.85, linewidths=0.3, edgecolor="white",
                    label=f"{label} (n={len(idxs)})")
-        legend_counts.append((pw, len(idxs)))
-
-    ax.set_title("B — UMAP colored by REACTOME pathway membership")
+    letter = chr(ord("A") + panel_idx)
+    ax.set_title(f"{letter} — UMAP coloré par pathway REACTOME")
     ax.set_xlabel("UMAP-1"); ax.set_ylabel("UMAP-2")
     ax.legend(loc="best", fontsize=7, frameon=True, markerscale=1.2)
 
@@ -400,8 +530,15 @@ def fig_network(run_dir: Path,
     # Collect edges restricted to top-N. Pour les types signés (V4
     # signaling / tf_curated), on dispatche dans des "kinds" virtuels
     # _activation / _inhibition selon le signe ∈ {−1, 0, +1}.
+    # Pour les types orientés (regulates/signaling/tf_curated), on
+    # PRÉSERVE l'orientation src→dst (pas de canonisation min/max).
+    # `flip=True` inverse l'orientation pour les relations *_by qui
+    # sont la transposée de leur version directe (ex: regulated_by
+    # est la transposée de regulates).
     def edges_for(rel: tuple[str, str, str],
-                  split_sign: bool = False) -> dict[str, list[tuple[int, int]]]:
+                  split_sign: bool = False,
+                  directed: bool = False,
+                  flip: bool = False) -> dict[str, list[tuple[int, int]]]:
         if rel not in data.edge_types:
             return {}
         ei = data[rel].edge_index.cpu().numpy()
@@ -415,7 +552,13 @@ def fig_network(run_dir: Path,
             s, d = int(ei[0, k]), int(ei[1, k])
             if s not in top_idx or d not in top_idx or s == d:
                 continue
-            pair = (int(min(s, d)), int(max(s, d)))
+            if directed:
+                if flip:
+                    pair = (d, s)
+                else:
+                    pair = (s, d)
+            else:
+                pair = (int(min(s, d)), int(max(s, d)))
             if attr is None or attr.shape[1] < 2:
                 bucket["unsigned"].add(pair)
                 continue
@@ -428,25 +571,29 @@ def fig_network(run_dir: Path,
                 bucket["unsigned"].add(pair)
         return {k: list(v) for k, v in bucket.items() if v}
 
-    # All gene-gene relations we display. Order = priority when an edge
-    # exists under several types: the earlier type wins the visible style,
-    # and the rest are stored in the "extra" set for the tooltip/title.
+    # All gene-gene relations we display. Tuple : (kind, edge_type,
+    # split_sign, directed, flip). `flip=True` pour les *_by qui sont
+    # la transposée de leur direction canonique TF→target.
     # V4 signaling / tf_curated sont splittés activation/inhibition.
-    edge_kinds: list[tuple[str, tuple[str, str, str], bool]] = [
-        ("ppi",          ("gene", "ppi", "gene"), False),
-        ("cocat",        ("gene", "metabolic_cocatalysis", "gene"), False),
-        ("pathway",      ("gene", "same_pathway", "gene"), False),
-        ("regulates",    ("gene", "regulates", "gene"), False),
-        ("regulates",    ("gene", "regulated_by", "gene"), False),
-        ("coexpression", ("gene", "coexpression", "gene"), False),
-        ("signaling",    ("gene", "signaling", "gene"), True),
-        ("tf_curated",   ("gene", "tf_curated", "gene"), True),
-        ("tf_curated",   ("gene", "tf_curated_by", "gene"), True),
+    edge_kinds: list[tuple[str, tuple[str, str, str], bool, bool, bool]] = [
+        ("ppi",          ("gene", "ppi", "gene"),                  False, False, False),
+        ("cocat",        ("gene", "metabolic_cocatalysis", "gene"), False, False, False),
+        ("pathway",      ("gene", "same_pathway", "gene"),         False, False, False),
+        ("regulates",    ("gene", "regulates", "gene"),            False, True,  False),
+        ("regulates",    ("gene", "regulated_by", "gene"),         False, True,  True),
+        ("coexpression", ("gene", "coexpression", "gene"),         False, False, False),
+        ("signaling",    ("gene", "signaling", "gene"),            True,  True,  False),
+        ("tf_curated",   ("gene", "tf_curated", "gene"),           True,  True,  False),
+        ("tf_curated",   ("gene", "tf_curated_by", "gene"),        True,  True,  True),
     ]
+    DIRECTED_KINDS = {"regulates", "signaling", "tf_curated",
+                      "signaling_activation", "signaling_inhibition",
+                      "tf_curated_activation", "tf_curated_inhibition"}
     edge_sets: dict[str, list[tuple[int, int]]] = {}
-    for kind, rel, split in edge_kinds:
+    for kind, rel, split, directed, flip in edge_kinds:
         is_signed = signed_types.get(rel, False) and split
-        buckets = edges_for(rel, split_sign=is_signed)
+        buckets = edges_for(rel, split_sign=is_signed,
+                            directed=directed, flip=flip)
         for sign_kind, pairs in buckets.items():
             display_kind = (f"{kind}_{sign_kind}"
                             if is_signed and sign_kind != "unsigned"
@@ -456,17 +603,20 @@ def fig_network(run_dir: Path,
     print(f"[network] top-{top_n} genes — edges by kind: "
           + ", ".join(f"{k}={len(set(v))}" for k, v in edge_sets.items()))
 
-    # Build graph
+    # Build graph — Graph non-orienté pour le layout (spring). Les
+    # arêtes orientées seront dessinées séparément via FancyArrowPatch.
     G = nx.Graph()
     for g in top:
         if g in gene_to_idx:
             G.add_node(gene_to_idx[g], symbol=g)
     for kind, pairs in edge_sets.items():
         for s, d in set(pairs):
-            if G.has_edge(s, d):
-                G[s][d]["kinds"].add(kind)
+            # Pour le layout uniquement, on canonise min/max
+            u, v = (min(s, d), max(s, d))
+            if G.has_edge(u, v):
+                G[u][v]["kinds"].add(kind)
             else:
-                G.add_edge(s, d, kinds={kind})
+                G.add_edge(u, v, kinds={kind})
 
     # Score for sizing / coloring — driver_score si dispo, sinon baseline
     imp = scores.reindex(top).fillna(0.0).to_dict()
@@ -544,20 +694,58 @@ def fig_network(run_dir: Path,
                                   "width": 1.1, "label": "TF curated (unsigned)"},
     }
     # Draw in the defined order (faint relations first, so strong
-    # relations are drawn on top).
+    # relations are drawn on top). Undirected kinds → lignes via
+    # `ax.plot`. Directed kinds → flèches via `FancyArrowPatch`
+    # (src→dst), avec courbure légère pour distinguer les paires
+    # bidirectionnelles (A→B et B→A simultanées).
+    from matplotlib.patches import FancyArrowPatch
+
     drawn_labels: set[str] = set()
     kind_counts: dict[str, int] = {k: 0 for k in kind_styles}
+
+    # Indexer les paires bidirectionnelles par kind : si (a, b) et (b, a)
+    # existent toutes deux pour le même kind, on courbe les flèches.
     for kind, style in kind_styles.items():
-        for u, v, d in G.edges(data=True):
-            if kind not in d["kinds"]:
+        is_directed = kind in DIRECTED_KINDS
+        if is_directed:
+            pairs = list(set(edge_sets.get(kind, [])))
+            if not pairs:
                 continue
-            kind_counts[kind] += 1
-            lbl = style["label"] if style["label"] not in drawn_labels else None
-            drawn_labels.add(style["label"])
-            ax.plot([pos[u][0], pos[v][0]], [pos[u][1], pos[v][1]],
-                    color=style["color"], alpha=style["alpha"],
-                    linewidth=style["width"], label=lbl, zorder=1,
-                    solid_capstyle="round")
+            reverse_set = {(d, s) for s, d in pairs}
+            bidir = {p for p in pairs if p in reverse_set}
+            for s, d in pairs:
+                if s not in pos or d not in pos:
+                    continue
+                kind_counts[kind] += 1
+                lbl = style["label"] if style["label"] not in drawn_labels else None
+                drawn_labels.add(style["label"])
+                # Courber les paires bidirectionnelles, sinon ligne droite
+                rad = 0.12 if (s, d) in bidir else 0.0
+                arrow = FancyArrowPatch(
+                    pos[s], pos[d],
+                    arrowstyle="-|>",
+                    mutation_scale=10,
+                    color=style["color"],
+                    alpha=style["alpha"],
+                    linewidth=style["width"],
+                    connectionstyle=f"arc3,rad={rad}",
+                    shrinkA=4.5, shrinkB=4.5,   # offset pour ne pas chevaucher les nœuds
+                    zorder=2,
+                    label=lbl,
+                )
+                ax.add_patch(arrow)
+        else:
+            # Undirected : tracé ligne via G.edges() (déduplique min/max)
+            for u, v, d in G.edges(data=True):
+                if kind not in d["kinds"]:
+                    continue
+                kind_counts[kind] += 1
+                lbl = style["label"] if style["label"] not in drawn_labels else None
+                drawn_labels.add(style["label"])
+                ax.plot([pos[u][0], pos[v][0]], [pos[u][1], pos[v][1]],
+                        color=style["color"], alpha=style["alpha"],
+                        linewidth=style["width"], label=lbl, zorder=1,
+                        solid_capstyle="round")
 
     # Nodes — smaller to let edges breathe; scaled by importance
     xs = [pos[n][0] for n in G.nodes]
@@ -1203,7 +1391,8 @@ def fig_analyze(versions: list[Path],
                 f"No hetero_graph_vgae.pt found under {v} — "
                 f"pass --reference-run explicitly.")
         sub_out = ensure_out_dir(out_dir / f"single_{v.name}")
-        paths.append(fig_umap(run, pathways, sub_out))
+        paths.append(fig_umap(run, pathways, sub_out,
+                              score_col=score_col, version_dir=v))
         paths.append(fig_network(run, sub_out, top_n=top_n,
                                  score_col=score_col, version_dir=v))
         return paths
@@ -1241,13 +1430,21 @@ def main():
                     help=f"Output directory (default: {OUT_ROOT_DEFAULT}).")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("umap", help="UMAP of VGAE embeddings coloured by pathway")
+    s = sub.add_parser("umap", help="UMAP de l'espace latent VGAE (driver_score + vgae_importance + pathway)")
     s.add_argument("--run-dir", type=Path, default=RUNS_ROOT / "V3_Run3")
     s.add_argument("--pathways", nargs="+", default=DEFAULT_PATHWAYS)
     s.add_argument("--top-n-label", type=int, default=15)
     s.add_argument("--n-neighbors", type=int, default=30)
     s.add_argument("--min-dist", type=float, default=0.2)
     s.add_argument("--seed", type=int, default=42)
+    s.add_argument("--score-col", default="driver_score",
+                   choices=["driver_score", "discovery_score",
+                            "validation_score", "canon_diff", "canon_cosine"],
+                   help="Colonne post-perturb pour le panel A (défaut driver_score). "
+                        "Fallback vgae_importance si non trouvée.")
+    s.add_argument("--version-dir", type=Path, default=None,
+                   help="Dossier contenant cross_seed_gene_ranking.tsv. "
+                        "Défaut : parent de --run-dir.")
 
     s = sub.add_parser("network", help="Top-N gene network (PPI + cocatalysis)")
     s.add_argument("--run-dir", type=Path, default=RUNS_ROOT / "V3_Run3")
@@ -1292,7 +1489,8 @@ def main():
 
     if args.cmd == "umap":
         fig_umap(args.run_dir, args.pathways, out_dir,
-                 args.top_n_label, args.n_neighbors, args.min_dist, args.seed)
+                 args.top_n_label, args.n_neighbors, args.min_dist, args.seed,
+                 score_col=args.score_col, version_dir=args.version_dir)
     elif args.cmd == "network":
         fig_network(args.run_dir, out_dir, args.top_n, args.seed)
     elif args.cmd == "v2_vs_v3":
