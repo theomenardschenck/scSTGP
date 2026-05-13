@@ -886,12 +886,42 @@ print("\n" + "=" * 70)
 print("5. Features des noeuds (topologiques)")
 print("=" * 70)
 
-# Feature 1 : is_tf — binaire, 1.0 si le gène est un TF détecté par pySCENIC.
-# Les TFs sont identifiés par leur présence comme régulateur dans les regulons.
+# Feature 1 : is_tf — binaire, 1.0 si le gène est un TF.
+# V3 : pySCENIC uniquement (~62 TFs après filtres motif + expression HUVEC).
+# V4.1+ : union pySCENIC ∪ CollecTRI sources lorsque
+# --use-omnipath-tf-curated est actif. CollecTRI (Müller-Dott 2023) couvre
+# ~1186 TFs curés depuis la littérature ; intersection avec les gènes
+# mesurés (gene_symbols) garantit qu'on n'invente aucun TF hors scRNA.
+# Permet à la logique TF-aware downstream (suffixe interpretation,
+# threshold B_discovery relaxé) de couvrir tous les TFs curés, pas
+# uniquement le sous-ensemble pySCENIC.
 scenic_tfs = set(regulon_edges["TF_clean"].unique())
-is_tf = np.array([1.0 if g in scenic_tfs else 0.0 for g in gene_symbols],
+collectri_tfs: set[str] = set()
+if MODULES["use_omnipath_tf_curated"]:
+    _collectri_cache = os.path.join(OMNIPATH_CACHE_DIR, "tf_collectri.tsv.gz")
+    if os.path.exists(_collectri_cache):
+        try:
+            import gzip as _gz
+            with _gz.open(_collectri_cache, "rt") as _f:
+                next(_f, None)  # header
+                for _line in _f:
+                    _src = _line.split("\t", 1)[0]
+                    # On exclut les hétérodimères type "NFKB1_REL"
+                    if _src and "_" not in _src:
+                        collectri_tfs.add(_src)
+            print(f"  is_tf : CollecTRI source TFs lus = {len(collectri_tfs)} "
+                  f"(union avec pySCENIC ci-dessous)")
+        except Exception as _e:
+            print(f"  is_tf : [warn] lecture CollecTRI échouée ({_e}) — "
+                  f"on garde pySCENIC seul")
+    else:
+        print(f"  is_tf : [warn] cache CollecTRI absent à {_collectri_cache} — "
+              f"on garde pySCENIC seul")
+all_tfs = scenic_tfs | collectri_tfs
+is_tf = np.array([1.0 if g in all_tfs else 0.0 for g in gene_symbols],
                  dtype=np.float32)
-print(f"  is_tf : {int(is_tf.sum())} TFs")
+print(f"  is_tf : pySCENIC={len(scenic_tfs)} + CollecTRI={len(collectri_tfs)} "
+      f"→ union ∩ available = {int(is_tf.sum())} TFs")
 
 # Feature 2 : variance_across_groups — variance de l'expression moyenne entre
 # les 5 groupes cellulaires. Calculée sur les mean_expression déjà calculées

@@ -1752,7 +1752,17 @@ def _load_is_tf(seed_paths: list[Path]) -> pd.Series:
     Source : pySCENIC-detected TFs in HUVEC (regulons with motif support,
     ~62 genes — restricted set). Returns Series indexed by gene symbol,
     values ∈ {0.0, 1.0}.
+
+    Post-hoc augmentation (V4.1+) : if the OmniPath CollecTRI cache exists
+    at `data/omnipath/tf_collectri.tsv.gz`, the returned series is OR-ed
+    with the CollecTRI source_symbol set (monomeric TFs only, ~1186) so
+    that the TF-aware downstream logic (interpretation suffix, B_discovery
+    threshold relaxation) covers all curated TFs, not only the pySCENIC
+    HUVEC-restricted subset. This does NOT modify the trained graph — the
+    GNN itself still sees only the original 62 TFs as 1.0 in feature[:,0].
+    Fix at the training level is planned for V5 (cf. §17 V4.1 du rapport).
     """
+    series = pd.Series(dtype=float)
     for seed in seed_paths:
         graph_p = seed / "hetero_graph_vgae.pt"
         emb_p = seed / "gene_embeddings_vgae.csv"
@@ -1764,10 +1774,43 @@ def _load_is_tf(seed_paths: list[Path]) -> pd.Series:
             emb = pd.read_csv(emb_p, index_col=0)
             genes = list(emb.index.astype(str))
             x = data["gene"].x.numpy()
-            return pd.Series(x[:, 0], index=genes, name="is_tf")
+            series = pd.Series(x[:, 0], index=genes, name="is_tf")
+            break
         except Exception:
             continue
-    return pd.Series(dtype=float)
+    if series.empty:
+        return series
+
+    cache_candidates = [
+        Path("data/omnipath/tf_collectri.tsv.gz"),
+        Path(__file__).resolve().parents[2] / "data" / "omnipath" / "tf_collectri.tsv.gz",
+    ]
+    for cache in cache_candidates:
+        if not cache.exists():
+            continue
+        try:
+            import gzip
+            collectri_tfs: set[str] = set()
+            with gzip.open(cache, "rt") as f:
+                next(f, None)  # header
+                for line in f:
+                    src = line.split("\t", 1)[0]
+                    if src and "_" not in src:  # drop heterodimers like NFKB1_REL
+                        collectri_tfs.add(src)
+            if not collectri_tfs:
+                break
+            extra = collectri_tfs & set(series.index)
+            n_before = int(series.sum())
+            series = series.copy()
+            series.loc[list(extra)] = 1.0
+            n_after = int(series.sum())
+            print(f"  [is_tf] pySCENIC = {n_before}, "
+                  f"+CollecTRI ∩ available = {len(extra)}, "
+                  f"union = {n_after}")
+        except Exception as e:
+            print(f"  [is_tf] CollecTRI augmentation skipped: {e}")
+        break
+    return series
 
 
 def _load_reactome_pathways() -> dict[str, set[str]]:
