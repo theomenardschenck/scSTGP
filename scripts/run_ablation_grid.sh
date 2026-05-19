@@ -8,13 +8,19 @@
 #
 # Interface : produit cartésien `--version × --ablations`.
 #
-# --version {V3, V4, V4.1, V4_1}   (défaut : V4.1)
-#     Définit les 4 configs de base à tester (baseline / sig / tf / full).
+# --version {V3, V4, V4.1, V4.2, V4_1, V4_2}   (défaut : V4.1)
+#     Définit les configs de base à tester.
 #         V3   : 1 config (full, no OmniPath, no flags). Reproduit V3.6 baseline.
 #         V4   : 4 configs avec edge_types `signaling` / `tf_curated` opt-in.
 #                tags v4-{baseline,sig,tf,full}.
 #         V4.1 : V4 + `--include-omnipath-genes` (étend gene_to_idx avec
 #                endpoints OmniPath). tags v4.1-{baseline,sig,tf,full}.
+#         V4.2 : 5 configs sur base V4.1-full + 3 leviers toggleable :
+#                coexpr différentielle P4∪P16, γ_t par edge_type,
+#                Reactome FI. tags v4.2-{full,coexdiff,coexdiff.gw,
+#                coexdiff.rfi,coexdiff.gw.rfi}. PRÉREQUIS :
+#                bash scripts/run_diff_coexpr.sh + cache_reactome_fi.sh.
+#                Cf. §14bis.6octies du rapport.
 #
 # --ablations <list>     (défaut : "" = juste les 4 configs base, AKA validation)
 #     Liste séparée par virgules. Chaque entrée peut être :
@@ -76,6 +82,7 @@ MODE=""                        # legacy alias
 MAX_PARALLEL=10
 TIME_LIMIT="0-02:00:00"
 DRY_RUN=0
+DATA_ROOT_CLI=""               # --data-root (override DATA_ROOT)
 
 # --- Parsing CLI ------------------------------------------------------------
 SEEDS=("${DEFAULT_SEEDS[@]}")
@@ -88,6 +95,7 @@ while [[ $# -gt 0 ]]; do
         --seeds)          IFS=' ' read -r -a SEEDS <<< "$2"; shift 2 ;;
         --max-parallel)   MAX_PARALLEL="$2"; shift 2 ;;
         --time)           TIME_LIMIT="$2"; shift 2 ;;
+        --data-root)      DATA_ROOT_CLI="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,75p' "$0"; exit 0 ;;
         *) echo "Argument inconnu : $1"; exit 1 ;;
@@ -105,8 +113,9 @@ case "$MODE" in
     *) echo "Mode legacy inconnu : $MODE"; exit 1 ;;
 esac
 
-# Normalisation : V4_1 → V4.1 pour éviter pièges shell
+# Normalisation : V4_1 → V4.1 / V4_2 → V4.2 pour éviter pièges shell
 [[ "$VERSION" == "V4_1" ]] && VERSION="V4.1"
+[[ "$VERSION" == "V4_2" ]] && VERSION="V4.2"
 
 # --- Définition des sub-configs par version ---------------------------------
 # Format : "<tag>::<flags>" — flags passés tels quels à gnn_vgae.py.
@@ -135,8 +144,24 @@ case "$VERSION" in
             "v4.1-full::$OP_SIG $OP_TF $OP_INC"
         )
         ;;
+    V4.2)
+        # V4.2 = V4.1-full + 3 leviers toggleable (cf. §14bis.6octies).
+        # Prérequis : coexpr_diff.tsv (bash scripts/run_diff_coexpr.sh)
+        # + cache Reactome FI (bash scripts/cache_reactome_fi.sh).
+        V41_FULL="$OP_SIG $OP_TF $OP_INC"
+        COEXDIFF="--coexpr-mode differential"
+        GW="--edge-type-weights ppi=0.1,coexpression=0.5"
+        RFI="--use-reactome-fi"
+        BASE_CONFIGS=(
+            "v4.2-full::$V41_FULL"
+            "v4.2-coexdiff::$V41_FULL $COEXDIFF"
+            "v4.2-coexdiff.gw::$V41_FULL $COEXDIFF $GW"
+            "v4.2-coexdiff.rfi::$V41_FULL $COEXDIFF $RFI"
+            "v4.2-coexdiff.gw.rfi::$V41_FULL $COEXDIFF $GW $RFI"
+        )
+        ;;
     *)
-        echo "Version inconnue : $VERSION (V3 | V4 | V4.1)"; exit 1 ;;
+        echo "Version inconnue : $VERSION (V3 | V4 | V4.1 | V4.2)"; exit 1 ;;
 esac
 
 # --- Parsing de --ablations en variantes -----------------------------------
@@ -232,6 +257,14 @@ fi
 # --- Préparation logs + configs.tsv ----------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# DATA_ROOT : racine des données d'ENTRÉE. DOIT correspondre à ce que
+# gnn_vgae.py lit réellement (cf. gnn_vgae.py:381-382, BASE_DIR/data sur
+# LAB-DATA). PROJECT_DIR est sur /scratch (code), mais les données
+# (omnipath, pyscenic, reactome_fi) sont sur /LAB-DATA → le garde-fou
+# DOIT vérifier LAB-DATA, pas $PROJECT_DIR/data. Override : --data-root
+# ou env GNN_DATA_ROOT.
+# Précédence : --data-root > env GNN_DATA_ROOT > défaut (= gnn_vgae.py:381)
+DATA_ROOT="${DATA_ROOT_CLI:-${GNN_DATA_ROOT:-/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data}}"
 TS="$(date +%Y%m%d_%H%M%S)"
 # Slug court pour identifier le run dans le LOG_DIR
 ABL_SLUG="${ABLATIONS//,/_}"
@@ -263,17 +296,44 @@ echo "[grid] time      : $TIME_LIMIT par tâche"
 echo "[grid] seeds     : ${SEEDS[*]}"
 echo
 
-# --- Sécurité : prévenir si le cache OmniPath manque ------------------------
-if [[ "$VERSION" == "V4" || "$VERSION" == "V4.1" ]]; then
-    CACHE_TF="$PROJECT_DIR/data/omnipath/tf_collectri.tsv.gz"
-    CACHE_SIG="$PROJECT_DIR/data/omnipath/signed_ppi_signor.tsv.gz"
+# --- Sécurité : prérequis vérifiés sur DATA_ROOT (= ce que gnn_vgae.py
+#     lit réellement, LAB-DATA), PAS $PROJECT_DIR/data (scratch, code) ---
+echo "[grid] data root : $DATA_ROOT  (doit = gnn_vgae.py BASE_DIR/data)"
+if [[ ! -d "$DATA_ROOT" ]]; then
+    echo "[warn] DATA_ROOT introuvable : $DATA_ROOT"
+    echo "       Vérifie qu'il correspond à gnn_vgae.py:381 (LAB_DIR/gnn/data)."
+    echo "       Override : --data-root <path> ou export GNN_DATA_ROOT=<path>"
+fi
+if [[ "$VERSION" == "V4" || "$VERSION" == "V4.1" || "$VERSION" == "V4.2" ]]; then
+    CACHE_TF="$DATA_ROOT/omnipath/tf_collectri.tsv.gz"
+    CACHE_SIG="$DATA_ROOT/omnipath/signed_ppi_signor.tsv.gz"
     if [[ ! -f "$CACHE_TF" ]]; then
         echo "[warn] cache OmniPath TF absent : $CACHE_TF"
-        echo "       lance d'abord : python scripts/cache_omnipath.py --cache-dir data/omnipath"
+        echo "       lance d'abord : python scripts/cache_omnipath.py --cache-dir $DATA_ROOT/omnipath"
     fi
     if [[ ! -f "$CACHE_SIG" ]]; then
         echo "[warn] cache OmniPath SIGNOR absent : $CACHE_SIG"
         echo "       (les arêtes signaling seront vides — runs +sig dégradés)"
+    fi
+fi
+
+# --- Sécurité V4.2 : prérequis coexpr différentiel + Reactome FI -----------
+if [[ "$VERSION" == "V4.2" ]]; then
+    DIFF_FILE="$DATA_ROOT/pyscenic/diff_coexpr/coexpr_diff.tsv"
+    RFI_FILE="$DATA_ROOT/reactome_fi/FIsInGene_with_annotations.txt"
+    if [[ ! -f "$DIFF_FILE" ]]; then
+        echo "[err] coexpr_diff.tsv absent : $DIFF_FILE"
+        echo "      Lance d'abord (workflow en 2 étapes découplées) :"
+        echo "        1. python src/preprocess/build_diff_coexpr.py extract-matrices \\"
+        echo "             --gene-universe graph --graph-genes <cross_seed_gene_ranking.tsv>"
+        echo "        2. bash scripts/run_diff_coexpr.sh --step grnboost2"
+        echo "        3. (attendre) bash scripts/run_diff_coexpr.sh --step merge"
+        exit 1
+    fi
+    if [[ ! -f "$RFI_FILE" ]]; then
+        echo "[warn] Reactome FI absent : $RFI_FILE"
+        echo "       Les configs *.rfi auront un edge_type reactome_fi vide."
+        echo "       Lance : bash scripts/cache_reactome_fi.sh $DATA_ROOT/reactome_fi"
     fi
 fi
 
