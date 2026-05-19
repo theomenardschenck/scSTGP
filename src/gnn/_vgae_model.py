@@ -32,6 +32,19 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv, HeteroConv
 
 
+class _ScaledConv(nn.Module):
+    """Wrapper V4.2 : multiplie la sortie d'un conv par γ_t fixe.
+    Cf. gnn_vgae.py — synchronisé manuellement (Tier 2.5)."""
+
+    def __init__(self, conv: nn.Module, gamma: float):
+        super().__init__()
+        self.conv = conv
+        self.gamma = float(gamma)
+
+    def forward(self, *args, **kwargs):
+        return self.conv(*args, **kwargs) * self.gamma
+
+
 class HeteroEncoder(nn.Module):
     """Encoder hétérogène multi-couches pour le VGAE. Cf. gnn_vgae.py §8."""
 
@@ -47,11 +60,15 @@ class HeteroEncoder(nn.Module):
         (("gene", "signaling", "gene"), 2),
         (("gene", "tf_curated", "gene"), 2),
         (("gene", "tf_curated_by", "gene"), 2),
+        (("gene", "reactome_fi", "gene"), 2),  # V4.2
     ]
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
-                 n_heads=4, dropout=0.2, available_edge_types=None):
+                 n_heads=4, dropout=0.2, available_edge_types=None,
+                 edge_dim_overrides=None, edge_type_weights=None):
         super().__init__()
+        self._edge_dim_overrides = edge_dim_overrides or {}
+        self._edge_type_weights = edge_type_weights or {}
         self.n_layers = n_layers
         head_dim = hidden // n_heads
 
@@ -75,7 +92,20 @@ class HeteroEncoder(nn.Module):
                 "HeteroEncoder : aucun edge_type actif. Vérifie --no-* / la "
                 "présence de data.edge_types."
             )
+        if self._edge_dim_overrides:
+            edge_types_dims = [
+                (et, self._edge_dim_overrides.get(et, dim))
+                for et, dim in edge_types_dims
+            ]
         self.edge_dims = {et: dim for et, dim in edge_types_dims}
+
+        def _resolve_gamma(et):
+            if et in self._edge_type_weights:
+                return float(self._edge_type_weights[et])
+            if et[1] in self._edge_type_weights:
+                return float(self._edge_type_weights[et[1]])
+            return 1.0
+        self.edge_gammas = {et: _resolve_gamma(et) for et, _ in edge_types_dims}
 
         for _ in range(n_layers):
             conv_dict = {}
@@ -84,7 +114,9 @@ class HeteroEncoder(nn.Module):
                                    dropout=dropout, add_self_loops=False)
                 if ed is not None:
                     conv_kwargs["edge_dim"] = ed
-                conv_dict[et] = GATConv(hidden, head_dim, **conv_kwargs)
+                _gat = GATConv(hidden, head_dim, **conv_kwargs)
+                _g = self.edge_gammas.get(et, 1.0)
+                conv_dict[et] = (_ScaledConv(_gat, _g) if _g != 1.0 else _gat)
             self.convs.append(HeteroConv(conv_dict, aggr="sum"))
             self.norms.append(nn.ModuleDict({
                 "gene": nn.BatchNorm1d(hidden),
