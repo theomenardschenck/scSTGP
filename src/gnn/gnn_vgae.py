@@ -17,13 +17,28 @@ ARCHITECTURE :
                               PAS de log2FC/padj (supprime la circularité)
      - Noeuds "cell_group" : 5 groupes (P4, P16_cluster_0..3)
      - Arêtes "expresses"  : mean_expr, pct, std, cv, q25, q75, tf_activity
-     - Arêtes "ppi"        : STRING (combined_score)
+     - Arêtes "ppi"        : STRING (combined_score, unsigned)
      - Arêtes "regulates"  : pySCENIC TF→cible (weight)
      - Arêtes "same_pathway" : REACTOME
-     - Arêtes "coexpression" : GRNBoost2 (top 2%)
+     - Arêtes "coexpression" : GRNBoost2 P16 (V4.1) OU différentiel
+                               P4∪P16 (V4.2, --coexpr-mode differential,
+                               edge_dim=6 option A)
+     - Arêtes "signaling"/"tf_curated" : OmniPath/SIGNOR/CollecTRI signé (V4)
+     - Arêtes "reactome_fi"  : Reactome Functional Interactions signé
+                               (V4.2, --use-reactome-fi)
 
   2. VGAE : encoder HeteroGNN (GATConv) → μ, σ → z ~ N(μ,σ²) → decoder (inner product)
      Loss = reconstruction des arêtes + KL divergence
+     V4.2 : pondération γ_t par edge_type au niveau message
+            (--edge-type-weights, _ScaledConv ; cf. §14bis.6octies rapport)
+
+  CHANGELOG en-tête :
+   - V4   : OmniPath signed (signaling + tf_curated), edge_dim=2
+   - V4.1 : --include-omnipath-genes (endpoints OmniPath dans gene set)
+   - V4.1.1 : is_tf = pySCENIC ∪ CollecTRI (section 5)
+   - V4.2 : coexpr différentielle P4∪P16 (option A, edge_dim 1→6),
+            γ_t par edge_type (_ScaledConv message-level),
+            Reactome FI signé (edge_type 'reactome_fi')
 
   3. Score d'importance émergent :
      - Centralité dans l'espace latent (norme de μ)
@@ -150,6 +165,46 @@ def _parse_cli_args():
                         "Requiert --use-omnipath-signaling et/ou "
                         "--use-omnipath-tf-curated.")
 
+    # --- V4.2 : coexpression différentielle P4∪P16 (option A) ---
+    p.add_argument("--coexpr-mode", choices=["p16_only", "differential"],
+                   default="p16_only",
+                   help="V4.2 : 'p16_only' = adjacencies.csv GRNBoost2 P16 "
+                        "(comportement V4.1, edge_dim=1) ; 'differential' = "
+                        "coexpr_diff.tsv (P4∪P16, option A, edge_dim=6 : "
+                        "imp_p4, imp_p16, delta, cat_shared/p4/p16). "
+                        "Cf. build_diff_coexpr.py + §V4.2 du rapport.")
+    p.add_argument("--diff-coexpr-file",
+                   default="data/pyscenic/diff_coexpr/coexpr_diff.tsv",
+                   help="V4.2 : chemin du TSV différentiel produit par "
+                        "build_diff_coexpr.py merge-adjacencies.")
+
+    # --- V4.2 : Reactome FI (arêtes signées additionnelles) ---
+    p.add_argument("--use-reactome-fi", dest="use_reactome_fi",
+                   action="store_true", default=False,
+                   help="V4.2 : ajoute edge_type 'reactome_fi' (Reactome "
+                        "Functional Interactions, signed). ~45k arêtes "
+                        "signées NOUVELLES (75% absentes de PPI/SIGNOR/"
+                        "CollecTRI). edge_dim=2 [score, sign].")
+    p.add_argument("--no-reactome-fi", dest="use_reactome_fi",
+                   action="store_false")
+    p.add_argument("--reactome-fi-file",
+                   default="data/reactome_fi/FIsInGene_with_annotations.txt",
+                   help="V4.2 : chemin du fichier Reactome FI décompressé "
+                        "(Gene1, Gene2, Annotation, Direction, Score).")
+
+    # --- V4.2 : pondération γ_t par edge_type (niveau message) ---
+    # NB : la loss VGAE est poolée (PPI∪REACTOME∪reg∪coexpr dédupliqués),
+    # donc on ne peut pas pondérer la *loss* par type proprement. Le
+    # déséquilibre mesuré (‖h_PPI‖ ≈ 13× ‖h_signaling‖, §14bis.6bis) est
+    # au niveau du MESSAGE-PASSING. γ_t scale donc la sortie de chaque
+    # GATConv AVANT l'agrégation HeteroConv-sum. Toggleable pour A/B V4.2.
+    p.add_argument("--edge-type-weights", default="",
+                   help="V4.2 : pondération γ_t par edge_type, format "
+                        "'ppi=0.1,coexpression=0.5,signaling=1.0'. Vide = "
+                        "tous les γ_t=1.0 (comportement V4.1). Les types "
+                        "non listés gardent γ=1.0. Appliqué au niveau du "
+                        "message (pas de la loss). Cf. §14bis.6bis.")
+
     # --- Exclusion fine de features de noeud gene ---
     # Liste possible : is_tf, variance, ppi_degree, reg_degree,
     #                  imp_P4, imp_P16, imp_delta, has_humess
@@ -207,7 +262,28 @@ MODULES = {
     "use_omnipath_signaling":    CLI_ARGS.use_omnipath_signaling,
     "use_omnipath_tf_curated":   CLI_ARGS.use_omnipath_tf_curated,
     "include_omnipath_genes":    CLI_ARGS.include_omnipath_genes,
+    "use_reactome_fi":           CLI_ARGS.use_reactome_fi,
 }
+
+# V4.2 : mode coexpression (p16_only = V4.1 ; differential = option A).
+COEXPR_MODE = CLI_ARGS.coexpr_mode
+COEXPR_DIFFERENTIAL = (COEXPR_MODE == "differential")
+
+# V4.2 : parsing de la pondération γ_t par edge_type (niveau message).
+# Format "ppi=0.1,coexpression=0.5". Vide → {} → tous γ=1.0 (V4.1).
+EDGE_TYPE_WEIGHTS: dict[str, float] = {}
+if CLI_ARGS.edge_type_weights.strip():
+    for _kv in CLI_ARGS.edge_type_weights.split(","):
+        _k, _, _v = _kv.partition("=")
+        _k, _v = _k.strip(), _v.strip()
+        if _k and _v:
+            try:
+                EDGE_TYPE_WEIGHTS[_k] = float(_v)
+            except ValueError:
+                print(f"  [warn] --edge-type-weights : '{_kv}' ignoré "
+                      f"(valeur non numérique)")
+if EDGE_TYPE_WEIGHTS:
+    print(f"  γ_t edge-type weights (message-level) : {EDGE_TYPE_WEIGHTS}")
 
 # Matrice « feature → activée ? » — recoupe les modules et l'option
 # --exclude-features. Une feature est INCLUSE ssi (a) sa source est active
@@ -250,6 +326,9 @@ def _build_run_tag():
     if MODULES["use_omnipath_signaling"]:   parts.append("op-sig")
     if MODULES["use_omnipath_tf_curated"]:  parts.append("op-tf")
     if MODULES["include_omnipath_genes"]:   parts.append("op-genes")
+    if MODULES["use_reactome_fi"]:          parts.append("rfi")
+    if COEXPR_DIFFERENTIAL:                 parts.append("coexdiff")
+    if EDGE_TYPE_WEIGHTS:                   parts.append("gw")
     if _EXCLUDED_FEATURES:                  parts.append("ex-" + "-".join(sorted(_EXCLUDED_FEATURES)))
     if CLI_ARGS.ppi_score_thresh != 900:    parts.append(f"ppi{CLI_ARGS.ppi_score_thresh}")
     if abs(CLI_ARGS.coexpr_top_quantile - 0.98) > 1e-9:
@@ -361,6 +440,12 @@ with open(_MANIFEST_PATH, "w") as _fh:
         "reactome_max_pathway": CLI_ARGS.reactome_max_pathway,
         "omnipath_cache_dir": OMNIPATH_CACHE_DIR,
         "omnipath_download_if_missing": CLI_ARGS.omnipath_download_if_missing,
+        # V4.2
+        "coexpr_mode": COEXPR_MODE,
+        "diff_coexpr_file": CLI_ARGS.diff_coexpr_file,
+        "use_reactome_fi": MODULES["use_reactome_fi"],
+        "reactome_fi_file": CLI_ARGS.reactome_fi_file,
+        "edge_type_weights": EDGE_TYPE_WEIGHTS,
     }, _fh, indent=2)
 print(f"  Manifest écrit    : {_MANIFEST_PATH}")
 
@@ -403,7 +488,7 @@ N_HEADS = 4
 DROPOUT = 0.2
 # N_EPOCHS : nombre maximal d'epochs (itérations complètes sur les données).
 #   L'early stopping arrêtera souvent avant (typiquement epoch 30-80).
-N_EPOCHS = 500
+N_EPOCHS = 550
 # LR : learning rate de l'optimiseur Adam. 0.005 est relativement élevé
 #   (typique des GNN qui convergent vite) mais compensé par le gradient
 #   clipping et le weight decay.
@@ -441,7 +526,7 @@ FREE_BITS = 0.5           # Minimum KL par dimension latente (en nats)
 # de reconstruction, cela prouve que la topologie du graphe apporte de
 # l'information au-delà des features brutes.
 MLP_HIDDEN = 64    # Dimension cachée du MLP (plus petit que le VGAE)
-MLP_EPOCHS = 200   # Moins d'epochs car le MLP converge vite (pas de graphe)
+MLP_EPOCHS = 250   # Moins d'epochs car le MLP converge vite (pas de graphe)
 MLP_LR = 0.001     # Learning rate plus faible que le VGAE (MLP est plus stable)
 
 # ── Style des figures ────────────────────────────────────────────────────────
@@ -568,7 +653,26 @@ print(f"  TF activity : {tf_activity.shape[0]} clusters × {tf_activity.shape[1]
 # pour avoir un réseau épars de haute confiance. Les poids faibles sont
 # vraisemblablement du bruit et ajouteraient des arêtes non informatives.
 # Modulaire : si --no-coexpr, on ne charge même pas le fichier (~700 Mo).
-if MODULES["use_coexpr"]:
+if MODULES["use_coexpr"] and COEXPR_DIFFERENTIAL:
+    # V4.2 option A : coexpr_diff.tsv produit par build_diff_coexpr.py.
+    # Colonnes : TF, target, importance_p4_norm, importance_p16_norm,
+    #            delta, cat_shared, cat_p4, cat_p16, ...
+    _diff_path = CLI_ARGS.diff_coexpr_file
+    if not os.path.isabs(_diff_path):
+        _diff_path = os.path.join(BASE_DIR, _diff_path)
+    if not os.path.exists(_diff_path):
+        raise FileNotFoundError(
+            f"--coexpr-mode differential mais {_diff_path} absent. "
+            f"Lancer build_diff_coexpr.py (extract-matrices → GRNBoost2 "
+            f"cluster → merge-adjacencies) d'abord."
+        )
+    adjacencies_filtered = pd.read_csv(_diff_path, sep="\t")
+    # Le filtrage top-quantile est déjà fait PAR CONDITION dans
+    # build_diff_coexpr.py (merge-adjacencies). On garde tout ici.
+    print(f"  Adjacencies (V4.2 differential) : {len(adjacencies_filtered)} "
+          f"arêtes P4∪P16, "
+          f"catégories={adjacencies_filtered['category'].value_counts().to_dict()}")
+elif MODULES["use_coexpr"]:
     adjacencies = pd.read_csv(os.path.join(SCENIC_DIR, "adjacencies.csv"))
     importance_thresh = adjacencies["importance"].quantile(COEXPR_TOP_QUANTILE)
     adjacencies_filtered = adjacencies[adjacencies["importance"] >= importance_thresh].copy()
@@ -1130,6 +1234,8 @@ print(f"  regulates : {len(reg_pairs)} liens TF→cible"
 # Feature = importance GRNBoost2 normalisée par le max.
 coexpr_src, coexpr_dst, coexpr_w = [], [], []
 coexpr_pairs = set()
+# V4.2 : en mode differential, edge_attr = 6 colonnes (option A).
+_COEXPR_DIM = 6 if COEXPR_DIFFERENTIAL else 1
 if MODULES["use_coexpr"]:
     for _, row in adjacencies_filtered.iterrows():
         g1, g2 = str(row["TF"]), str(row["target"])
@@ -1140,19 +1246,38 @@ if MODULES["use_coexpr"]:
                 coexpr_pairs.add(pair)
                 coexpr_src.extend([i, j])
                 coexpr_dst.extend([j, i])
-                imp = float(row["importance"])
-                coexpr_w.extend([imp, imp])
+                if COEXPR_DIFFERENTIAL:
+                    # [imp_p4, imp_p16, delta, cat_shared, cat_p4, cat_p16]
+                    feat = [
+                        float(row["importance_p4_norm"]),
+                        float(row["importance_p16_norm"]),
+                        float(row["delta"]),
+                        float(row["cat_shared"]),
+                        float(row["cat_p4"]),
+                        float(row["cat_p16"]),
+                    ]
+                    coexpr_w.append(feat)
+                    coexpr_w.append(feat)  # bidirectionnel, même attr
+                else:
+                    imp = float(row["importance"])
+                    coexpr_w.extend([imp, imp])
 
 # Conversion en tenseurs PyG. Si aucune co-expression n'a été trouvée,
 # on crée un tenseur vide (0 arêtes) pour éviter les erreurs en aval.
 edge_index_coexpr = torch.tensor(
     [coexpr_src, coexpr_dst] if coexpr_src else [[], []], dtype=torch.long
 )
-coexpr_w_tensor = (torch.tensor(coexpr_w, dtype=torch.float).unsqueeze(1)
-                   if coexpr_w else torch.zeros((0, 1)))
-# Normalisation min-max par le max
-if coexpr_w_tensor.numel() > 0:
-    coexpr_w_tensor = coexpr_w_tensor / (coexpr_w_tensor.max() + 1e-8)
+if COEXPR_DIFFERENTIAL:
+    # Pas de re-normalisation : imp_p4/imp_p16 déjà min-max normalisés
+    # dans build_diff_coexpr.py ; delta ∈ [-1, 1] ; cat_* ∈ {0, 1}.
+    coexpr_w_tensor = (torch.tensor(coexpr_w, dtype=torch.float)
+                       if coexpr_w else torch.zeros((0, _COEXPR_DIM)))
+else:
+    coexpr_w_tensor = (torch.tensor(coexpr_w, dtype=torch.float).unsqueeze(1)
+                       if coexpr_w else torch.zeros((0, 1)))
+    # Normalisation min-max par le max
+    if coexpr_w_tensor.numel() > 0:
+        coexpr_w_tensor = coexpr_w_tensor / (coexpr_w_tensor.max() + 1e-8)
 print(f"  coexpression : {len(coexpr_pairs)} paires ({len(coexpr_src)} arêtes)"
       + ("" if MODULES["use_coexpr"] else " [SKIP --no-coexpr]"))
 
@@ -1432,6 +1557,66 @@ edge_index_tf_curated_by = (torch.tensor([op_tf_dst.tolist(),
                             if op_tf_src.size > 0
                             else torch.zeros((2, 0), dtype=torch.long))
 
+# ── V4.2 : Reactome FI signé ─────────────────────────────────────────────────
+# Reactome Functional Interactions (Wu 2010 Genome Biol). Fichier
+# FIsInGene_*_with_annotations.txt : Gene1, Gene2, Annotation, Direction,
+# Score. La colonne Direction encode le signe : '|' = inhibition, '>'/'<'
+# = activation/direction, '-'/'<->' = non signé. On exclut les FI
+# 'predicted' (computationnels non curés). edge_attr = [score, sign].
+# Apport mesuré (audit 2026-05-12) : ~45k arêtes signées NOUVELLES (75%
+# absentes de PPI/SIGNOR/CollecTRI). Cf. §14bis.6quater du rapport.
+reactome_fi_src, reactome_fi_dst, reactome_fi_attr = [], [], []
+if MODULES["use_reactome_fi"]:
+    _fi_path = CLI_ARGS.reactome_fi_file
+    if not os.path.isabs(_fi_path):
+        _fi_path = os.path.join(BASE_DIR, _fi_path)
+    if not os.path.exists(_fi_path):
+        print(f"  [warn] Reactome FI : fichier absent ({_fi_path}) — "
+              f"edge_type 'reactome_fi' vide. Télécharger via "
+              f"scripts/cache_reactome_fi.sh")
+    else:
+        _fi = pd.read_csv(_fi_path, sep="\t")
+        _n_raw = len(_fi)
+        # Exclure les FI purement prédites (non curées)
+        _fi = _fi[~_fi["Annotation"].astype(str).str.contains(
+            "predicted", case=False, na=False)]
+
+        def _fi_sign(d: str) -> float:
+            d = str(d)
+            if "|" in d:                    # notation inhibition Reactome FI
+                return -1.0
+            if ">" in d or "<" in d:        # direction d'activation
+                return 1.0
+            return 0.0
+
+        _seen_fi = set()
+        for _, r in _fi.iterrows():
+            g1, g2 = str(r["Gene1"]), str(r["Gene2"])
+            if g1 in gene_to_idx and g2 in gene_to_idx:
+                i, j = gene_to_idx[g1], gene_to_idx[g2]
+                pair = (min(i, j), max(i, j))
+                if pair in _seen_fi:
+                    continue
+                _seen_fi.add(pair)
+                sign = _fi_sign(r["Direction"])
+                score = float(r["Score"]) if not pd.isna(r["Score"]) else 1.0
+                # Bidirectionnel (FI = interaction fonctionnelle, on
+                # propage dans les deux sens comme PPI/coexpr)
+                reactome_fi_src.extend([i, j])
+                reactome_fi_dst.extend([j, i])
+                reactome_fi_attr.extend([[score, sign], [score, sign]])
+        n_fi_signed = sum(1 for a in reactome_fi_attr if a[1] != 0)
+        print(f"  Reactome FI : {_n_raw} brut → {len(_seen_fi)} paires "
+              f"curées dans le graphe ({n_fi_signed//2} signées)")
+
+edge_index_reactome_fi = (torch.tensor([reactome_fi_src, reactome_fi_dst],
+                                       dtype=torch.long)
+                          if reactome_fi_src
+                          else torch.zeros((2, 0), dtype=torch.long))
+edge_attr_reactome_fi = (torch.tensor(reactome_fi_attr, dtype=torch.float)
+                         if reactome_fi_attr
+                         else torch.zeros((0, 2), dtype=torch.float))
+
 # ── Finaliser les features de noeuds gene avec les degrés ────────────────────
 # Les features de degré (nombre de voisins) sont calculées APRÈS la
 # construction des arêtes. Elles capturent la "centralité" de chaque gène
@@ -1561,6 +1746,10 @@ if edge_index_tf_curated.numel() > 0:
     data["gene", "tf_curated", "gene"].edge_attr = edge_attr_tf_curated
     data["gene", "tf_curated_by", "gene"].edge_index = edge_index_tf_curated_by
     data["gene", "tf_curated_by", "gene"].edge_attr = edge_attr_tf_curated
+# V4.2 — Reactome FI signé (edge_type séparé, ablation-able via --no-reactome-fi)
+if edge_index_reactome_fi.numel() > 0:
+    data["gene", "reactome_fi", "gene"].edge_index = edge_index_reactome_fi
+    data["gene", "reactome_fi", "gene"].edge_attr = edge_attr_reactome_fi
 
 print(f"  Noeuds gene       : {n_genes} (features={gene_features.shape[1]})")
 print(f"  Noeuds cell_group : {len(CELL_GROUPS)}")
@@ -1573,6 +1762,10 @@ print(f"  Arêtes signaling  : {edge_index_signaling.shape[1]}"
       + ("" if MODULES["use_omnipath_signaling"] else " [SKIP --no-omnipath-signaling]"))
 print(f"  Arêtes tf_curated : {edge_index_tf_curated.shape[1]}"
       + ("" if MODULES["use_omnipath_tf_curated"] else " [SKIP --no-omnipath-tf-curated]"))
+print(f"  Arêtes reactome_fi: {edge_index_reactome_fi.shape[1]}"
+      + ("" if MODULES["use_reactome_fi"] else " [SKIP --no-reactome-fi]"))
+print(f"  Coexpr mode       : {COEXPR_MODE}"
+      + (f" (edge_dim={_COEXPR_DIM})" if MODULES["use_coexpr"] else ""))
 
 # Sauvegarde du graphe complet pour réutilisation (perturbations, etc.)
 torch.save(data, os.path.join(OUT_DIR, "hetero_graph_vgae.pt"))
@@ -1605,6 +1798,28 @@ torch.save(data, os.path.join(OUT_DIR, "hetero_graph_vgae.pt"))
 print("\n" + "=" * 70)
 print("8. Modèle VGAE")
 print("=" * 70)
+
+
+class _ScaledConv(nn.Module):
+    """Wrapper V4.2 : multiplie la sortie d'un conv par γ_t (scalaire fixe).
+
+    Permet d'appliquer une pondération par edge_type AU NIVEAU DU MESSAGE
+    (avant l'agrégation HeteroConv-sum), pour rééquilibrer le déséquilibre
+    ‖h_PPI‖ ≫ ‖h_signaling‖ mesuré en §14bis.6bis du rapport. γ_t est un
+    hyperparamètre fixe (non appris) — toggleable via --edge-type-weights.
+
+    Transparent pour HeteroConv : on relaie *args/**kwargs vers le conv
+    encapsulé (signature GATConv : (x, edge_index, edge_attr=...)).
+    """
+
+    def __init__(self, conv: nn.Module, gamma: float):
+        super().__init__()
+        self.conv = conv
+        self.gamma = float(gamma)
+
+    def forward(self, *args, **kwargs):
+        out = self.conv(*args, **kwargs)
+        return out * self.gamma
 
 
 class HeteroEncoder(nn.Module):
@@ -1652,17 +1867,29 @@ class HeteroEncoder(nn.Module):
         (("gene", "signaling", "gene"), 2),
         (("gene", "tf_curated", "gene"), 2),
         (("gene", "tf_curated_by", "gene"), 2),
+        # V4.2 — Reactome FI signed (edge_attr = [score, sign])
+        (("gene", "reactome_fi", "gene"), 2),
     ]
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
-                 n_heads=4, dropout=0.2, available_edge_types=None):
+                 n_heads=4, dropout=0.2, available_edge_types=None,
+                 edge_dim_overrides=None, edge_type_weights=None):
         """
         Args:
             available_edge_types: itérable de tuples (src, rel, dst) — typiquement
                 `list(data.edge_types)`. Si fourni, seuls les types listés sont
                 instanciés. None = utilise tout le catalogue (rétro-compatible).
+            edge_dim_overrides: dict {(src,rel,dst): edge_dim} — V4.2, écrase
+                la dimension d'edge_attr du catalogue (ex. coexpression 1→6
+                en mode differential). None = catalogue inchangé.
+            edge_type_weights: dict {(src,rel,dst) ou 'rel': γ_t} — V4.2,
+                facteur multiplicatif appliqué à la sortie du GATConv de ce
+                type AVANT l'agrégation HeteroConv-sum. None/{} = tous γ=1.0
+                (comportement V4.1). Cf. §14bis.6bis du rapport.
         """
         super().__init__()
+        self._edge_dim_overrides = edge_dim_overrides or {}
+        self._edge_type_weights = edge_type_weights or {}
         self.n_layers = n_layers
         # Chaque tête d'attention travaille en dimension head_dim = hidden/n_heads.
         # Les résultats des n_heads têtes sont concaténés → sortie = hidden.
@@ -1698,7 +1925,29 @@ class HeteroEncoder(nn.Module):
                 "HeteroEncoder : aucun edge_type actif. Vérifie --no-* / la "
                 "présence de data.edge_types."
             )
+        # V4.2 : appliquer les overrides de dimension d'edge_attr (ex.
+        # coexpression 1→6 en mode differential).
+        if self._edge_dim_overrides:
+            edge_types_dims = [
+                (et, self._edge_dim_overrides.get(et, dim))
+                for et, dim in edge_types_dims
+            ]
         self.edge_dims = {et: dim for et, dim in edge_types_dims}
+
+        # V4.2 : résolution des γ_t par edge_type. La clé peut être le
+        # tuple complet (src,rel,dst) ou juste le 'rel' (str) pour
+        # simplifier la CLI (--edge-type-weights ppi=0.1,...).
+        def _resolve_gamma(et):
+            if et in self._edge_type_weights:
+                return float(self._edge_type_weights[et])
+            rel = et[1]
+            if rel in self._edge_type_weights:
+                return float(self._edge_type_weights[rel])
+            return 1.0
+        self.edge_gammas = {et: _resolve_gamma(et) for et, _ in edge_types_dims}
+        _non_unit = {k[1]: v for k, v in self.edge_gammas.items() if v != 1.0}
+        if _non_unit:
+            print(f"  HeteroEncoder γ_t (message-level) : {_non_unit}")
 
         for _ in range(n_layers):
             conv_dict = {}
@@ -1715,7 +1964,13 @@ class HeteroEncoder(nn.Module):
                                    dropout=dropout, add_self_loops=False)
                 if ed is not None:
                     conv_kwargs["edge_dim"] = ed
-                conv_dict[et] = GATConv(hidden, head_dim, **conv_kwargs)
+                _gat = GATConv(hidden, head_dim, **conv_kwargs)
+                # V4.2 : si γ_t ≠ 1.0, on enveloppe le GATConv dans un
+                # scaler qui multiplie sa sortie par γ_t AVANT que
+                # HeteroConv(aggr="sum") ne somme les canaux. Ainsi
+                # h_i = Σ_t γ_t · h_i^t (rééquilibrage §14bis.6bis).
+                _g = self.edge_gammas.get(et, 1.0)
+                conv_dict[et] = (_ScaledConv(_gat, _g) if _g != 1.0 else _gat)
             # HeteroConv : applique chaque GATConv sur son type d'arête,
             # puis agrège (aggr="sum") les résultats pour chaque noeud.
             # Un gène qui a des voisins PPI ET des voisins pathway recevra
@@ -1966,6 +2221,13 @@ encoder = HeteroEncoder(
     n_heads=N_HEADS,                       # 4 têtes d'attention
     dropout=DROPOUT,                       # 0.2
     available_edge_types=list(data.edge_types),  # filtre selon ablations
+    # V4.2 : coexpression edge_dim 1→6 en mode differential.
+    edge_dim_overrides=(
+        {("gene", "coexpression", "gene"): _COEXPR_DIM}
+        if COEXPR_DIFFERENTIAL else None
+    ),
+    # V4.2 : pondération γ_t par edge_type (message-level), toggleable.
+    edge_type_weights=EDGE_TYPE_WEIGHTS or None,
 )
 model = VGAE(encoder)
 
@@ -2087,9 +2349,9 @@ eval_epochs = []       # Numéros d'epoch où on a évalué
 best_test_auc = 0.0    # Meilleure AUC test observée
 best_test_ap = 0.0     # AP au meilleur epoch (par AUC)
 best_epoch = 0         # Epoch correspondante
-# PATIENCE = 80 epochs : si l'AUC ne s'améliore pas pendant 80 epochs
+# PATIENCE = 100 epochs : si l'AUC ne s'améliore pas pendant 80 epochs
 # (= 8 évaluations), on arrête. Le pic est typiquement autour de epoch 30-50.
-PATIENCE = 80
+PATIENCE = 100
 # GRAD_CLIP_NORM = 1.0 : on clamp la norme du gradient total à 1.0.
 # Empêche les mises à jour explosives (ex : quand τ change brusquement).
 GRAD_CLIP_NORM = 1.0
