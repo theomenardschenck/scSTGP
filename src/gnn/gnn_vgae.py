@@ -204,6 +204,17 @@ def _parse_cli_args():
                         "tous les γ_t=1.0 (comportement V4.1). Les types "
                         "non listés gardent γ=1.0. Appliqué au niveau du "
                         "message (pas de la loss). Cf. §14bis.6bis.")
+    p.add_argument("--dedup-ppi-signed",
+                   choices=["off", "remove", "annotate"], default="off",
+                   help="V4.2 : si une paire (a,b) a une arête SIGNÉE "
+                        "orientée (signaling/tf_curated/reactome_fi), "
+                        "l'arête PPI non-signée est redondante. off "
+                        "(DÉFAUT) = inchangé, diagnostic seul (compte "
+                        "arêtes/gènes touchés). remove = supprime le "
+                        "doublon PPI. annotate = garde l'arête PPI + "
+                        "colonne flag has_signed_counterpart (edge_dim "
+                        "1→2). Cf. §14bis.6quaterdecies. Bénéfice plein "
+                        "avec V5 (message/decodeur signés).")
 
     # --- Exclusion fine de features de noeud gene ---
     # Liste possible : is_tf, variance, ppi_degree, reg_degree,
@@ -329,6 +340,8 @@ def _build_run_tag():
     if MODULES["use_reactome_fi"]:          parts.append("rfi")
     if COEXPR_DIFFERENTIAL:                 parts.append("coexdiff")
     if EDGE_TYPE_WEIGHTS:                   parts.append("gw")
+    if getattr(CLI_ARGS, "dedup_ppi_signed", "off") != "off":
+        parts.append(f"dedup-{CLI_ARGS.dedup_ppi_signed}")
     if _EXCLUDED_FEATURES:                  parts.append("ex-" + "-".join(sorted(_EXCLUDED_FEATURES)))
     if CLI_ARGS.ppi_score_thresh != 900:    parts.append(f"ppi{CLI_ARGS.ppi_score_thresh}")
     if abs(CLI_ARGS.coexpr_top_quantile - 0.98) > 1e-9:
@@ -446,6 +459,7 @@ with open(_MANIFEST_PATH, "w") as _fh:
         "use_reactome_fi": MODULES["use_reactome_fi"],
         "reactome_fi_file": CLI_ARGS.reactome_fi_file,
         "edge_type_weights": EDGE_TYPE_WEIGHTS,
+        "dedup_ppi_signed": getattr(CLI_ARGS, "dedup_ppi_signed", "off"),
     }, _fh, indent=2)
 print(f"  Manifest écrit    : {_MANIFEST_PATH}")
 
@@ -1617,6 +1631,93 @@ edge_attr_reactome_fi = (torch.tensor(reactome_fi_attr, dtype=torch.float)
                          if reactome_fi_attr
                          else torch.zeros((0, 2), dtype=torch.float))
 
+# ── V4.2 : déduplication PPI vs arêtes signées+orientées ─────────────────────
+# Pour une paire (a,b), si une arête SIGNÉE ORIENTÉE existe (signaling /
+# tf_curated / reactome_fi avec sign≠0), l'arête PPI non-signée
+# non-orientée est redondante : elle gonfle le compte et son message
+# symétrique s'ajoute (agrégation HeteroConv-sum) au message signé →
+# dilution partielle (cf. §14bis.6bis : PPI domine déjà ‖h‖).
+#
+# `--dedup-ppi-signed {off,remove,annotate}` (DÉFAUT off — comportement
+# inchangé). Le DIAGNOSTIC (combien d'arêtes/gènes seraient touchés)
+# est TOUJOURS calculé et loggé, même en mode off, pour décider sur
+# chiffres. Cf. §14bis.6quaterdecies. NB : bénéfice « bien orienter le
+# message » seulement PARTIEL en V4.2 (le signe n'entre qu'en
+# attention, design A) ; bénéfice PLEIN avec V5 (SignedGATConv message
+# + BilinearSignedDecoder). Les deux sont décorrélés mais
+# complémentaires.
+def _signed_pair_set(*eis_attrs) -> set[tuple[int, int]]:
+    """Paires (min,max) couvertes par une arête signée (sign≠0)."""
+    s: set[tuple[int, int]] = set()
+    for ei, attr in eis_attrs:
+        if ei.numel() == 0:
+            continue
+        if attr is not None and attr.numel() > 0 and attr.dim() == 2 \
+                and attr.shape[1] >= 2:
+            sign = attr[:, 1]
+            for k in range(ei.shape[1]):
+                if float(sign[k]) != 0.0:
+                    a, b = int(ei[0, k]), int(ei[1, k])
+                    s.add((min(a, b), max(a, b)))
+        else:
+            for a, b in zip(ei[0].tolist(), ei[1].tolist()):
+                s.add((min(a, b), max(a, b)))
+    return s
+
+
+_signed_pairs = _signed_pair_set(
+    (edge_index_signaling, edge_attr_signaling),
+    (edge_index_tf_curated, edge_attr_tf_curated),
+    (edge_index_reactome_fi, edge_attr_reactome_fi),
+)
+# Diagnostic : combien d'arêtes PPI redondantes ? combien de gènes
+# perdraient TOUTES leurs arêtes PPI si on dédupliquait ?
+_n_ppi_before = int(edge_index_ppi.shape[1]) if edge_index_ppi.numel() else 0
+_ppi_redundant_mask = None
+if _n_ppi_before > 0 and _signed_pairs:
+    import numpy as _np
+    _src = edge_index_ppi[0].numpy()
+    _dst = edge_index_ppi[1].numpy()
+    _ppi_redundant_mask = _np.array([
+        (min(int(a), int(b)), max(int(a), int(b))) in _signed_pairs
+        for a, b in zip(_src, _dst)
+    ])
+    _n_redundant = int(_ppi_redundant_mask.sum())
+    # Gènes qui n'ont QUE des arêtes PPI redondantes (perdraient tout PPI)
+    _deg_all = _np.zeros(n_genes, dtype=_np.int64)
+    _deg_keep = _np.zeros(n_genes, dtype=_np.int64)
+    for i, (a, b) in enumerate(zip(_src, _dst)):
+        _deg_all[int(a)] += 1
+        if not _ppi_redundant_mask[i]:
+            _deg_keep[int(a)] += 1
+    _n_genes_lose_ppi = int(((_deg_all > 0) & (_deg_keep == 0)).sum())
+    _n_genes_with_ppi = int((_deg_all > 0).sum())
+    print(f"\n  [dedup-ppi diag] PPI redondant (paire signée existante) : "
+          f"{_n_redundant}/{_n_ppi_before} arêtes "
+          f"({100*_n_redundant/_n_ppi_before:.1f}%)")
+    print(f"  [dedup-ppi diag] gènes perdant TOUTES leurs arêtes PPI si "
+          f"dédup : {_n_genes_lose_ppi}/{_n_genes_with_ppi} "
+          f"({100*_n_genes_lose_ppi/max(1,_n_genes_with_ppi):.1f}%)")
+    _dedup_mode = getattr(CLI_ARGS, "dedup_ppi_signed", "off")
+    if _dedup_mode == "remove":
+        _keep = ~_ppi_redundant_mask
+        edge_index_ppi = edge_index_ppi[:, _keep.tolist()]
+        if edge_attr_ppi.numel() > 0:
+            edge_attr_ppi = edge_attr_ppi[_keep.tolist()]
+        print(f"  [dedup-ppi] mode=remove : PPI {_n_ppi_before} → "
+              f"{edge_index_ppi.shape[1]} arêtes")
+    elif _dedup_mode == "annotate":
+        # edge_dim 1→2 : ajoute une colonne flag (1 si paire signée).
+        _flag = torch.tensor(_ppi_redundant_mask.astype("float32")).unsqueeze(1)
+        if edge_attr_ppi.numel() > 0:
+            edge_attr_ppi = torch.cat([edge_attr_ppi, _flag], dim=1)
+        else:
+            edge_attr_ppi = _flag
+        print(f"  [dedup-ppi] mode=annotate : edge_attr_ppi → dim "
+              f"{edge_attr_ppi.shape[1]} (col 1 = has_signed_counterpart)")
+    else:
+        print(f"  [dedup-ppi] mode=off : aucune modif (diagnostic seul)")
+
 # ── Finaliser les features de noeuds gene avec les degrés ────────────────────
 # Les features de degré (nombre de voisins) sont calculées APRÈS la
 # construction des arêtes. Elles capturent la "centralité" de chaque gène
@@ -2221,11 +2322,15 @@ encoder = HeteroEncoder(
     n_heads=N_HEADS,                       # 4 têtes d'attention
     dropout=DROPOUT,                       # 0.2
     available_edge_types=list(data.edge_types),  # filtre selon ablations
-    # V4.2 : coexpression edge_dim 1→6 en mode differential.
-    edge_dim_overrides=(
-        {("gene", "coexpression", "gene"): _COEXPR_DIM}
-        if COEXPR_DIFFERENTIAL else None
-    ),
+    # V4.2 : edge_dim overrides — coexpr 1→6 (differential) ;
+    # ppi 1→2 si --dedup-ppi-signed annotate (colonne flag ajoutée).
+    edge_dim_overrides=(lambda _o: _o or None)({
+        **({("gene", "coexpression", "gene"): _COEXPR_DIM}
+           if COEXPR_DIFFERENTIAL else {}),
+        **({("gene", "ppi", "gene"): int(edge_attr_ppi.shape[1])}
+           if getattr(CLI_ARGS, "dedup_ppi_signed", "off") == "annotate"
+           and edge_attr_ppi.numel() > 0 else {}),
+    }),
     # V4.2 : pondération γ_t par edge_type (message-level), toggleable.
     edge_type_weights=EDGE_TYPE_WEIGHTS or None,
 )
@@ -3469,17 +3574,20 @@ _edge_catalog = {
     "metabolic_cocatalysis": (edge_index_cocat,       edge_attr_cocat),
     "signaling":             (edge_index_signaling,   edge_attr_signaling),
     "tf_curated":            (edge_index_tf_curated,  edge_attr_tf_curated),
+    "reactome_fi":           (edge_index_reactome_fi, edge_attr_reactome_fi),
     "expresses":             (edge_index_expresses,   edge_attr_expresses),
 }
 _per_type = {name: _edge_stats(ei, attr)
              for name, (ei, attr) in _edge_catalog.items()}
 
-# Agrégats : types qui portent un signe biologique (causal/régulatoire)
-_signed_types = ("signaling", "tf_curated", "regulates")
+# Agrégats : types qui portent un signe biologique (causal/régulatoire).
+# reactome_fi (V4.2) est signé (edge_attr=[score, sign]) → inclus.
+_signed_types = ("signaling", "tf_curated", "regulates", "reactome_fi")
 _signed_total_edges = sum(_per_type[t]["n_edges"] for t in _signed_types)
 _total_gene_gene = sum(_per_type[t]["n_edges"] for t in
                        ("ppi", "same_pathway", "regulates", "coexpression",
-                        "metabolic_cocatalysis", "signaling", "tf_curated"))
+                        "metabolic_cocatalysis", "signaling", "tf_curated",
+                        "reactome_fi"))
 
 # Couverture vs PPI : combien d'arêtes signées (signaling / tf_curated) NE
 # sont PAS doublées par une arête PPI (bidirectionnelle) ? Mesure l'apport
@@ -3503,6 +3611,7 @@ def _count_non_ppi(ei) -> int:
 
 _signaling_non_ppi  = _count_non_ppi(edge_index_signaling)
 _tf_curated_non_ppi = _count_non_ppi(edge_index_tf_curated)
+_reactome_fi_non_ppi = _count_non_ppi(edge_index_reactome_fi)
 
 # Logs console — utile pour diag interactif sans ouvrir le JSON
 print("\n  Stats arêtes (V4.1) :")
@@ -3512,12 +3621,17 @@ for name, st in _per_type.items():
         extra = (f"  [+:{st['n_pos']} −:{st['n_neg']} "
                  f"0:{st['n_unsigned']}]")
     print(f"    {name:<22} : {st['n_edges']:>8}{extra}")
-if _per_type["signaling"]["n_edges"] > 0 or _per_type["tf_curated"]["n_edges"] > 0:
-    print(f"  Couverture causale OmniPath hors PPI :")
-    print(f"    signaling non-PPI  : {_signaling_non_ppi} "
+if (_per_type["signaling"]["n_edges"] > 0
+        or _per_type["tf_curated"]["n_edges"] > 0
+        or _per_type["reactome_fi"]["n_edges"] > 0):
+    print(f"  Couverture causale hors PPI :")
+    print(f"    signaling non-PPI   : {_signaling_non_ppi} "
           f"/ {_per_type['signaling']['n_edges']}")
-    print(f"    tf_curated non-PPI : {_tf_curated_non_ppi} "
+    print(f"    tf_curated non-PPI  : {_tf_curated_non_ppi} "
           f"/ {_per_type['tf_curated']['n_edges']}")
+    if _per_type["reactome_fi"]["n_edges"] > 0:
+        print(f"    reactome_fi non-PPI : {_reactome_fi_non_ppi} "
+              f"/ {_per_type['reactome_fi']['n_edges']}")
 if _total_gene_gene > 0:
     print(f"  frac signed / total gene-gene : "
           f"{_signed_total_edges / _total_gene_gene:.3f}")
@@ -3536,6 +3650,8 @@ _edge_stats_block = {
         "signaling_non_ppi":    int(_signaling_non_ppi),
         "tf_curated_total":     _per_type["tf_curated"]["n_edges"],
         "tf_curated_non_ppi":   int(_tf_curated_non_ppi),
+        "reactome_fi_total":    _per_type["reactome_fi"]["n_edges"],
+        "reactome_fi_non_ppi":  int(_reactome_fi_non_ppi),
     },
     "include_omnipath_genes":   bool(MODULES["include_omnipath_genes"]),
     "n_omnipath_endpoints_in_graph": int(
