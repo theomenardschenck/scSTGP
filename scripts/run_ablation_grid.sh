@@ -8,7 +8,7 @@
 #
 # Interface : produit cartésien `--version × --ablations`.
 #
-# --version {V3, V4, V4.1, V4.2, V4_1, V4_2}   (défaut : V4.1)
+# --version {V3, V4, V4.1, V4.2, V4.2-sweep, V4_1, V4_2}   (défaut : V4.1)
 #     Définit les configs de base à tester.
 #         V3   : 1 config (full, no OmniPath, no flags). Reproduit V3.6 baseline.
 #         V4   : 4 configs avec edge_types `signaling` / `tf_curated` opt-in.
@@ -21,6 +21,12 @@
 #                coexdiff.rfi,coexdiff.gw.rfi}. PRÉREQUIS :
 #                bash scripts/run_diff_coexpr.sh + cache_reactome_fi.sh.
 #                Cf. §14bis.6octies du rapport.
+#         V4.2-sweep : 3 configs comparant l'élagage du canal coexpr
+#                (constat 2026-05-19 : AUC 0.91 vs V4.1 0.97 — coexpr
+#                trop dense noie le décodeur). tags v4.2-coex.{k5q5,
+#                k3q7,k2q8}. PRÉREQUIS : bash scripts/run_coexpr_prune_sweep.sh
+#                (génère les 3 coexpr_diff.*.tsv depuis adjacencies existants).
+#                Cf. §14bis.6sexdecies du rapport.
 #
 # --ablations <list>     (défaut : "" = juste les 4 configs base, AKA validation)
 #     Liste séparée par virgules. Chaque entrée peut être :
@@ -116,6 +122,7 @@ esac
 # Normalisation : V4_1 → V4.1 / V4_2 → V4.2 pour éviter pièges shell
 [[ "$VERSION" == "V4_1" ]] && VERSION="V4.1"
 [[ "$VERSION" == "V4_2" ]] && VERSION="V4.2"
+[[ "$VERSION" == "V4_2-sweep" || "$VERSION" == "V4_2_sweep" ]] && VERSION="V4.2-sweep"
 
 # --- Définition des sub-configs par version ---------------------------------
 # Format : "<tag>::<flags>" — flags passés tels quels à gnn_vgae.py.
@@ -160,8 +167,24 @@ case "$VERSION" in
             "v4.2-coexdiff.gw.rfi::$V41_FULL $COEXDIFF $GW $RFI"
         )
         ;;
+    V4.2-sweep)
+        # Sweep d'élagage coexpr (cf. §14bis.6sexdecies). Run V4.2 du
+        # 2026-05-19 : AUC 0.9051 (vs V4.1 0.97). Hypothèse : K=5 / floor
+        # q=0.5 / universe=all = trop d'arêtes coexpr (~150-200k, 1.5×PPI)
+        # qui noient le signal PPI signé dans le décodeur.
+        # 3 configs avec --diff-coexpr-file vers fichiers pré-générés par
+        # run_coexpr_prune_sweep.sh (depuis MÊMES adjacencies, juste re-merge).
+        V41_FULL="$OP_SIG $OP_TF $OP_INC"
+        COEXDIFF="--coexpr-mode differential"
+        DD_BASE="data/pyscenic/diff_coexpr/coexpr_diff"
+        BASE_CONFIGS=(
+            "v4.2-coex.k5q5::$V41_FULL $COEXDIFF --diff-coexpr-file ${DD_BASE}.k5q5.tsv"
+            "v4.2-coex.k3q7::$V41_FULL $COEXDIFF --diff-coexpr-file ${DD_BASE}.k3q7.tsv"
+            "v4.2-coex.k2q8::$V41_FULL $COEXDIFF --diff-coexpr-file ${DD_BASE}.k2q8.tsv"
+        )
+        ;;
     *)
-        echo "Version inconnue : $VERSION (V3 | V4 | V4.1 | V4.2)"; exit 1 ;;
+        echo "Version inconnue : $VERSION (V3 | V4 | V4.1 | V4.2 | V4.2-sweep)"; exit 1 ;;
 esac
 
 # --- Parsing de --ablations en variantes -----------------------------------
@@ -304,7 +327,7 @@ if [[ ! -d "$DATA_ROOT" ]]; then
     echo "       Vérifie qu'il correspond à gnn_vgae.py:381 (LAB_DIR/gnn/data)."
     echo "       Override : --data-root <path> ou export GNN_DATA_ROOT=<path>"
 fi
-if [[ "$VERSION" == "V4" || "$VERSION" == "V4.1" || "$VERSION" == "V4.2" ]]; then
+if [[ "$VERSION" == "V4" || "$VERSION" == "V4.1" || "$VERSION" == "V4.2" || "$VERSION" == "V4.2-sweep" ]]; then
     CACHE_TF="$DATA_ROOT/omnipath/tf_collectri.tsv.gz"
     CACHE_SIG="$DATA_ROOT/omnipath/signed_ppi_signor.tsv.gz"
     if [[ ! -f "$CACHE_TF" ]]; then
@@ -334,6 +357,23 @@ if [[ "$VERSION" == "V4.2" ]]; then
         echo "[warn] Reactome FI absent : $RFI_FILE"
         echo "       Les configs *.rfi auront un edge_type reactome_fi vide."
         echo "       Lance : bash scripts/cache_reactome_fi.sh $DATA_ROOT/reactome_fi"
+    fi
+fi
+
+# --- Sécurité V4.2-sweep : 3 fichiers coexpr_diff.{k5q5,k3q7,k2q8}.tsv ----
+if [[ "$VERSION" == "V4.2-sweep" ]]; then
+    DD="$DATA_ROOT/pyscenic/diff_coexpr"
+    missing=0
+    for v in k5q5 k3q7 k2q8; do
+        F="$DD/coexpr_diff.${v}.tsv"
+        if [[ ! -f "$F" ]]; then
+            echo "[err] coexpr_diff.${v}.tsv absent : $F"
+            missing=1
+        fi
+    done
+    if [[ $missing -eq 1 ]]; then
+        echo "      Lance d'abord : bash scripts/run_coexpr_prune_sweep.sh"
+        exit 1
     fi
 fi
 
