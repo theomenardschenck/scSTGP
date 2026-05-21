@@ -61,6 +61,11 @@ N_WORKERS=8
 PRUNE_MODE="per-target-topk"
 PER_TARGET_K=5
 TOP_QUANTILE=0.995   # utilisé seulement si --prune-mode global-quantile|hybrid
+# Floor LAXISTE optionnel : drop les gènes sans régulateur réel
+# (imp_max tous < médiane globale) que per-target-topk garderait
+# sinon à K arêtes de bruit. 0.0 = off ; 0.5 (médiane) recommandé
+# en univers graph (~6700 gènes hors-HVG, certains sans coexpr réel).
+MIN_IMAX_QUANTILE=0.5
 # 08:00:00 : avec --gene-universe graph (~11k cibles vs 5k HVG) le
 # GRNBoost2-local sklearn prend ~2× plus longtemps. 4h ne suffit pas.
 TIME_GRN="08:00:00"
@@ -75,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --n-workers)      N_WORKERS="$2"; shift 2 ;;
         --prune-mode)     PRUNE_MODE="$2"; shift 2 ;;
         --per-target-k)   PER_TARGET_K="$2"; shift 2 ;;
+        --min-imax-quantile) MIN_IMAX_QUANTILE="$2"; shift 2 ;;
         --top-quantile)   TOP_QUANTILE="$2"; shift 2 ;;
         --time-grn)       TIME_GRN="$2"; shift 2 ;;
         --diff-dir)       DIFF_DIR="$2"; shift 2 ;;
@@ -140,7 +146,7 @@ fi
 echo "[diff-coexpr] project    : $PROJECT_DIR"
 echo "[diff-coexpr] log dir    : $LOG_DIR"
 echo "[diff-coexpr] n_workers  : $N_WORKERS (sklearn grnboost2-local + joblib)"
-echo "[diff-coexpr] prune      : $PRUNE_MODE (k=$PER_TARGET_K, q=$TOP_QUANTILE)"
+echo "[diff-coexpr] prune      : $PRUNE_MODE (k=$PER_TARGET_K, q=$TOP_QUANTILE, floor-imax-q=$MIN_IMAX_QUANTILE)"
 
 # --- 1. sbatch GRNBoost2 (array P4/P16) ------------------------------------
 GRN_SBATCH="$LOG_DIR/sbatch_grnboost2.sh"
@@ -206,6 +212,7 @@ python3 src/build_diff_coexpr.py merge-adjacencies \\
     --prune-mode "$PRUNE_MODE" \\
     --per-target-k $PER_TARGET_K \\
     --top-quantile $TOP_QUANTILE \\
+    --min-imax-quantile $MIN_IMAX_QUANTILE \\
     --out "$DIFF_DIR/coexpr_diff.tsv"
 
 echo "[\$(date +%T)] coexpr_diff.tsv généré :"

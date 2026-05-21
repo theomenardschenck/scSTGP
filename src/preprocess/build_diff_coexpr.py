@@ -357,6 +357,24 @@ def cmd_merge_adjacencies(args: argparse.Namespace) -> None:
     print(f"[merge] réseaux complets fusionnés : {len(merged)} paires "
           f"(P4={len(df4)}, P16={len(df16)})")
 
+    # 2bis. Floor LAXISTE sur imp_max (optionnel, --min-imax-quantile).
+    # But : éliminer les gènes SANS régulateur réel (régression-bruit,
+    # imp_max tous faibles) que per-target-topk garderait quand même à
+    # K arêtes de bruit. Floor = quantile(imp_max) — laxiste (0.5 =
+    # médiane recommandée) vs q0.98/0.995 hub-dominé. Appliqué AVANT
+    # le top-K : un gène dont TOUS les imp_max sont sous le floor →
+    # 0 arête (droppé, souhaité) ; un vrai gène garde son top-K.
+    fq = args.min_imax_quantile
+    if fq and fq > 0.0:
+        floor = merged["imp_max"].quantile(fq)
+        n_before = len(merged)
+        tgt_before = merged["target"].nunique()
+        merged = merged[merged["imp_max"] >= floor].copy()
+        print(f"[merge] floor laxiste imp_max ≥ q{fq} ({floor:.4g}) : "
+              f"{n_before} → {len(merged)} paires ; cibles "
+              f"{tgt_before} → {merged['target'].nunique()} "
+              f"(gènes sans signal droppés)")
+
     # 3. Élagage sur imp_max (force inter-condition), APRÈS le merge.
     if mode == "global-quantile":
         thr = merged["imp_max"].quantile(q)
@@ -484,6 +502,14 @@ def main() -> None:
                          "n_cibles × K.")
     pm.add_argument("--top-quantile", type=float, default=0.98,
                     help="Quantile (modes global-quantile / hybrid).")
+    pm.add_argument("--min-imax-quantile", type=float, default=0.0,
+                    help="Floor LAXISTE optionnel : drop les paires dont "
+                         "imp_max < quantile(imp_max, q) AVANT le top-K. "
+                         "0.0 = off (défaut). 0.5 (médiane) recommandé : "
+                         "élimine les gènes sans régulateur réel "
+                         "(régression-bruit) que per-target-topk "
+                         "garderait sinon à K arêtes de bruit. "
+                         "Cf. §14bis.6terdecies.")
     pm.add_argument("--out",
                     default="data/pyscenic/diff_coexpr/coexpr_diff.tsv")
     pm.set_defaults(func=cmd_merge_adjacencies)
