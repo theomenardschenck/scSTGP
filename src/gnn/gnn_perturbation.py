@@ -66,7 +66,12 @@ from scipy.stats import rankdata
 from sklearn.neighbors import NearestNeighbors
 from torch_geometric.nn import GATConv, HeteroConv
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Permettre l'import d'ora_consensus depuis src/validation/ora/ (layout local)
+# OU src/ (fallback flat-layout cluster).
+_HERE = Path(__file__).resolve().parent
+for _p in [_HERE, _HERE.parent / "validation" / "ora", _HERE.parent]:
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 from ora_consensus import (  # noqa: E402
     load_background,
     load_reactome_gmt,

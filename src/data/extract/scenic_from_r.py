@@ -44,7 +44,6 @@ import pickle
 import pandas as pd
 import numpy as np
 import scanpy as sc
-import loompy
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap
@@ -524,8 +523,150 @@ def main():
     client.close()
     cluster.close()
 
+# =============================================================================
+# SOUS-COMMANDE V4.2 : GRNBoost2 différentiel P4 / P16 sur TOUS les gènes QC
+# =============================================================================
+# Produit adjacencies_{P4,P16}.csv via arboreto CANONIQUE (pas la
+# réimplémentation sklearn de build_diff_coexpr.py grnboost2-local) — à
+# lancer là où arboreto fonctionne (local). Sortie consommée ensuite par
+#   build_diff_coexpr.py merge-adjacencies → coexpr_diff.tsv
+#   gnn_vgae.py --coexpr-mode differential
+#
+# Différences avec main() legacy :
+#   - lit merged_P4_P16_normalized.csv (TOUS les gènes QC, ~15779) et
+#     non la matrice pyscenic 5000-HVG ;
+#   - filtre par `passage` == condition (P4 ou P16) → réseaux séparés ;
+#   - GRNBoost2 SEUL (pas RcisTarget/AUCell).
+# seed=42 IDENTIQUE P4/P16 → le delta n'est pas confondu par la
+# stochasticité GRNBoost2 (cf. §14bis.6octies du rapport).
+_META_COLS = ("passage", "cluster_P16", "cell_state")
+
+
+def run_grnboost2_diff(condition: str, merged_path: str, tf_list_path: str,
+                       out_path: str, n_workers: int = 6,
+                       seed: int = 42, memory_limit: str = "8GB") -> None:
+    import os
+    # arboreto exige l'API legacy dask.dataframe ; si dask-expr présent
+    # (≥2024.3) on le désactive AVANT tout import dask (no-op si déjà legacy).
+    os.environ.setdefault("DASK_DATAFRAME__QUERY_PLANNING", "False")
+    try:
+        import dask
+        dask.config.set({"dataframe.query-planning": False})
+    except Exception:
+        pass  # arboreto local : si dask gère déjà legacy, no-op
+    import pandas as pd
+    # arboreto exige l'API legacy dask.dataframe. Si dask ≥ 2025.1
+    # (legacy SUPPRIMÉE, pas seulement désactivable) → import lève
+    # NotImplementedError. On capture et on guide vers les solutions
+    # plutôt que d'afficher un traceback brut.
+    try:
+        from dask.distributed import Client, LocalCluster
+        from arboreto.algo import grnboost2
+    except (NotImplementedError, ImportError) as _e:
+        raise SystemExit(
+            f"\n[grn-diff] arboreto/dask CASSÉ dans cet env : {type(_e).__name__}: {_e}\n"
+            "\n→ Solution A (recommandée) — réimplémentation sklearn (zéro dask) :\n"
+            "    python src/preprocess/build_diff_coexpr.py extract-matrices \\\n"
+            "        --merged data/gnn_data/merged_P4_P16_normalized.csv \\\n"
+            "        --gene-universe all --out-dir data/pyscenic/diff_coexpr\n"
+            "    python src/preprocess/build_diff_coexpr.py grnboost2-local \\\n"
+            "        --expr data/pyscenic/diff_coexpr/expr_matrix_P4.csv \\\n"
+            "        --tf-list data/pyscenic/scenic_refs/allTFs_hg38.txt \\\n"
+            "        --out data/pyscenic/diff_coexpr/adjacencies_P4.csv --n-jobs 6\n"
+            "    (idem --expr expr_matrix_P16.csv --out adjacencies_P16.csv)\n"
+            "\n→ Solution B — env conda séparé avec dask pinné < 2024.3 :\n"
+            "    micromamba create -n arboreto -c conda-forge -c bioconda -y \\\n"
+            "        python=3.11 'dask<2024.3' 'distributed<2024.3' arboreto pandas scanpy\n"
+            "    micromamba run -n arboreto python src/extraction/scenic_from_r.py \\\n"
+            "        grnboost2-diff --condition P4 ... (cf. --help)\n"
+            "\nCf. §14bis.6quindecies du rapport.\n"
+        )
+
+    if condition not in ("P4", "P16"):
+        raise SystemExit(f"[grn-diff] --condition doit être P4 ou P16 "
+                         f"(reçu : {condition})")
+
+    print("=" * 60)
+    print(f"GRNBoost2 différentiel — condition {condition} (arboreto)")
+    print("=" * 60)
+
+    # 1. Charger le merged normalisé (post-QC) et filtrer par passage.
+    #    Lecture chunkée : le fichier fait ~976 Mo.
+    print(f"[grn-diff] lecture {merged_path} (chunks) ...")
+    buf, gene_cols = [], None
+    for chunk in pd.read_csv(merged_path, index_col=0, chunksize=2000):
+        if "passage" not in chunk.columns:
+            raise SystemExit("[grn-diff] colonne 'passage' absente du merged.")
+        if gene_cols is None:
+            gene_cols = [c for c in chunk.columns if c not in _META_COLS]
+        sub = chunk[chunk["passage"] == condition]
+        if not sub.empty:
+            buf.append(sub[gene_cols])
+    if not buf:
+        raise SystemExit(f"[grn-diff] aucune cellule {condition} dans le merged.")
+    expr_df = pd.concat(buf, axis=0)
+    print(f"[grn-diff] {condition} : {expr_df.shape[0]} cellules × "
+          f"{expr_df.shape[1]} gènes (TOUS les QC)")
+
+    # 2. TF list + normalisation underscore↔dash (idem main()).
+    tf_list = pd.read_csv(tf_list_path, header=None)[0].tolist()
+    cols = set(expr_df.columns)
+    tf_in_data = sorted({
+        (tf if tf in cols else tf.replace("_", "-"))
+        for tf in tf_list
+        if tf in cols or tf.replace("_", "-") in cols
+    })
+    print(f"[grn-diff] TFs mappés : {len(tf_in_data)}/{len(tf_list)}")
+    if len(tf_in_data) < 10:
+        raise SystemExit(f"[grn-diff] seulement {len(tf_in_data)} TFs — "
+                         f"vérifier la nomenclature des gènes.")
+
+    # 3. Dask LocalCluster + GRNBoost2 (même signature que main(), prouvée).
+    cluster = LocalCluster(n_workers=n_workers, threads_per_worker=1,
+                           dashboard_address=None, silence_logs=True,
+                           memory_limit=memory_limit)
+    client = Client(cluster)
+    print(f"[grn-diff] Dask : {n_workers} workers — GRNBoost2 "
+          f"(peut prendre 1-3 h sur {expr_df.shape[1]} gènes) ...")
+    adj = grnboost2(expression_data=expr_df, tf_names=tf_in_data,
+                    client_or_address=client, seed=seed, verbose=True)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".",
+                exist_ok=True)
+    adj.to_csv(out_path, index=False)
+    client.close()
+    cluster.close()
+    print(f"[grn-diff] {condition} : {len(adj)} paires (TF,target,"
+          f"importance) → {out_path}")
+    print(f"[grn-diff] ENSUITE : build_diff_coexpr.py merge-adjacencies "
+          f"--adj-{condition.lower()} {out_path} ...")
+
+
 if __name__ == '__main__':
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "grnboost2-diff":
+        import argparse
+        ap = argparse.ArgumentParser(
+            prog="scenic_from_r.py grnboost2-diff",
+            description="GRNBoost2 arboreto sur TOUS les gènes QC, "
+                        "par condition (P4 ou P16). Sortie = "
+                        "adjacencies_{cond}.csv pour build_diff_coexpr.")
+        ap.add_argument("grnboost2-diff")  # placeholder positionnel
+        ap.add_argument("--condition", required=True, choices=["P4", "P16"])
+        ap.add_argument("--merged",
+                        default="data/gnn_data/merged_P4_P16_normalized.csv")
+        ap.add_argument("--tf-list",
+                        default="data/pyscenic/scenic_refs/allTFs_hg38.txt")
+        ap.add_argument("--out", required=True,
+                        help="adjacencies_{P4,P16}.csv de sortie")
+        ap.add_argument("--n-workers", type=int, default=6)
+        ap.add_argument("--seed", type=int, default=42,
+                        help="IDENTIQUE P4/P16 (delta non confondu)")
+        ap.add_argument("--memory-limit", default="8GB")
+        a = ap.parse_args()
+        run_grnboost2_diff(a.condition, a.merged, a.tf_list, a.out,
+                           a.n_workers, a.seed, a.memory_limit)
+    else:
+        main()  # comportement legacy inchangé
 
 ################################################################################
 # NOTES

@@ -31,12 +31,12 @@ Output TSV columns (matches format of pre-existing ora_v3 files):
 Usage
 -----
     # REACTOME ORA on an explicit gene list
-    python src/validation/ora_consensus.py \\
+    python src/validation/ora/ora_consensus.py \\
         --genes docs/novel_genes_consensus_3of3.txt \\
         --out output/ora_v3/consensus_3of3_reactome.tsv
 
     # Aging-database ORA with consensus built from three runs
-    python src/validation/ora_consensus.py \\
+    python src/validation/ora/ora_consensus.py \\
         --db aging \\
         --consensus-runs output/gnn_vgae/V3.3/run1 \\
                          output/gnn_vgae/V3.3/run2 \\
@@ -60,7 +60,7 @@ def _find_project_root(start: Path, fallback_levels: int = 2) -> Path:
     """Remonte les ancêtres jusqu'à trouver `data/databases/`.
 
     Robuste aux deux layouts du projet :
-        local   : src/validation/ora_consensus.py → parents[2] = projet
+        local   : src/validation/ora/ora_consensus.py → parents[2] = projet
         cluster : src/ora_consensus.py            → parents[1] = projet
     Un override env GNN_PROJECT_ROOT court-circuite la détection (utile en
     cas de structure exotique). Fallback : parents[fallback_levels] si

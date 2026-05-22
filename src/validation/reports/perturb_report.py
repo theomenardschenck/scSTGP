@@ -35,7 +35,7 @@ Usage
         --perturb-dir output/gnn_vgae/V3_Run3/perturbation \\
         --min-baseline-pct 10
     
-    python src/validation/perturb_report.py --cross-seed output/gnn_vgae/V3.6/full/* --top-per-side 3
+    python src/validation/reports/perturb_report.py --cross-seed output/gnn_vgae/V3.6/full/* --top-per-side 3
 
 Outputs (inside <perturb-dir>/report/)
 --------------------------------------
@@ -1822,7 +1822,11 @@ def _load_reactome_pathways() -> dict[str, set[str]]:
     except Exception:
         try:
             import sys
-            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            here = Path(__file__).resolve()
+            # src/validation/reports/ → src/validation/ora/ + flat fallback src/
+            for cand in [here.parent.parent / "ora", here.parent.parent.parent]:
+                if cand.exists() and str(cand) not in sys.path:
+                    sys.path.insert(0, str(cand))
             from ora_consensus import load_reactome_gmt
             return load_reactome_gmt()
         except Exception as e:

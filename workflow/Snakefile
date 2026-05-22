@@ -220,7 +220,7 @@ rule aggregate_scoring:
     threads: 4
     shell:
         # TODO Tier 2.5 : `python -m gnn_huvec.cli.perturb_report`
-        "python src/validation/perturb_report.py "
+        "python src/validation/reports/perturb_report.py "
         "--cross-seed "
         "--perturb-dirs {OUT_DIR}/perturbation/seed* "
         "--de-magnitude-csv {input.degs} "
@@ -244,7 +244,7 @@ rule validate_ora:
     log:
         OUT_DIR / "logs/validate_ora.log",
     shell:
-        "python src/validation/ora_consensus.py "
+        "python src/validation/ora/ora_consensus.py "
         "--db aging "
         "--ranking {input.ranking} "
         "--out {output.results} "
@@ -259,7 +259,7 @@ rule cluster_annotation:
     log:
         OUT_DIR / "logs/cluster_annotation.log",
     shell:
-        "python src/validation/cluster_annotation.py "
+        "python src/validation/cluster/cluster_annotation.py "
         "--run-dir $(dirname {input.graph}) "
         "--out {output.annotation} "
         "&> {log}"

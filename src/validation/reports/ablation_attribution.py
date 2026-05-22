@@ -24,7 +24,7 @@
 
 Usage
 -----
-    python src/validation/ablation_attribution.py \\
+    python src/validation/reports/ablation_attribution.py \\
         --reference output/gnn_vgae/V4.1/cross_seed_v4.1-baseline_axisV4 \\
         --ablations \\
             output/gnn_vgae/V4.1/cross_seed_v4.1-baseline+no-coexpr_axisV4 \\
@@ -33,7 +33,7 @@ Usage
         --out-dir output/gnn_vgae/V4.1/attribution_baseline
 
     # Sur la branche full V4.1 :
-    python src/validation/ablation_attribution.py \\
+    python src/validation/reports/ablation_attribution.py \\
         --reference output/gnn_vgae/V4.1/cross_seed_v4.1-full_axisV4 \\
         --ablations \\
             output/gnn_vgae/V4.1/cross_seed_v4.1-full+no-coexpr_axisV4 \\
@@ -59,11 +59,18 @@ from pathlib import Path
 import pandas as pd
 
 
-# Bootstrap pour importer ora_consensus.py côte à côte
+# Bootstrap pour importer ora_consensus.py (src/validation/ora/) et permettre
+# le fallback flat-layout du cluster (tout sous src/).
 def _bootstrap_paths():
     here = Path(__file__).resolve()
-    if str(here.parent) not in sys.path:
-        sys.path.insert(0, str(here.parent))
+    candidates = [
+        here.parent,                       # src/validation/reports/ (cas inattendu)
+        here.parent.parent / "ora",        # src/validation/ora/ (layout local)
+        here.parent.parent.parent,         # src/ (fallback flat cluster)
+    ]
+    for cand in candidates:
+        if cand.exists() and str(cand) not in sys.path:
+            sys.path.insert(0, str(cand))
 
 
 _bootstrap_paths()
@@ -280,7 +287,7 @@ def render_markdown(delta: pd.DataFrame,
     lines.append("")
     lines.append("Référence : Ramaswamy 2021 *Bioinformatics* (edge perturbation "
                  "ranking) ; ORA hypergéométrique via "
-                 "`src/validation/ora_consensus.py` (BH-FDR sur catalogues).")
+                 "`src/validation/ora/ora_consensus.py` (BH-FDR sur catalogues).")
     return "\n".join(lines)
 
 

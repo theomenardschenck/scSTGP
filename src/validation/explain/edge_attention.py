@@ -37,13 +37,13 @@ Choix d'agrégation
 
 Usage
 -----
-    python src/validation/edge_attention.py extract \\
+    python src/validation/explain/edge_attention.py extract \\
         --run-dir output/gnn_vgae/V4.0/v4-full.s1 \\
         --target-genes H2AFZ HMGB1 ASNS \\
         --top-k 30 \\
         --out-dir output/gnn_vgae/V4.0/v4-full.s1/attention
 
-    python src/validation/edge_attention.py figure \\
+    python src/validation/explain/edge_attention.py figure \\
         --attention-tsv .../attention/edge_attention.tsv \\
         --target-gene H2AFZ \\
         --top-k 20
@@ -70,9 +70,11 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 def _bootstrap_paths():
     here = Path(__file__).resolve()
-    project_root = here.parents[2]  # gnn_huvec/
+    # src/validation/explain/edge_attention.py → parents[3] = gnn_huvec/
+    # Fallback flat-layout cluster : parents[1] = gnn_huvec/ aussi (src/edge_attention.py).
+    project_root = here.parents[3] if len(here.parents) > 3 else here.parents[1]
     for p in [project_root / "src", project_root]:
-        if str(p) not in sys.path:
+        if p.exists() and str(p) not in sys.path:
             sys.path.insert(0, str(p))
 
 
