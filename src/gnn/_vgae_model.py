@@ -32,6 +32,16 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv, HeteroConv
 
 
+# V5 (TIER 1c) — edge_types qui portent un `sign` (colonne 1 de edge_attr).
+# Synchronisé avec gnn_vgae.py.
+SIGNED_EDGE_TYPES: set = {
+    ("gene", "signaling", "gene"),
+    ("gene", "tf_curated", "gene"),
+    ("gene", "tf_curated_by", "gene"),
+    ("gene", "reactome_fi", "gene"),
+}
+
+
 class _ScaledConv(nn.Module):
     """Wrapper V4.2 : multiplie la sortie d'un conv par γ_t fixe.
     Cf. gnn_vgae.py — synchronisé manuellement (Tier 2.5)."""
@@ -65,10 +75,15 @@ class HeteroEncoder(nn.Module):
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
                  n_heads=4, dropout=0.2, available_edge_types=None,
-                 edge_dim_overrides=None, edge_type_weights=None):
+                 edge_dim_overrides=None, edge_type_weights=None,
+                 signed_message=False, signed_edge_types=None):
         super().__init__()
         self._edge_dim_overrides = edge_dim_overrides or {}
         self._edge_type_weights = edge_type_weights or {}
+        self._signed_message = bool(signed_message)
+        self._signed_edge_types = set(
+            tuple(et) for et in (signed_edge_types or SIGNED_EDGE_TYPES)
+        )
         self.n_layers = n_layers
         head_dim = hidden // n_heads
 
@@ -114,7 +129,16 @@ class HeteroEncoder(nn.Module):
                                    dropout=dropout, add_self_loops=False)
                 if ed is not None:
                     conv_kwargs["edge_dim"] = ed
-                _gat = GATConv(hidden, head_dim, **conv_kwargs)
+                # V5 : SignedGATConv pour les edge_types signés si flag actif.
+                _use_signed = (
+                    self._signed_message
+                    and et in self._signed_edge_types
+                    and ed is not None and ed >= 2
+                )
+                if _use_signed:
+                    _gat = SignedGATConv(hidden, head_dim, sign_col=1, **conv_kwargs)
+                else:
+                    _gat = GATConv(hidden, head_dim, **conv_kwargs)
                 _g = self.edge_gammas.get(et, 1.0)
                 conv_dict[et] = (_ScaledConv(_gat, _g) if _g != 1.0 else _gat)
             self.convs.append(HeteroConv(conv_dict, aggr="sum"))
@@ -190,25 +214,38 @@ class SignedGATConv(GATConv):
     def __init__(self, *args, sign_col: int = 1, **kwargs):
         super().__init__(*args, **kwargs)
         self.sign_col = sign_col
+        # Buffer transient pour le sign de l'edge courant (capturé dans
+        # forward(), consommé dans message()). PyG ne passe pas edge_attr
+        # à message() par défaut — d'où ce mécanisme « stash ».
+        self._current_edge_sign = None
 
-    def message(self, x_j, alpha, index, ptr, size_i, **kwargs):
-        # Recup standard du message GATConv : α_ij · W·h_j (broadcast head).
-        out = super().message(x_j=x_j, alpha=alpha, index=index,
-                              ptr=ptr, size_i=size_i, **kwargs)
-        # Application du sign si disponible dans edge_attr (via kwargs).
-        # PyG passe edge_attr en kwargs si edge_dim défini.
-        edge_attr = kwargs.get("edge_attr", None)
-        if edge_attr is None or edge_attr.ndim < 2:
+    def forward(self, x, edge_index, edge_attr=None, size=None,
+                return_attention_weights=None):
+        # Capture du sign AVANT propagate(), pour que message() puisse
+        # l'utiliser. edge_attr peut être (E, 1) (unsigned), (E, 2)
+        # ([score, sign]) ou plus.
+        if edge_attr is not None and edge_attr.ndim >= 2 \
+                and edge_attr.shape[1] > self.sign_col:
+            self._current_edge_sign = edge_attr[:, self.sign_col]
+        else:
+            self._current_edge_sign = None
+        return super().forward(x, edge_index, edge_attr=edge_attr,
+                               size=size,
+                               return_attention_weights=return_attention_weights)
+
+    def message(self, x_j, alpha):
+        # Sortie GATConv : (E, n_heads, head_dim) — concat=True le rendra
+        # (E, n_heads * head_dim) ensuite (au niveau forward, pas message).
+        out = super().message(x_j, alpha)
+        sign = self._current_edge_sign
+        if sign is None:
             return out
-        if edge_attr.shape[1] <= self.sign_col:
-            return out
-        sign = edge_attr[:, self.sign_col].view(-1, 1, 1)  # broadcast head, feat
-        # Si sign ∈ {-1, 0, +1}, sign=0 (info inconnue) → message inchangé.
-        # Convention : message *= sign si sign != 0, sinon *= 1.
-        scale = torch.where(sign == 0,
-                            torch.ones_like(sign),
-                            sign)
-        return out * scale.squeeze(-1) if out.ndim == 2 else out * scale
+        # sign ∈ {-1, 0, +1} → scale ∈ {-1, 1, 1} (sign=0 = info inconnue,
+        # message inchangé). Broadcast sur les dims n_heads × head_dim.
+        scale = torch.where(sign == 0, torch.ones_like(sign), sign)
+        # out a 2 ou 3 dims selon la version pyg ; broadcast via view.
+        scale = scale.view(-1, *([1] * (out.ndim - 1)))
+        return out * scale
 
 
 class BilinearSignedDecoder(nn.Module):
@@ -278,13 +315,27 @@ class BilinearSignedDecoder(nn.Module):
 
 
 class VGAE(nn.Module):
-    """VGAE complet : encoder + reparametrization + décodeur cosinus."""
+    """VGAE complet : encoder + reparametrization + décodeur cosinus.
 
-    def __init__(self, encoder, tau_init=2.0, tau_max=3.0):
+    V5 (TIER 1c.3) : `bilinear_decoder` optionnel ; quand fourni, expose
+    `decode_signed(z, edge_index, edge_sign)` en plus du décodeur cosinus
+    historique (backward-compat V4.x).
+    """
+
+    def __init__(self, encoder, tau_init=2.0, tau_max=3.0,
+                 bilinear_decoder=None):
         super().__init__()
         self.encoder = encoder
         self.log_tau = nn.Parameter(torch.tensor(float(np.log(tau_init))))
         self.log_tau_max = np.log(tau_max)
+        self.bilinear_decoder = bilinear_decoder
+
+    def decode_signed(self, z, edge_index, edge_sign):
+        if self.bilinear_decoder is None:
+            raise AttributeError(
+                "VGAE.decode_signed appelé mais bilinear_decoder=None."
+            )
+        return self.bilinear_decoder.forward_signed(z, edge_index, edge_sign)
 
     def reparametrize(self, mu, logvar):
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)

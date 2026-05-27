@@ -216,6 +216,34 @@ def _parse_cli_args():
                         "1→2). Cf. §14bis.6quaterdecies. Bénéfice plein "
                         "avec V5 (message/decodeur signés).")
 
+    # --- V5 : message-passing signé + décodeur bilinéaire signé (TIER 1c) ---
+    # Tous opt-in, défaut OFF → backward-compat V4.x. Cf. §14bis.6septies
+    # du rapport, prototypes dans src/gnn/_vgae_model.py:171-277.
+    p.add_argument("--signed-message",
+                   action="store_true", default=False,
+                   help="V5 (TIER 1c.2) : remplace GATConv par SignedGATConv "
+                        "pour les edge_types signés (signaling, tf_curated, "
+                        "tf_curated_by, reactome_fi). Chaque message est "
+                        "multiplié par son `sign` (colonne 1 de edge_attr) "
+                        "⇒ une arête `sign=-1` propage `-W·h_j`. Ref : Derr "
+                        "2018 ICDM SGCN §3.2. Défaut OFF (legacy).")
+    p.add_argument("--signed-decoder",
+                   action="store_true", default=False,
+                   help="V5 (TIER 1c.3) : ajoute un BilinearSignedDecoder "
+                        "(3 canaux W_+ / W_- / W_0) en parallèle du "
+                        "décodeur cosinus. Active une loss auxiliaire "
+                        "BCE(logit_bilin, sign∈{0,1}) sur les arêtes "
+                        "positives des edge_types signés. La loss "
+                        "principale (cosinus + KL) reste inchangée. Ref : "
+                        "Liu 2024 NAR SGAT-bilinear, Yang 2015 ICLR "
+                        "DistMult. Défaut OFF (legacy).")
+    p.add_argument("--signed-loss-weight", type=float, default=1.0,
+                   help="V5 (TIER 1c.4) : λ_signed multiplicateur de la "
+                        "loss auxiliaire signée (ignoré si "
+                        "--signed-decoder OFF). 1.0 = équivalent à la "
+                        "recon_loss principale ; 0.5 = demi-poids. Défaut "
+                        "1.0.")
+
     # --- Exclusion fine de features de noeud gene ---
     # Liste possible : is_tf, variance, ppi_degree, reg_degree,
     #                  imp_P4, imp_P16, imp_delta, has_humess
@@ -1901,6 +1929,116 @@ print("8. Modèle VGAE")
 print("=" * 70)
 
 
+# V5 (TIER 1c) — edge_types pour lesquels le `sign` ∈ {-1, 0, +1} est
+# présent en colonne 1 de edge_attr (convention V4 : edge_attr=[score, sign]).
+# Routés vers SignedGATConv si --signed-message, et vers le canal bilinéaire
+# signé si --signed-decoder. Les autres edge_types restent unsigned
+# (PPI/coexpr/REACTOME : décodeur cosinus, GATConv standard).
+SIGNED_EDGE_TYPES: set = {
+    ("gene", "signaling", "gene"),
+    ("gene", "tf_curated", "gene"),
+    ("gene", "tf_curated_by", "gene"),
+    ("gene", "reactome_fi", "gene"),
+}
+
+
+class SignedGATConv(GATConv):
+    """V5 (TIER 1c.2) — GATConv qui multiplie chaque message par son sign d'arête.
+
+    Extension du design A (V4 edge_attr=[score, sign] consommé par
+    l'attention via edge_dim=2) : force le `sign` à influencer aussi
+    le MESSAGE. Pour une arête `sign=-1`, propage `-W·h_j` au lieu de
+    `+W·h_j` — sémantique « inhibition » explicitement codée dans la
+    mise à jour d'embedding.
+
+    Ref : Derr et al. 2018 *ICDM* SGCN §3.2 (balance theory pour
+    message-passing signé), adapté au cadre GAT (PyG).
+
+    Sign lu depuis `edge_attr[:, sign_col]` (convention V4 : colonne 1).
+    Backward-compat : si edge_attr None ou sign_col hors borne, retombe
+    sur GATConv standard. Source de vérité : src/gnn/_vgae_model.py:171.
+    """
+
+    def __init__(self, *args, sign_col: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sign_col = sign_col
+        # Buffer transient (forward → message). PyG ne passe pas edge_attr
+        # à message() — on doit le « stash » nous-mêmes.
+        self._current_edge_sign = None
+
+    def forward(self, x, edge_index, edge_attr=None, size=None,
+                return_attention_weights=None):
+        if edge_attr is not None and edge_attr.ndim >= 2 \
+                and edge_attr.shape[1] > self.sign_col:
+            self._current_edge_sign = edge_attr[:, self.sign_col]
+        else:
+            self._current_edge_sign = None
+        return super().forward(x, edge_index, edge_attr=edge_attr,
+                               size=size,
+                               return_attention_weights=return_attention_weights)
+
+    def message(self, x_j, alpha):
+        out = super().message(x_j, alpha)
+        sign = self._current_edge_sign
+        if sign is None:
+            return out
+        scale = torch.where(sign == 0, torch.ones_like(sign), sign)
+        scale = scale.view(-1, *([1] * (out.ndim - 1)))
+        return out * scale
+
+
+class BilinearSignedDecoder(nn.Module):
+    """V5 (TIER 1c.3) — décodeur bilinéaire 3 canaux (activate / inhibit / unsigned).
+
+    Pour une arête (i, j) avec sign ∈ {+1, -1, 0} :
+
+        logit(activate, i→j) = z_i^T W_+ z_j
+        logit(inhibit,  i→j) = z_i^T W_- z_j
+        logit(neutral,  i→j) = z_i^T W_0 z_j
+
+    Sélection vectorisée par signe au moment du forward.
+
+    Préserve la compat V4.x : le décodeur cosinus de VGAE reste actif
+    pour la loss principale ; le canal bilinéaire est utilisé en
+    AUXILIAIRE pour la loss signée (TIER 1c.4).
+
+    Ref : Liu et al. 2024 *NAR* SGAT-bilinear ; Yang et al. 2015 *ICLR*
+    DistMult généralisé à la classification signée.
+    Source de vérité : src/gnn/_vgae_model.py:214.
+    """
+
+    def __init__(self, latent_dim: int):
+        super().__init__()
+        eye = torch.eye(latent_dim)
+        # Init identité + bruit ⇒ démarre proche du produit scalaire,
+        # se spécialise progressivement par canal pendant l'entraînement.
+        self.W_pos = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
+        self.W_neg = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
+        self.W_zero = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
+
+    def forward_signed(self, z: torch.Tensor, edge_index: torch.Tensor,
+                       edge_sign: torch.Tensor) -> torch.Tensor:
+        """Logits bilinéaires par canal sélectionné selon edge_sign.
+
+        Args:
+            z : (n_nodes, latent_dim) embeddings.
+            edge_index : (2, E) paires (src, dst).
+            edge_sign : (E,) sign ∈ {-1, 0, +1}.
+
+        Returns:
+            (E,) logits. Appliquer σ pour proba.
+        """
+        z_src = z[edge_index[0]]
+        z_dst = z[edge_index[1]]
+        logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
+        logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
+        logit_zero = (z_src @ self.W_zero * z_dst).sum(dim=-1)
+        mask_pos = (edge_sign > 0).float()
+        mask_neg = (edge_sign < 0).float()
+        mask_zero = (edge_sign == 0).float()
+        return mask_pos * logit_pos + mask_neg * logit_neg + mask_zero * logit_zero
+
+
 class _ScaledConv(nn.Module):
     """Wrapper V4.2 : multiplie la sortie d'un conv par γ_t (scalaire fixe).
 
@@ -1974,7 +2112,8 @@ class HeteroEncoder(nn.Module):
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
                  n_heads=4, dropout=0.2, available_edge_types=None,
-                 edge_dim_overrides=None, edge_type_weights=None):
+                 edge_dim_overrides=None, edge_type_weights=None,
+                 signed_message=False, signed_edge_types=None):
         """
         Args:
             available_edge_types: itérable de tuples (src, rel, dst) — typiquement
@@ -1987,10 +2126,20 @@ class HeteroEncoder(nn.Module):
                 facteur multiplicatif appliqué à la sortie du GATConv de ce
                 type AVANT l'agrégation HeteroConv-sum. None/{} = tous γ=1.0
                 (comportement V4.1). Cf. §14bis.6bis du rapport.
+            signed_message: V5 (TIER 1c.2). Si True, utilise SignedGATConv
+                pour les edge_types listés dans `signed_edge_types` ET dont
+                edge_dim>=2 (sign disponible). Défaut False (V4.x legacy).
+            signed_edge_types: set de tuples (src, rel, dst). Défaut =
+                SIGNED_EDGE_TYPES (signaling, tf_curated, tf_curated_by,
+                reactome_fi). Ignoré si signed_message=False.
         """
         super().__init__()
         self._edge_dim_overrides = edge_dim_overrides or {}
         self._edge_type_weights = edge_type_weights or {}
+        self._signed_message = bool(signed_message)
+        self._signed_edge_types = set(
+            tuple(et) for et in (signed_edge_types or SIGNED_EDGE_TYPES)
+        )
         self.n_layers = n_layers
         # Chaque tête d'attention travaille en dimension head_dim = hidden/n_heads.
         # Les résultats des n_heads têtes sont concaténés → sortie = hidden.
@@ -2050,6 +2199,7 @@ class HeteroEncoder(nn.Module):
         if _non_unit:
             print(f"  HeteroEncoder γ_t (message-level) : {_non_unit}")
 
+        _signed_used = []  # debug : edge_types effectivement routés vers SignedGATConv
         for _ in range(n_layers):
             conv_dict = {}
             for et, ed in edge_types_dims:
@@ -2065,7 +2215,20 @@ class HeteroEncoder(nn.Module):
                                    dropout=dropout, add_self_loops=False)
                 if ed is not None:
                     conv_kwargs["edge_dim"] = ed
-                _gat = GATConv(hidden, head_dim, **conv_kwargs)
+                # V5 (TIER 1c.2) : SignedGATConv pour les edge_types signés
+                # uniquement si edge_dim >= 2 (sign en colonne 1). Pour les
+                # autres types ou si --signed-message OFF : GATConv standard.
+                _use_signed = (
+                    self._signed_message
+                    and et in self._signed_edge_types
+                    and ed is not None and ed >= 2
+                )
+                if _use_signed:
+                    _gat = SignedGATConv(hidden, head_dim, sign_col=1, **conv_kwargs)
+                    if et[1] not in _signed_used:
+                        _signed_used.append(et[1])
+                else:
+                    _gat = GATConv(hidden, head_dim, **conv_kwargs)
                 # V4.2 : si γ_t ≠ 1.0, on enveloppe le GATConv dans un
                 # scaler qui multiplie sa sortie par γ_t AVANT que
                 # HeteroConv(aggr="sum") ne somme les canaux. Ainsi
@@ -2084,6 +2247,14 @@ class HeteroEncoder(nn.Module):
                 "gene": nn.BatchNorm1d(hidden),
                 "cell_group": nn.BatchNorm1d(hidden),
             }))
+
+        if self._signed_message:
+            if _signed_used:
+                print(f"  HeteroEncoder V5 SignedGATConv actif sur : {_signed_used}")
+            else:
+                print(f"  [warn] --signed-message ON mais aucun edge_type "
+                      f"signé éligible présent (signed_edge_types ∩ "
+                      f"available avec edge_dim≥2 vide).")
 
         self.dropout = nn.Dropout(dropout)
 
@@ -2214,7 +2385,8 @@ class VGAE(nn.Module):
       On clampe τ ≤ tau_max pour éviter le surapprentissage.
     """
 
-    def __init__(self, encoder, tau_init=2.0, tau_max=3.0):
+    def __init__(self, encoder, tau_init=2.0, tau_max=3.0,
+                 bilinear_decoder=None):
         super().__init__()
         self.encoder = encoder
         # τ est stocké comme log(τ) pour garantir τ > 0 (exp est toujours positif).
@@ -2223,6 +2395,24 @@ class VGAE(nn.Module):
         # trop grands et le modèle surapprent les arêtes d'entraînement.
         self.log_tau = nn.Parameter(torch.tensor(float(np.log(tau_init))))
         self.log_tau_max = np.log(tau_max)
+        # V5 (TIER 1c.3) : décodeur bilinéaire signé optionnel. Si présent,
+        # il est utilisé en AUXILIAIRE de `decode()` (cosinus) pour la loss
+        # signée sur les arêtes positives des edge_types signés. Le décodeur
+        # principal (cosinus) reste actif pour la loss de reconstruction
+        # principale — backward-compat V4.x.
+        self.bilinear_decoder = bilinear_decoder
+
+    def decode_signed(self, z, edge_index, edge_sign):
+        """V5 (TIER 1c.3) — logits bilinéaires sur arêtes signées.
+
+        Raise AttributeError si `bilinear_decoder=None` (= --signed-decoder OFF).
+        """
+        if self.bilinear_decoder is None:
+            raise AttributeError(
+                "VGAE.decode_signed appelé mais bilinear_decoder=None. "
+                "Active --signed-decoder à l'init du modèle."
+            )
+        return self.bilinear_decoder.forward_signed(z, edge_index, edge_sign)
 
     def reparametrize(self, mu, logvar):
         """
@@ -2333,8 +2523,19 @@ encoder = HeteroEncoder(
     }),
     # V4.2 : pondération γ_t par edge_type (message-level), toggleable.
     edge_type_weights=EDGE_TYPE_WEIGHTS or None,
+    # V5 (TIER 1c.2) : SignedGATConv pour les edge_types signés si flag actif.
+    signed_message=CLI_ARGS.signed_message,
+    signed_edge_types=SIGNED_EDGE_TYPES,
 )
-model = VGAE(encoder)
+# V5 (TIER 1c.3) : décodeur bilinéaire signé optionnel, instancié uniquement
+# si --signed-decoder. Sinon, VGAE utilise uniquement le décodeur cosinus
+# historique (backward-compat V4.x).
+_bilinear_decoder = (BilinearSignedDecoder(LATENT_DIM)
+                     if CLI_ARGS.signed_decoder else None)
+model = VGAE(encoder, bilinear_decoder=_bilinear_decoder)
+if CLI_ARGS.signed_decoder:
+    print(f"  VGAE V5 BilinearSignedDecoder actif (λ_signed="
+          f"{CLI_ARGS.signed_loss_weight}).")
 
 total_params = sum(p.numel() for p in model.parameters())
 print(f"  VGAE : {N_LAYERS} couches GATConv, hidden={HIDDEN_DIM}, latent={LATENT_DIM}")
@@ -2443,6 +2644,38 @@ for et_key in data.edge_types:
     if "edge_attr" in store and store.edge_attr is not None:
         edge_attr_dict[et_key] = store.edge_attr
 
+# V5 (TIER 1c.4) : pool des arêtes signées POSITIVES pour la loss auxiliaire.
+# {edge_type: (edge_index_dirigé, sign∈{-1,0,+1})}. Construit une seule fois,
+# indépendamment du split train/test du pool de reconstruction (smoke test :
+# on entraîne sur l'ensemble du pool signé).
+signed_pos_pool: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+if CLI_ARGS.signed_decoder:
+    for et_key in data.edge_types:
+        if tuple(et_key) not in SIGNED_EDGE_TYPES:
+            continue
+        ea = edge_attr_dict.get(et_key)
+        ei = edge_index_dict.get(et_key)
+        if ea is None or ea.ndim < 2 or ea.shape[1] < 2 or ei is None \
+                or ei.numel() == 0:
+            continue
+        # Convention V4 : edge_attr=[score, sign]. Seules les arêtes signées
+        # (sign != 0) contribuent à la loss auxiliaire — sign=0 = info inconnue.
+        sign = ea[:, 1].float()
+        mask = sign != 0
+        if not mask.any():
+            continue
+        signed_pos_pool[tuple(et_key)] = (
+            ei[:, mask].clone(),
+            sign[mask].clone(),
+        )
+    if signed_pos_pool:
+        _summary = {et[1]: int(ei.shape[1])
+                    for et, (ei, _) in signed_pos_pool.items()}
+        print(f"  V5 signed_pos_pool (auxiliaire) : {_summary}")
+    else:
+        print("  [warn] --signed-decoder ON mais signed_pos_pool vide "
+              "(pas d'edge_type signé avec sign≠0 dans le graphe).")
+
 # Historique pour les plots
 train_losses = []      # Loss totale à chaque epoch
 recon_losses = []      # Loss de reconstruction à chaque epoch
@@ -2498,6 +2731,25 @@ for epoch in range(N_EPOCHS):
     )
     recon_loss = pos_loss + neg_loss
 
+    # --- V5 (TIER 1c.4) : loss auxiliaire signée (BilinearSignedDecoder) ---
+    # Cible binaire : sign>0 → 1 (activation), sign<0 → 0 (inhibition).
+    # BCE par edge_type signé sur logits bilinéaires, moyenne pondérée par
+    # le nombre d'arêtes. Active uniquement si --signed-decoder.
+    signed_aux_loss = torch.tensor(0.0, device=z.device)
+    if CLI_ARGS.signed_decoder and signed_pos_pool:
+        _aux_terms = []
+        for et_key, (ei, sign) in signed_pos_pool.items():
+            ei = ei.to(z.device)
+            sign = sign.to(z.device)
+            # Logits bilinéaires sur les arêtes signées dirigées.
+            logits = model.decode_signed(z, ei, sign)
+            target = (sign > 0).float()  # +1 → 1 ; -1 → 0
+            _aux_terms.append(F.binary_cross_entropy_with_logits(
+                logits, target
+            ))
+        if _aux_terms:
+            signed_aux_loss = torch.stack(_aux_terms).mean()
+
     # --- KL divergence avec annealing + free bits ---
     # KL ANNEALING : β augmente linéairement de 0 à KL_BETA_MAX pendant
     # les KL_WARMUP_EPOCHS premières epochs. Calendrier :
@@ -2510,8 +2762,9 @@ for epoch in range(N_EPOCHS):
     kl_beta = min(KL_BETA_MAX, KL_BETA_MAX * epoch / max(1, KL_WARMUP_EPOCHS))
     kl_loss = model.kl_loss(mu, logvar, free_bits=FREE_BITS)
 
-    # Loss totale = reconstruction + β × KL
-    loss = recon_loss + kl_beta * kl_loss
+    # Loss totale = reconstruction + β × KL + λ_signed × signed_aux (V5)
+    loss = recon_loss + kl_beta * kl_loss \
+        + CLI_ARGS.signed_loss_weight * signed_aux_loss
     loss.backward()
     # Gradient clipping : empêche les mises à jour explosives
     torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
@@ -2574,9 +2827,12 @@ for epoch in range(N_EPOCHS):
         # Log détaillé toutes les 50 epochs
         if (epoch + 1) % 50 == 0:
             tau_val = np.exp(model.log_tau.item())  # τ actuel
+            _signed_log = (f" sgn={signed_aux_loss.item():.4f}"
+                           if CLI_ARGS.signed_decoder else "")
             print(f"    Epoch {epoch+1:3d}/{N_EPOCHS} — "
                   f"Loss: {loss.item():.4f} (recon={recon_loss.item():.4f} "
-                  f"kl={kl_loss.item():.4f} β={kl_beta:.5f} τ={tau_val:.2f}) — "
+                  f"kl={kl_loss.item():.4f} β={kl_beta:.5f} τ={tau_val:.2f}"
+                  f"{_signed_log}) — "
                   f"Test AUC: {auc:.4f}, AP: {ap:.4f}")
 
     # Early stopping — si l'AUC ne s'améliore plus, on arrête avant
