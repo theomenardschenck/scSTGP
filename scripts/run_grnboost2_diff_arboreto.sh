@@ -43,7 +43,7 @@
 # Options : --dry-run | --n-workers 8 | --mem-per-cpu 10G | --time 06:00:00
 #
 # NB cluster Nautilus : .py déployés à plat sous src/. Donc
-# src/scenic_from_r.py (pas src/extraction/scenic_from_r.py).
+# src/scenic_from_r.py (pas src/data/extract/scenic_from_r.py).
 # =============================================================================
 set -euo pipefail
 

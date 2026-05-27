@@ -347,7 +347,7 @@ if [[ "$VERSION" == "V4.2" ]]; then
     if [[ ! -f "$DIFF_FILE" ]]; then
         echo "[err] coexpr_diff.tsv absent : $DIFF_FILE"
         echo "      Lance d'abord (workflow en 2 étapes découplées) :"
-        echo "        1. python src/preprocess/build_diff_coexpr.py extract-matrices \\"
+        echo "        1. python src/data/preprocess/build_diff_coexpr.py extract-matrices \\"
         echo "             --gene-universe graph --graph-genes <cross_seed_gene_ranking.tsv>"
         echo "        2. bash scripts/run_diff_coexpr.sh --step grnboost2"
         echo "        3. (attendre) bash scripts/run_diff_coexpr.sh --step merge"

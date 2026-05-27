@@ -11,7 +11,7 @@
 #
 # Prérequis étape grnboost2 (en local ou frontal) — RECOMMANDÉ mode
 # graph (couverture coexpr 100%% du graphe VGAE vs 40%% en HVG-5000) :
-#   python src/preprocess/build_diff_coexpr.py extract-matrices \
+#   python src/data/preprocess/build_diff_coexpr.py extract-matrices \
 #       --gene-universe graph \
 #       --graph-genes output/gnn_vgae/V4.1/full/cross_seed_v4.1-full_axisV4/cross_seed_gene_ranking.tsv
 #   → data/pyscenic/diff_coexpr/expr_matrix_{P4,P16}.csv (~11k gènes)
@@ -38,7 +38,7 @@
 # supported"). Zéro dépendance dask → robuste sur n'importe quel nœud.
 #
 # NB cluster Nautilus : .py déployés à plat sous src/ (pas de sous-dossiers).
-# Donc src/build_diff_coexpr.py (PAS src/preprocess/...).
+# Donc src/build_diff_coexpr.py (PAS src/data/preprocess/...).
 # =============================================================================
 set -euo pipefail
 
@@ -107,7 +107,7 @@ if [[ "$STEP" == "grnboost2" ]]; then
         if [[ ! -f "$M" ]]; then
             echo "[err] $M absent."
             echo "      Lance d'abord (local/frontal) :"
-            echo "      python src/preprocess/build_diff_coexpr.py extract-matrices \\"
+            echo "      python src/data/preprocess/build_diff_coexpr.py extract-matrices \\"
             echo "          --gene-universe graph --graph-genes <cross_seed_gene_ranking.tsv>"
             exit 1
         fi
