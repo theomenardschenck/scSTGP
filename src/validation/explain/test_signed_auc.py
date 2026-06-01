@@ -157,9 +157,36 @@ def load_run(run_dir: Path) -> tuple[VGAE, "HeteroData", list[str]]:
         # SignedGATConv hérite GATConv et restera comportement identique
         # quand _current_edge_sign est None.
     )
-    bilin = BilinearSignedDecoder(latent_dim=hp["latent"])
+
+    # V5.3 — détecter signed_decoder_dim depuis le state_dict.
+    # Trois cas :
+    #   (a) Checkpoint V5.3 : présence de `bilinear_decoder.signed_proj.weight`
+    #       → signed_dim = signed_proj.weight.shape[0].
+    #   (b) Checkpoint V5.1/V5.2 (pas de signed_proj) → signed_dim = latent_dim,
+    #       on instancie en V5.3 puis on load avec strict=False ; le
+    #       `signed_proj` reste à son init (identité + 0 bias) ⇒ équivalent
+    #       numérique exact à V5.2.
+    #   (c) Pas de bilinear_decoder du tout → bloqué en amont par `_detect_v5`.
+    _proj_w = state.get("bilinear_decoder.signed_proj.weight", None)
+    if _proj_w is not None:
+        signed_dim = int(_proj_w.shape[0])
+        strict_load = True
+    else:
+        signed_dim = hp["latent"]
+        strict_load = False
+        print(f"  [info] checkpoint V5.1/V5.2 (sans signed_proj) chargé en V5.3 "
+              f"avec signed_proj init=identité (équivalence numérique).")
+    bilin = BilinearSignedDecoder(latent_dim=hp["latent"], signed_dim=signed_dim)
     model = VGAE(encoder, bilinear_decoder=bilin)
-    model.load_state_dict(state, strict=True)
+    _missing, _unexpected = model.load_state_dict(state, strict=strict_load)
+    if not strict_load and _unexpected:
+        # Garde-fou : on accepte signed_proj manquant, mais pas d'autres
+        # surplus de poids (signe d'incompatibilité réelle).
+        _unexpected_other = [k for k in _unexpected
+                             if not k.startswith("bilinear_decoder.signed_proj.")]
+        if _unexpected_other:
+            raise RuntimeError(
+                f"state_dict contient des clés inattendues : {_unexpected_other}")
     model.eval()
 
     # gene_symbols : conservé soit dans data['gene'].gene_symbols, soit

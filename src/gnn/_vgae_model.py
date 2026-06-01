@@ -249,61 +249,93 @@ class SignedGATConv(GATConv):
 
 
 class BilinearSignedDecoder(nn.Module):
-    """Décodeur bilinéaire à 2 canaux pour reconstruction signée.
+    """Décodeur bilinéaire à 3 canaux pour reconstruction signée + tête sub-espace V5.3.
 
-    V5 (cf. §14bis.6septies). Pour une arête (i, j) avec sign ∈ {+1, -1} :
+    V5.1+ (cf. §14bis.6septies/octodecies). Pour une arête (i, j) avec
+    sign ∈ {+1, -1, 0} :
 
-        p(activate, i→j) = σ(z_i^T W_+ z_j)
-        p(inhibit,  i→j) = σ(z_i^T W_- z_j)
+        z_signed = signed_proj(z)            # V5.3 : projection sub-espace
+        logit_pos  = z_signed_i · W_+ · z_signed_j   (activation)
+        logit_neg  = z_signed_i · W_- · z_signed_j   (inhibition)
+        logit_zero = z_signed_i · W_0 · z_signed_j   (non-signé)
+        score sign-agnostique = logit_pos − logit_neg    (gate 1c.5)
 
-    Au moment de la loss, on prend le canal correspondant au sign cible :
-    `logit = sign_pos · logit_+ + sign_neg · logit_-` où sign_pos =
-    1{sign > 0} et sign_neg = 1{sign < 0}. Pour sign=0 (PPI non-signé),
-    on retombe sur `σ(z_i^T W_0 z_j)` (3e canal "interaction non signée").
+    **V5.3 (§14bis.6unvicesies)** : `signed_proj : R^latent → R^signed_dim`
+    insère une projection linéaire entre `z` et les bilinéaires. Le gradient
+    du `signed_aux_loss` passe par `signed_proj` ET filtre vers `z` —
+    `signed_proj` absorbe une partie de la contrainte, ce qui réduit la
+    concurrence avec le décodeur cosinus principal (V5.2 mesure : −0.022
+    AUC recon dûe à cette concurrence).
 
-    Préserve la compatibilité avec le décodeur cosinus existant pour
-    les edge_types unsigned (PPI, coexpr, REACTOME) en exposant
-    `forward_cosine()` séparément.
+    Backward-compat V5.1/V5.2 : `signed_proj` initialisée à identité + bias
+    zéro → comportement initial identique à V5.2. Le checkpoint d'une V5.2
+    se charge avec `strict=False` + post-init `signed_proj=identity`.
+
+    Paramètres :
+        latent_dim  : dim de `z` (= LATENT_DIM, typiquement 64).
+        signed_dim  : dim du sous-espace signed. Défaut latent_dim (pas de
+                      compression, `signed_proj` peut converger vers
+                      identité). signed_dim < latent_dim force la
+                      spécialisation par compression.
 
     Référence : Liu et al. 2024 *NAR* SGAT-bilinear ; généralisation du
-    DistMult de Yang 2015 *ICLR* à la classification signée.
+    DistMult de Yang 2015 *ICLR* à la classification signée + tête
+    sub-espace (inspiré des "task heads" en multi-task learning).
     """
 
-    def __init__(self, latent_dim: int):
+    def __init__(self, latent_dim: int, signed_dim: int | None = None):
         super().__init__()
-        # Trois matrices : activation (+), inhibition (-), unsigned (0)
-        # Initialisation identité + bruit pour partir de l'inner product
-        eye = torch.eye(latent_dim)
-        self.W_pos = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
-        self.W_neg = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
-        self.W_zero = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
+        self.latent_dim = latent_dim
+        self.signed_dim = signed_dim if signed_dim is not None else latent_dim
+
+        # V5.3 — projection latent → sous-espace signed. Init = identité +
+        # 0 bias pour préserver V5.2 au load (équivalence numérique exacte
+        # quand signed_dim == latent_dim).
+        self.signed_proj = nn.Linear(latent_dim, self.signed_dim, bias=True)
+        with torch.no_grad():
+            if self.signed_dim == latent_dim:
+                self.signed_proj.weight.copy_(torch.eye(latent_dim))
+            else:
+                # signed_dim < latent_dim : init "PCA-like" (premières dims).
+                init = torch.zeros(self.signed_dim, latent_dim)
+                init[:self.signed_dim, :self.signed_dim] = torch.eye(self.signed_dim)
+                self.signed_proj.weight.copy_(init)
+            self.signed_proj.bias.zero_()
+
+        # 3 matrices bilinéaires dans le sous-espace signed.
+        eye = torch.eye(self.signed_dim)
+        self.W_pos = nn.Parameter(eye + 0.01 * torch.randn(self.signed_dim, self.signed_dim))
+        self.W_neg = nn.Parameter(eye + 0.01 * torch.randn(self.signed_dim, self.signed_dim))
+        self.W_zero = nn.Parameter(eye + 0.01 * torch.randn(self.signed_dim, self.signed_dim))
+
+    def _project(self, z: torch.Tensor) -> torch.Tensor:
+        """V5.3 — projette `z` dans le sous-espace signed via signed_proj.
+
+        Si signed_dim == latent_dim et signed_proj n'a pas été entraîné :
+        identité (équivalence V5.2). Une fois entraîné, peut diverger de
+        l'identité pour spécialiser le sous-espace au gate signed.
+        """
+        return self.signed_proj(z)
 
     def forward_signed(self, z: torch.Tensor, edge_index: torch.Tensor,
                        edge_sign: torch.Tensor) -> torch.Tensor:
-        """Décode des arêtes signées — usage TRAINING uniquement.
+        """Décode des arêtes signées — usage TRAINING uniquement (V5.0 hérité).
 
         Sélectionne le canal selon `edge_sign` (info connue à l'entraînement).
-        La BCE compare ensuite `σ(logit_canal)` à 0/1 selon le sign cible.
+        ⚠ Inutilisable pour l'évaluation `AUC(activate vs inhibit)` : la
+        sélection donne déjà la réponse. Pour l'inférence sign-agnostique,
+        utiliser `predict_sign_score()`.
 
-        ⚠ Inutilisable pour l'évaluation `AUC(activate vs inhibit)` : on
-        donnerait déjà la réponse via la sélection du canal. Pour
-        l'inférence sign-agnostique, utiliser `predict_sign_score()`.
-
-        Args:
-            z : embedding latent (n_nodes, latent_dim).
-            edge_index : (2, E) — paires (src, dst).
-            edge_sign : (E,) — sign ∈ {-1, 0, +1}.
-
-        Returns:
-            logits : (E,) — logit non-normalisé du canal sélectionné par sign.
+        V5.1+ : conservé pour compat — la `signed_aux_loss` utilise
+        désormais `predict_sign_score()` (BCE contrastive sur score
+        différentiel) au lieu de cette méthode.
         """
-        z_src = z[edge_index[0]]  # (E, D)
-        z_dst = z[edge_index[1]]  # (E, D)
-        # 3 canaux en parallèle
+        z_signed = self._project(z)
+        z_src = z_signed[edge_index[0]]
+        z_dst = z_signed[edge_index[1]]
         logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
         logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
         logit_zero = (z_src @ self.W_zero * z_dst).sum(dim=-1)
-        # Sélection par signe (vectorized)
         mask_pos = (edge_sign > 0).float()
         mask_neg = (edge_sign < 0).float()
         mask_zero = (edge_sign == 0).float()
@@ -313,14 +345,16 @@ class BilinearSignedDecoder(nn.Module):
                            edge_index: torch.Tensor) -> torch.Tensor:
         """Score sign-agnostique pour évaluation AUC(activate vs inhibit).
 
-        Pour chaque arête (i, j), retourne `logit_pos − logit_neg` SANS
-        utiliser le sign cible. AUC entre ce score et `(sign > 0).int()`
-        mesure la séparation activate / inhibit apprise par le décodeur.
+        Retourne `logit_pos − logit_neg` SANS utiliser le sign cible.
+        AUC entre ce score et `(sign > 0).int()` mesure la séparation
+        activate / inhibit apprise par le décodeur.
 
-        C'est le score correct pour le gate 1c.5 (Liu 2024 *NAR* §3).
+        C'est le score correct pour le gate 1c.5 (Liu 2024 *NAR* §3) et
+        celui utilisé par la `signed_aux_loss` V5.1+.
         """
-        z_src = z[edge_index[0]]
-        z_dst = z[edge_index[1]]
+        z_signed = self._project(z)
+        z_src = z_signed[edge_index[0]]
+        z_dst = z_signed[edge_index[1]]
         logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
         logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
         return logit_pos - logit_neg

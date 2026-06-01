@@ -266,6 +266,16 @@ def _parse_cli_args():
                         "--signed-decoder OFF). 1.0 = équivalent à la "
                         "recon_loss principale ; 0.5 = demi-poids. Défaut "
                         "1.0.")
+    p.add_argument("--signed-decoder-dim", type=int, default=None,
+                   help="V5.3 (TIER 1c.7) : dimension du sous-espace signed "
+                        "(tête `signed_proj : R^latent → R^signed_dim` avant "
+                        "le décodeur bilinéaire). Défaut None = LATENT_DIM "
+                        "(pas de compression, signed_proj init=identité ⇒ "
+                        "équivalent V5.2 au load checkpoint). Valeurs <"
+                        "LATENT_DIM forcent la compression du sous-espace "
+                        "signed (spécialisation). Réduit la concurrence "
+                        "avec le décodeur cosinus (V5.2 : −0.022 AUC recon). "
+                        "Cf. §14bis.6unvicesies.")
 
     # --- V5 phase 2 : VRAI hold-out signed pour gate 1c.5 rigoureux ---
     # Sans ces flags, la signed_aux_loss voit TOUTES les arêtes signées
@@ -559,6 +569,8 @@ with open(_MANIFEST_PATH, "w") as _fh:
         "signed_message": CLI_ARGS.signed_message,
         "signed_decoder": CLI_ARGS.signed_decoder,
         "signed_loss_weight": CLI_ARGS.signed_loss_weight,
+        # V5.3 (TIER 1c.7) — tête sub-espace signed_proj
+        "signed_decoder_dim": CLI_ARGS.signed_decoder_dim,
         # V5 phase 2 (TIER 1c.5 strict) — hold-out signed TF pour gate rigoureux
         # Les clés `holdout_signed_tf_set` et `holdout_signed_tf_seed_used`
         # sont enrichies plus tard (cf. section 10) une fois le pool construit.
@@ -2064,45 +2076,68 @@ class SignedGATConv(GATConv):
 
 
 class BilinearSignedDecoder(nn.Module):
-    """V5 (TIER 1c.3) — décodeur bilinéaire 3 canaux (activate / inhibit / unsigned).
+    """V5.3 (TIER 1c.3 + sub-espace) — décodeur bilinéaire 3 canaux avec tête signed.
 
-    Pour une arête (i, j) avec sign ∈ {+1, -1, 0} :
+    Architecture :
+        z_signed = signed_proj(z)            # V5.3 — projection sub-espace
+        logit_pos  = z_signed_i · W_+ · z_signed_j
+        logit_neg  = z_signed_i · W_- · z_signed_j
+        logit_zero = z_signed_i · W_0 · z_signed_j
 
-        logit(activate, i→j) = z_i^T W_+ z_j
-        logit(inhibit,  i→j) = z_i^T W_- z_j
-        logit(neutral,  i→j) = z_i^T W_0 z_j
+    **V5.3 (§14bis.6unvicesies)** : la projection `signed_proj` filtre
+    les gradients du `signed_aux_loss` avant qu'ils n'atteignent
+    l'encodeur. Elle absorbe une partie de la contrainte signed, ce qui
+    réduit la concurrence avec le décodeur cosinus principal (V5.2
+    mesurait −0.022 AUC recon dûe à cette concurrence).
 
-    Sélection vectorisée par signe au moment du forward.
+    Backward-compat V5.1/V5.2 : `signed_proj` init = identité + 0 bias
+    ⇒ comportement initial identique à V5.2 (équivalence numérique exacte
+    si signed_dim == latent_dim). Les checkpoints V5.2 se chargent avec
+    `strict=False` + post-init signed_proj=identity.
 
-    Préserve la compat V4.x : le décodeur cosinus de VGAE reste actif
-    pour la loss principale ; le canal bilinéaire est utilisé en
-    AUXILIAIRE pour la loss signée (TIER 1c.4).
+    Source de vérité : src/gnn/_vgae_model.py:251.
 
     Ref : Liu et al. 2024 *NAR* SGAT-bilinear ; Yang et al. 2015 *ICLR*
-    DistMult généralisé à la classification signée.
-    Source de vérité : src/gnn/_vgae_model.py:214.
+    DistMult ; tête sub-espace = inspiration multi-task task heads.
     """
 
-    def __init__(self, latent_dim: int):
+    def __init__(self, latent_dim: int, signed_dim: int | None = None):
         super().__init__()
-        eye = torch.eye(latent_dim)
-        # Init identité + bruit ⇒ démarre proche du produit scalaire,
-        # se spécialise progressivement par canal pendant l'entraînement.
-        self.W_pos = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
-        self.W_neg = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
-        self.W_zero = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
+        self.latent_dim = latent_dim
+        self.signed_dim = signed_dim if signed_dim is not None else latent_dim
+
+        # V5.3 — projection latent → sous-espace signed.
+        self.signed_proj = nn.Linear(latent_dim, self.signed_dim, bias=True)
+        with torch.no_grad():
+            if self.signed_dim == latent_dim:
+                self.signed_proj.weight.copy_(torch.eye(latent_dim))
+            else:
+                init = torch.zeros(self.signed_dim, latent_dim)
+                init[:self.signed_dim, :self.signed_dim] = torch.eye(self.signed_dim)
+                self.signed_proj.weight.copy_(init)
+            self.signed_proj.bias.zero_()
+
+        # 3 matrices bilinéaires dans le sous-espace signed.
+        eye = torch.eye(self.signed_dim)
+        self.W_pos = nn.Parameter(eye + 0.01 * torch.randn(self.signed_dim, self.signed_dim))
+        self.W_neg = nn.Parameter(eye + 0.01 * torch.randn(self.signed_dim, self.signed_dim))
+        self.W_zero = nn.Parameter(eye + 0.01 * torch.randn(self.signed_dim, self.signed_dim))
+
+    def _project(self, z: torch.Tensor) -> torch.Tensor:
+        """V5.3 — projette `z` dans le sous-espace signed via signed_proj."""
+        return self.signed_proj(z)
 
     def forward_signed(self, z: torch.Tensor, edge_index: torch.Tensor,
                        edge_sign: torch.Tensor) -> torch.Tensor:
-        """Logits bilinéaires — TRAINING uniquement.
+        """Logits bilinéaires — TRAINING uniquement (V5.0 hérité).
 
-        Sélectionne le canal selon `edge_sign` (info connue à l'entraînement).
         ⚠ NE PAS utiliser pour l'évaluation `AUC(activate vs inhibit)` :
-        la sélection donne déjà la réponse. Pour l'inférence sign-agnostique,
-        utiliser `predict_sign_score()`.
+        la sélection par sign donne déjà la réponse. La `signed_aux_loss`
+        V5.1+ utilise `predict_sign_score()` (BCE contrastive).
         """
-        z_src = z[edge_index[0]]
-        z_dst = z[edge_index[1]]
+        z_signed = self._project(z)
+        z_src = z_signed[edge_index[0]]
+        z_dst = z_signed[edge_index[1]]
         logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
         logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
         logit_zero = (z_src @ self.W_zero * z_dst).sum(dim=-1)
@@ -2116,10 +2151,12 @@ class BilinearSignedDecoder(nn.Module):
         """Score sign-agnostique pour évaluation AUC(activate vs inhibit).
 
         Retourne `logit_pos − logit_neg` SANS utiliser le sign cible.
-        Score correct pour gate 1c.5 (Liu 2024 *NAR* SGAT-bilinear §3).
+        Score correct pour gate 1c.5 (Liu 2024 *NAR* SGAT-bilinear §3) et
+        utilisé par la `signed_aux_loss` V5.1+.
         """
-        z_src = z[edge_index[0]]
-        z_dst = z[edge_index[1]]
+        z_signed = self._project(z)
+        z_src = z_signed[edge_index[0]]
+        z_dst = z_signed[edge_index[1]]
         logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
         logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
         return logit_pos - logit_neg
@@ -2616,12 +2653,19 @@ encoder = HeteroEncoder(
 # V5 (TIER 1c.3) : décodeur bilinéaire signé optionnel, instancié uniquement
 # si --signed-decoder. Sinon, VGAE utilise uniquement le décodeur cosinus
 # historique (backward-compat V4.x).
-_bilinear_decoder = (BilinearSignedDecoder(LATENT_DIM)
+# V5.3 (TIER 1c.7) : tête sub-espace `signed_proj` paramétrée par
+# --signed-decoder-dim (défaut LATENT_DIM ⇒ équivalent V5.2 numérique au
+# load checkpoint).
+SIGNED_DECODER_DIM = (CLI_ARGS.signed_decoder_dim
+                      if CLI_ARGS.signed_decoder_dim is not None
+                      else LATENT_DIM)
+_bilinear_decoder = (BilinearSignedDecoder(LATENT_DIM, signed_dim=SIGNED_DECODER_DIM)
                      if CLI_ARGS.signed_decoder else None)
 model = VGAE(encoder, bilinear_decoder=_bilinear_decoder)
 if CLI_ARGS.signed_decoder:
     print(f"  VGAE V5 BilinearSignedDecoder actif (λ_signed="
-          f"{CLI_ARGS.signed_loss_weight}).")
+          f"{CLI_ARGS.signed_loss_weight}, signed_dim={SIGNED_DECODER_DIM} "
+          f"{'(= latent_dim, équiv V5.2 init)' if SIGNED_DECODER_DIM == LATENT_DIM else '(compression vs latent)'}).")
 
 total_params = sum(p.numel() for p in model.parameters())
 print(f"  VGAE : {N_LAYERS} couches GATConv, hidden={HIDDEN_DIM}, latent={LATENT_DIM}")

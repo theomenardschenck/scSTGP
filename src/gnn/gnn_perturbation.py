@@ -137,23 +137,43 @@ class SignedGATConv(GATConv):
 
 
 class BilinearSignedDecoder(nn.Module):
-    """Décodeur bilinéaire signé (V5) — duplicate import-safe.
+    """Décodeur bilinéaire signé V5.3 — duplicate import-safe.
 
-    Paramètres `W_pos`, `W_neg`, `W_zero` (latent×latent). En perturbation,
-    on n'appelle pas `forward_signed()` (l'importance utilise le décodeur
-    cosinus), mais la classe doit exister pour que le state_dict charge.
+    V5.3 (§14bis.6unvicesies) : ajout de `signed_proj : R^latent → R^signed_dim`
+    pour filtrer le gradient signed loss et réduire la concurrence avec le
+    décodeur cosinus. En perturbation, on n'appelle pas `forward_signed()`
+    (l'importance utilise le décodeur cosinus), mais la classe doit exister
+    pour que le state_dict V5.x charge.
+
+    Backward-compat V5.1/V5.2 : si signed_proj absent du state_dict, init
+    à identité + 0 bias ⇒ équivalent numérique exact.
     """
 
-    def __init__(self, latent_dim: int):
+    def __init__(self, latent_dim: int, signed_dim: int | None = None):
         super().__init__()
-        eye = torch.eye(latent_dim)
-        self.W_pos = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
-        self.W_neg = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
-        self.W_zero = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
+        self.latent_dim = latent_dim
+        self.signed_dim = signed_dim if signed_dim is not None else latent_dim
+        self.signed_proj = nn.Linear(latent_dim, self.signed_dim, bias=True)
+        with torch.no_grad():
+            if self.signed_dim == latent_dim:
+                self.signed_proj.weight.copy_(torch.eye(latent_dim))
+            else:
+                init = torch.zeros(self.signed_dim, latent_dim)
+                init[:self.signed_dim, :self.signed_dim] = torch.eye(self.signed_dim)
+                self.signed_proj.weight.copy_(init)
+            self.signed_proj.bias.zero_()
+        eye = torch.eye(self.signed_dim)
+        self.W_pos = nn.Parameter(eye + 0.01 * torch.randn(self.signed_dim, self.signed_dim))
+        self.W_neg = nn.Parameter(eye + 0.01 * torch.randn(self.signed_dim, self.signed_dim))
+        self.W_zero = nn.Parameter(eye + 0.01 * torch.randn(self.signed_dim, self.signed_dim))
+
+    def _project(self, z):
+        return self.signed_proj(z)
 
     def forward_signed(self, z, edge_index, edge_sign):
-        z_src = z[edge_index[0]]
-        z_dst = z[edge_index[1]]
+        z_signed = self._project(z)
+        z_src = z_signed[edge_index[0]]
+        z_dst = z_signed[edge_index[1]]
         logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
         logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
         logit_zero = (z_src @ self.W_zero * z_dst).sum(dim=-1)
@@ -161,6 +181,14 @@ class BilinearSignedDecoder(nn.Module):
         mask_neg = (edge_sign < 0).float()
         mask_zero = (edge_sign == 0).float()
         return mask_pos * logit_pos + mask_neg * logit_neg + mask_zero * logit_zero
+
+    def predict_sign_score(self, z, edge_index):
+        z_signed = self._project(z)
+        z_src = z_signed[edge_index[0]]
+        z_dst = z_signed[edge_index[1]]
+        logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
+        logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
+        return logit_pos - logit_neg
 
 
 class HeteroEncoder(nn.Module):
@@ -862,27 +890,50 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
         edge_dim_overrides=edge_dim_overrides or None,
         signed_message=signed_message,
     )
-    bilinear_decoder = BilinearSignedDecoder(latent) if signed_decoder else None
-    model = VGAE(encoder, bilinear_decoder=bilinear_decoder)
-    if signed_message or signed_decoder:
-        print(f"  [load_run] V5 flags : signed_message={signed_message} "
-              f"signed_decoder={signed_decoder}")
-
     state_path = run_dir / "best_vgae.pt"
     if not state_path.exists():
         state_path = run_dir / "vgae_weights.pt"
     state_dict = torch.load(state_path, weights_only=True)
+
     # V5 safety : si vgae_metrics.json absent OU faux négatif sur
     # signed_decoder mais que le state_dict contient bilinear_decoder.*,
-    # on instancie le module a posteriori pour ne pas planter sur strict=True.
+    # on bascule signed_decoder=True pour instancier correctement.
     has_bilinear_keys = any(k.startswith("bilinear_decoder.")
                             for k in state_dict.keys())
-    if has_bilinear_keys and model.bilinear_decoder is None:
+    if has_bilinear_keys and not signed_decoder:
         print("  [load_run] bilinear_decoder.* détecté dans le state_dict "
               "mais signed_decoder=False dans vgae_metrics.json — "
-              "instanciation a posteriori pour accepter le checkpoint.")
-        model.bilinear_decoder = BilinearSignedDecoder(latent)
-    model.load_state_dict(state_dict)
+              "activation a posteriori.")
+        signed_decoder = True
+
+    # V5.3 — détecter signed_dim depuis le state_dict (3 cas) :
+    #   (a) V5.3 checkpoint : `bilinear_decoder.signed_proj.weight` présent
+    #       → signed_dim = signed_proj.weight.shape[0].
+    #   (b) V5.1/V5.2 checkpoint (bilinear_decoder.* mais pas signed_proj)
+    #       → signed_dim = latent, init identité ⇒ équivalence numérique.
+    #   (c) Pas de bilinéaire du tout → bilinear_decoder=None.
+    _proj_w = state_dict.get("bilinear_decoder.signed_proj.weight", None)
+    if signed_decoder:
+        signed_dim = int(_proj_w.shape[0]) if _proj_w is not None else latent
+        bilinear_decoder = BilinearSignedDecoder(latent, signed_dim=signed_dim)
+    else:
+        bilinear_decoder = None
+    model = VGAE(encoder, bilinear_decoder=bilinear_decoder)
+    if signed_message or signed_decoder:
+        print(f"  [load_run] V5 flags : signed_message={signed_message} "
+              f"signed_decoder={signed_decoder}"
+              + (f" signed_dim={signed_dim}" if signed_decoder else ""))
+
+    # V5.3 strict=False si signed_proj absent (V5.1/V5.2 chargé en V5.3)
+    _strict = (_proj_w is not None) if signed_decoder else True
+    _missing, _unexpected = model.load_state_dict(state_dict, strict=_strict)
+    if not _strict and _unexpected:
+        _other = [k for k in _unexpected
+                  if not k.startswith("bilinear_decoder.signed_proj.")]
+        if _other:
+            raise RuntimeError(f"state_dict clés inattendues : {_other}")
+        print(f"  [load_run] V5.3 backward-compat : signed_proj initialisé "
+              f"à identité (checkpoint V5.1/V5.2 sans signed_proj).")
     model.eval()
     return data, model, gene_symbols, gene_to_idx, baseline, group_expr
 
