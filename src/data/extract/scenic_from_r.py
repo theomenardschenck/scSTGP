@@ -43,12 +43,17 @@ import glob
 import pickle
 import pandas as pd
 import numpy as np
-import scanpy as sc
-import matplotlib.pyplot as plt
-import seaborn as sns
-from matplotlib.colors import LinearSegmentedColormap
+# scanpy / matplotlib / seaborn — imports paresseux dans main() (UMAP
+# legacy). La sous-commande grnboost2-diff n'en a pas besoin et l'env
+# `arboreto` GLiCID ne les installe pas (fail au top-level cassait
+# grnboost2-diff alors qu'arboreto fonctionne).
+# Voir §14bis.6septdecies du rapport pour le contexte V4.3.
 
 def main():
+    import scanpy as sc
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib.colors import LinearSegmentedColormap
 
     from dask.distributed import Client, LocalCluster
     import os
@@ -90,7 +95,7 @@ def main():
     )
 
     # Fichiers intermédiaires
-    ADJACENCIES_FILE = os.path.join(RESULTS_DIR, "adjacencies.csv")
+    ADJACENCIES_FILE = os.path.join(RESULTS_DIR, "adjacencies_arb.csv")
     REGULONS_FILE = os.path.join(RESULTS_DIR, "regulons.pkl")
     AUCELL_LOOM = os.path.join(RESULTS_DIR, "scenic_output.loom")
     AUCELL_MTX = os.path.join(RESULTS_DIR, "auc_matrix.csv")
@@ -526,11 +531,16 @@ def main():
 # =============================================================================
 # SOUS-COMMANDE V4.2 : GRNBoost2 différentiel P4 / P16 sur TOUS les gènes QC
 # =============================================================================
-# Produit adjacencies_{P4,P16}.csv via arboreto CANONIQUE (pas la
+# Produit adjacencies_{P4,P16}.arboreto.csv via arboreto CANONIQUE (pas la
 # réimplémentation sklearn de build_diff_coexpr.py grnboost2-local) — à
 # lancer là où arboreto fonctionne (local). Sortie consommée ensuite par
-#   build_diff_coexpr.py merge-adjacencies → coexpr_diff.tsv
-#   gnn_vgae.py --coexpr-mode differential
+#   build_diff_coexpr.py merge-adjacencies → coexpr_diff.arboreto.<prune>.tsv
+#   gnn_vgae.py --coexpr-mode differential --coexpr-method arboreto
+#
+# Convention de nommage V4.3 (grille méthodes×prunes) :
+#   --out data/pyscenic/diff_coexpr/adjacencies_<COND>.arboreto.csv
+# `arboreto` est le suffixe de méthode pour distinguer des sorties
+# `sklearn` (grnboost2-local), `corr` et `mi` (build_diff_coexpr.py).
 #
 # Différences avec main() legacy :
 #   - lit merged_P4_P16_normalized.csv (TOUS les gènes QC, ~15779) et

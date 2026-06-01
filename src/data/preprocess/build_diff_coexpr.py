@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""build_diff_coexpr.py — Coexpression différentielle P4 vs P16 (V4.2, option A).
+"""build_diff_coexpr.py — Coexpression différentielle P4 vs P16 (V4.2/V4.3).
 
 Contexte
 --------
@@ -13,6 +13,27 @@ V4.2 — option A : on infère GRNBoost2 SÉPARÉMENT sur P4 et P16, puis on
 construit un edge_attr enrichi `[imp_p4, imp_p16, delta, cat_shared,
 cat_p4, cat_p16]` (edge_dim=6) qui laisse le modèle apprendre quoi
 pondérer plutôt que de figer un prior P16-only.
+
+V4.3 — comparaison de méthodes d'inférence et d'élagage. Le script
+fournit maintenant **4 méthodes GRN** (toutes émettent le même format
+`(TF, target, importance)`) et **4 modes d'élagage** :
+
+  GRN     : `grnboost2-local` (sklearn, défaut V4.2)
+          : `grnboost2-diff` (arboreto canonique, cf. scenic_from_r.py)
+          : `correlation`    (Pearson/Spearman TF×target)
+          : `mutual-info`    (sklearn mutual_info_regression)
+
+  élagage : `per-target-topk`   (DÉFAUT, = élagage SCENIC, K régul./cible)
+          : `global-quantile`   (legacy, hub-dominé — baseline négative)
+          : `mutual-rank`       (Obayashi 2018, COXPRESdb, sym. + débiaisé hub)
+          : `z-score`           (par cible, μ + n·σ — adaptatif)
+
+Convention de nommage (V4.3) :
+    adjacencies_<COND>.<METHOD>.csv      # COND ∈ {P4,P16}, METHOD ∈ {sklearn,arboreto,corr,mi}
+    coexpr_diff.<METHOD>.<PRUNE>.tsv     # PRUNE ∈ {topk,quantile,mr,zscore}
+
+Compat. ascendante : sans `--method`, les sorties gardent leur nom
+historique (`adjacencies_<COND>.csv`, `coexpr_diff.tsv`).
 
 Workflow (3 étapes — GRNBoost2 doit tourner sur le cluster)
 -----------------------------------------------------------
@@ -305,6 +326,161 @@ def cmd_grnboost2_local(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Étape 2ter — correlation : Pearson/Spearman TF×target
+# ---------------------------------------------------------------------------
+# Baseline naïve pour la grille V4.3. Calcule la corrélation entre chaque
+# TF et chaque cible (≠ TF lui-même), garde |r| comme `importance` et
+# conserve le signe dans la colonne `sign` (consommable par un encodeur
+# signé V5/V6 ; ignorée par le decoder InnerProduct V4.x).
+# Référence : Eisen 1998 PNAS (clustering corr.) ; Stuart 2003 Science
+# (coexpr corrélationnelle) ; Marbach 2012 Nat Methods (limites
+# corrélation vs GRNBoost2 sur GRN benchmarks).
+def cmd_correlation(args: argparse.Namespace) -> None:
+    """Corrélation TF×target (Pearson ou Spearman), format (TF, target, importance, sign)."""
+    expr_path = Path(args.expr)
+    tf_path = Path(args.tf_list)
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"[corr] lecture {expr_path}")
+    expr = pd.read_csv(expr_path, index_col=0)
+    cols = list(expr.columns)
+    col_set = set(cols)
+
+    raw_tfs = [t.strip() for t in open(tf_path) if t.strip()]
+    tf_names = []
+    for t in raw_tfs:
+        if t in col_set:
+            tf_names.append(t)
+        elif t.replace("_", "-") in col_set:
+            tf_names.append(t.replace("_", "-"))
+    tf_names = sorted(set(tf_names))
+    print(f"[corr] {expr.shape[0]} cellules × {expr.shape[1]} gènes ; "
+          f"{len(tf_names)}/{len(raw_tfs)} TFs mappés ; method={args.method}")
+    if len(tf_names) < 10:
+        sys.exit(f"[corr] seulement {len(tf_names)} TFs mappés — abort.")
+
+    # Sortir la matrice rangée [cells × genes] en numpy. Pour Spearman :
+    # remplacer par les rangs colonne par colonne (ranking par gène) puis
+    # appliquer la même formule Pearson sur les rangs ⇒ Spearman.
+    X = expr.to_numpy(dtype=np.float32)
+    if args.method == "spearman":
+        # rankdata par colonne (axis=0) — argsort.argsort = rangs entiers
+        ranks = X.argsort(axis=0).argsort(axis=0).astype(np.float32)
+        X = ranks
+
+    # Centrer-réduire colonne par colonne (n cells = lignes).
+    mu = X.mean(axis=0, keepdims=True)
+    sigma = X.std(axis=0, keepdims=True)
+    sigma[sigma == 0.0] = 1.0  # éviter NaN sur colonnes constantes
+    Z = (X - mu) / sigma
+    n_cells = Z.shape[0]
+
+    name_to_idx = {g: i for i, g in enumerate(cols)}
+    tf_idx = np.array([name_to_idx[t] for t in tf_names], dtype=np.int64)
+
+    # Corrélation Z[:, tf] · Z[:, all] / n  →  matrice TF × allGenes.
+    # Coût mémoire : len(tf) × len(cols) × 4 octets (e.g. 1500×15000 ≈ 90 Mo).
+    print(f"[corr] produit matriciel TF×target ({len(tf_idx)}×{len(cols)})…")
+    R = (Z[:, tf_idx].T @ Z) / n_cells  # shape (n_tf, n_genes)
+    R = np.clip(R, -1.0, 1.0).astype(np.float32)
+
+    # Masquer la diagonale TF↔TF (un TF ne se régule pas lui-même).
+    for k, gi in enumerate(tf_idx):
+        R[k, gi] = 0.0
+
+    # Filtre optionnel sur |r|.
+    thr = float(args.min_abs_r)
+    print(f"[corr] filtre |r| ≥ {thr}")
+    abs_R = np.abs(R)
+    mask = abs_R >= thr
+    tf_ix, tgt_ix = np.where(mask)
+    importances = abs_R[tf_ix, tgt_ix]
+    signs = np.sign(R[tf_ix, tgt_ix]).astype(np.int8)
+    rows = list(zip(
+        [tf_names[i] for i in tf_ix],
+        [cols[j] for j in tgt_ix],
+        importances.tolist(),
+        signs.tolist(),
+    ))
+    adj = pd.DataFrame(rows, columns=["TF", "target", "importance", "sign"])
+    adj = adj.sort_values("importance", ascending=False).reset_index(drop=True)
+    adj.to_csv(out_path, index=False)
+    print(f"[corr] {len(adj)} arêtes |r|≥{thr} → {out_path}")
+    if len(adj) > 0:
+        print(f"[corr] top 3 :\n{adj.head(3).to_string(index=False)}")
+
+
+# ---------------------------------------------------------------------------
+# Étape 2quater — mutual-info : sklearn mutual_info_regression
+# ---------------------------------------------------------------------------
+# Baseline non linéaire (capture dépendances non monotones). Coût ×N par
+# rapport à la corrélation. Pour chaque cible, MI(TF, target) via
+# sklearn.feature_selection.mutual_info_regression (k-NN Kraskov 2004).
+# Pas de signe : MI ≥ 0.
+# Référence : Margolin 2006 BMC Bioinf. (ARACNe, MI + DPI) ; Faith 2007
+# PLoS Biol (CLR sur MI).
+def cmd_mutual_info(args: argparse.Namespace) -> None:
+    """Mutual information TF×target (sklearn mutual_info_regression)."""
+    from joblib import Parallel, delayed
+    from sklearn.feature_selection import mutual_info_regression
+
+    expr_path = Path(args.expr)
+    tf_path = Path(args.tf_list)
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"[mi] lecture {expr_path}")
+    expr = pd.read_csv(expr_path, index_col=0)
+    cols = list(expr.columns)
+    col_set = set(cols)
+
+    raw_tfs = [t.strip() for t in open(tf_path) if t.strip()]
+    tf_names = []
+    for t in raw_tfs:
+        if t in col_set:
+            tf_names.append(t)
+        elif t.replace("_", "-") in col_set:
+            tf_names.append(t.replace("_", "-"))
+    tf_names = sorted(set(tf_names))
+    print(f"[mi] {expr.shape[0]} cellules × {expr.shape[1]} gènes ; "
+          f"{len(tf_names)}/{len(raw_tfs)} TFs mappés")
+    if len(tf_names) < 10:
+        sys.exit(f"[mi] seulement {len(tf_names)} TFs mappés — abort.")
+
+    X_tf = expr[tf_names].to_numpy(dtype=np.float32)
+    targets = cols
+    n_jobs = args.n_jobs
+    n_neighbors = args.n_neighbors
+
+    def _mi_one(target):
+        keep = [i for i, tf in enumerate(tf_names) if tf != target]
+        if not keep:
+            return []
+        X = X_tf[:, keep]
+        feats = [tf_names[i] for i in keep]
+        y = expr[target].to_numpy(dtype=np.float32)
+        mi = mutual_info_regression(
+            X, y, n_neighbors=n_neighbors, random_state=args.seed,
+        )
+        return [(feats[k], target, float(mi[k])) for k in range(len(feats))
+                if mi[k] > 0.0]
+
+    print(f"[mi] régression MI sur {len(targets)} cibles "
+          f"(k-NN n_neighbors={n_neighbors}, {n_jobs} jobs)…")
+    results = Parallel(n_jobs=n_jobs, verbose=10, backend="loky")(
+        delayed(_mi_one)(tgt) for tgt in targets
+    )
+    rows = [r for sub in results for r in sub]
+    adj = pd.DataFrame(rows, columns=["TF", "target", "importance"])
+    adj = adj.sort_values("importance", ascending=False).reset_index(drop=True)
+    adj.to_csv(out_path, index=False)
+    print(f"[mi] {len(adj)} arêtes → {out_path}")
+    if len(adj) > 0:
+        print(f"[mi] top 3 :\n{adj.head(3).to_string(index=False)}")
+
+
+# ---------------------------------------------------------------------------
 # Étape 3 — merge-adjacencies (option A)
 # ---------------------------------------------------------------------------
 def cmd_merge_adjacencies(args: argparse.Namespace) -> None:
@@ -312,6 +488,13 @@ def cmd_merge_adjacencies(args: argparse.Namespace) -> None:
     p16_path = Path(args.adj_p16)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Garde-fou (V4.3) : ne pas écraser silencieusement.
+    if out_path.exists() and not args.overwrite:
+        sys.exit(f"[merge] sortie déjà présente : {out_path} — passer "
+                 f"--overwrite pour remplacer (V4.3 : protège la "
+                 f"grille méthode×prune contre les ré-écritures "
+                 f"accidentelles).")
 
     for p in (p4_path, p16_path):
         if not p.exists():
@@ -384,6 +567,36 @@ def cmd_merge_adjacencies(args: argparse.Namespace) -> None:
         merged = (merged.sort_values("imp_max", ascending=False)
                         .groupby("target", sort=False).head(K).copy())
         why = f"per-target top-{K} sur imp_max"
+    elif mode == "mutual-rank":
+        # Obayashi 2018 (COXPRESdb) : MR(TF,target) = sqrt(rank_TF×target ×
+        # rank_target×TF) avec rang DENSE par origine. Symétrise et
+        # corrige le biais hub (un hub n'apparaît top-K pour TOUTES les
+        # cibles que si la réciproque est aussi vraie). Pour des données
+        # TF→target asymétriques (cas GRNBoost2), on définit :
+        #   r1 = rang de (TF, target) parmi les arêtes sortantes du TF
+        #        (TF fixé, target variable) sur imp_max
+        #   r2 = rang de (TF, target) parmi les arêtes entrantes du target
+        #        (target fixé, TF variable) sur imp_max
+        #   MR = sqrt(r1 * r2). On garde MR <= K (= top K les plus
+        #   mutuellement co-classés).
+        m = merged.copy()
+        m["r1"] = (m.sort_values("imp_max", ascending=False)
+                    .groupby("TF").cumcount() + 1)
+        m["r2"] = (m.sort_values("imp_max", ascending=False)
+                    .groupby("target").cumcount() + 1)
+        m["mr"] = np.sqrt(m["r1"].to_numpy() * m["r2"].to_numpy())
+        merged = m[m["mr"] <= K].copy()
+        why = f"mutual-rank ≤ {K} (Obayashi 2018)"
+    elif mode == "z-score":
+        # Par cible : keep TF dont (imp - μ_target) / σ_target ≥ z_thresh.
+        # Adaptatif à la dispersion locale ⇒ ne donne pas le même
+        # nombre d'arêtes par cible (contrairement à top-K déterministe).
+        z = float(args.z_thresh)
+        mu = merged.groupby("target")["imp_max"].transform("mean")
+        sd = merged.groupby("target")["imp_max"].transform("std").fillna(0.0)
+        sd = sd.replace(0.0, 1.0)
+        merged = merged[(merged["imp_max"] - mu) / sd >= z].copy()
+        why = f"z-score per-target ≥ {z}σ"
     else:  # hybrid
         thr = merged["imp_max"].quantile(q)
         g = merged[merged["imp_max"] >= thr]
@@ -481,18 +694,55 @@ def main() -> None:
                          "delta non confondu)")
     pl.set_defaults(func=cmd_grnboost2_local)
 
+    # --- correlation (V4.3) ---
+    pc = sub.add_parser(
+        "correlation",
+        help="Corrélation Pearson/Spearman TF×target — baseline V4.3.")
+    pc.add_argument("--expr", required=True,
+                    help="expr_matrix_{P4,P16}.csv (cellules × gènes)")
+    pc.add_argument("--tf-list",
+                    default="data/pyscenic/scenic_refs/allTFs_hg38.txt")
+    pc.add_argument("--out", required=True,
+                    help="adjacencies_{P4,P16}.corr.csv de sortie "
+                         "(colonnes TF,target,importance=|r|,sign)")
+    pc.add_argument("--method", choices=["pearson", "spearman"],
+                    default="spearman",
+                    help="Spearman (défaut, robuste rangs) ou Pearson.")
+    pc.add_argument("--min-abs-r", type=float, default=0.1,
+                    help="Filtre minimal sur |r| (défaut 0.1 : élimine "
+                         "le bruit ; ajusté ensuite par merge --prune-mode).")
+    pc.set_defaults(func=cmd_correlation)
+
+    # --- mutual-info (V4.3) ---
+    pmi = sub.add_parser(
+        "mutual-info",
+        help="Mutual information sklearn TF×target — baseline V4.3.")
+    pmi.add_argument("--expr", required=True)
+    pmi.add_argument("--tf-list",
+                     default="data/pyscenic/scenic_refs/allTFs_hg38.txt")
+    pmi.add_argument("--out", required=True,
+                     help="adjacencies_{P4,P16}.mi.csv de sortie")
+    pmi.add_argument("--n-jobs", type=int, default=8)
+    pmi.add_argument("--n-neighbors", type=int, default=3,
+                     help="k-NN MI Kraskov (sklearn défaut=3).")
+    pmi.add_argument("--seed", type=int, default=42)
+    pmi.set_defaults(func=cmd_mutual_info)
+
     pm = sub.add_parser("merge-adjacencies",
                         help="adjacencies_P4/P16 → coexpr_diff.tsv (option A)")
     pm.add_argument("--adj-p4", required=True)
     pm.add_argument("--adj-p16", required=True)
     pm.add_argument("--prune-mode",
-                    choices=["per-target-topk", "global-quantile", "hybrid"],
+                    choices=["per-target-topk", "global-quantile",
+                             "hybrid", "mutual-rank", "z-score"],
                     default="per-target-topk",
                     help="per-target-topk (DÉFAUT V4.2 : top-K régulateurs "
                          "par cible → 100%% couverture, hubs déconcentrés, "
                          "= élagage SCENIC) ; global-quantile (legacy, "
                          "dominé par hubs → affame ASNS/IL6/IL1B/DDIT3) ; "
-                         "hybrid (union des deux).")
+                         "hybrid (union des deux) ; mutual-rank "
+                         "(Obayashi 2018 COXPRESdb, MR ≤ K sym. + débiaisé "
+                         "hub) ; z-score (par cible, (imp-μ)/σ ≥ z_thresh).")
     pm.add_argument("--per-target-k", type=int, default=5,
                     help="K régulateurs gardés par cible, sur imp_max "
                          "(modes per-target-topk / hybrid). Défaut 5 : "
@@ -510,6 +760,12 @@ def main() -> None:
                          "(régression-bruit) que per-target-topk "
                          "garderait sinon à K arêtes de bruit. "
                          "Cf. §14bis.6terdecies.")
+    pm.add_argument("--z-thresh", type=float, default=2.0,
+                    help="Seuil σ pour --prune-mode z-score (défaut 2.0).")
+    pm.add_argument("--overwrite", action="store_true",
+                    help="V4.3 : autorise l'écrasement de --out si présent. "
+                         "Par défaut, refuse pour protéger la grille "
+                         "méthode×prune.")
     pm.add_argument("--out",
                     default="data/pyscenic/diff_coexpr/coexpr_diff.tsv")
     pm.set_defaults(func=cmd_merge_adjacencies)

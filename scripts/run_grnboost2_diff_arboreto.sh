@@ -35,7 +35,8 @@
 # Workflow :
 #   1. bash scripts/run_grnboost2_diff_arboreto.sh             # array P4+P16
 #   2. squeue -j <JID>                                          # attendre
-#   3. Adjacencies → data/pyscenic/diff_coexpr/adjacencies_{P4,P16}_arboreto.csv
+#   3. Adjacencies → data/pyscenic/diff_coexpr/adjacencies_{P4,P16}.arboreto.csv
+#      (convention V4.3 — consommée par run_coexpr_method_compare.sh)
 #   4. (optionnel) merge arboreto :
 #        bash scripts/run_diff_coexpr.sh --step merge \
 #          --diff-dir <dir>  # après renommage des adjacencies_*.csv
@@ -52,6 +53,7 @@ N_WORKERS=8
 MEM_PER_CPU="10G"   # 8 × 10G = 80G/job ; arboreto pic ~50G sur 15779 gènes
 TIME_GRN="06:00:00"
 ENV_NAME="arboreto"
+MICROMAMBA_BIN=""   # opt : chemin absolu vers le binaire (sinon auto-détection)
 DIFF_DIR="/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/pyscenic/diff_coexpr"
 MERGED="/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/gnn_data/merged_P4_P16_normalized.csv"
 TF_LIST="/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/pyscenic/scenic_refs/allTFs_hg38.txt"
@@ -63,6 +65,7 @@ while [[ $# -gt 0 ]]; do
         --mem-per-cpu)    MEM_PER_CPU="$2"; shift 2 ;;
         --time)           TIME_GRN="$2"; shift 2 ;;
         --env-name)       ENV_NAME="$2"; shift 2 ;;
+        --micromamba-bin) MICROMAMBA_BIN="$2"; shift 2 ;;
         --diff-dir)       DIFF_DIR="$2"; shift 2 ;;
         --merged)         MERGED="$2"; shift 2 ;;
         --tf-list)        TF_LIST="$2"; shift 2 ;;
@@ -117,13 +120,44 @@ cat > "$GRN_SBATCH" <<EOF
 set -euo pipefail
 cd "$PROJECT_DIR"
 
-# Activation env arboreto via micromamba (cf. ~/.bashrc pour le shell hook)
+# Activation env arboreto via micromamba — les nœuds de calcul GLiCID
+# n'héritent PAS du PATH du shell login → on cherche micromamba dans
+# l'ordre :  (0) --micromamba-bin si fourni ; (1) déjà dans le PATH ;
+# (2) ~/.bashrc ; (3) chemins d'installation standards. Sortie
+# explicite si rien ne marche.
+if [[ -n "$MICROMAMBA_BIN" ]]; then
+    export MAMBA_ROOT_PREFIX="\${MAMBA_ROOT_PREFIX:-\$HOME/micromamba}"
+    export PATH="$(dirname "$MICROMAMBA_BIN"):\$PATH"
+fi
+if ! command -v micromamba >/dev/null 2>&1; then
+    if [[ -f "\$HOME/.bashrc" ]]; then
+        # shellcheck disable=SC1091
+        source "\$HOME/.bashrc" || true
+    fi
+fi
+if ! command -v micromamba >/dev/null 2>&1; then
+    for _cand in "\$HOME/.local/bin/micromamba" "\$HOME/micromamba/bin/micromamba" \\
+                 "\$HOME/bin/micromamba" "/opt/micromamba/bin/micromamba"; do
+        if [[ -x "\$_cand" ]]; then
+            export MAMBA_ROOT_PREFIX="\${MAMBA_ROOT_PREFIX:-\$HOME/micromamba}"
+            export PATH="\$(dirname "\$_cand"):\$PATH"
+            echo "[env] micromamba trouvé : \$_cand"
+            break
+        fi
+    done
+fi
+if ! command -v micromamba >/dev/null 2>&1; then
+    echo "[env] ERREUR : micromamba introuvable sur le compute node." >&2
+    echo "      Trouve son chemin sur le frontal avec 'which micromamba'," >&2
+    echo "      puis ajoute-le à --env-micromamba-bin <chemin>." >&2
+    exit 1
+fi
 eval "\$(micromamba shell hook --shell bash)"
 micromamba activate $ENV_NAME
 
 CONDS=(P4 P16)
 COND=\${CONDS[\$SLURM_ARRAY_TASK_ID]}
-OUT="$DIFF_DIR/adjacencies_\${COND}_arboreto.csv"
+OUT="$DIFF_DIR/adjacencies_\${COND}.arboreto.csv"
 
 echo "[\$(date +%T)] GRNBoost2 arboreto \$COND sur \$(hostname) (\$SLURM_CPUS_PER_TASK workers)"
 echo "[\$(date +%T)] python : \$(which python)"
@@ -157,12 +191,13 @@ GRN_JID=$(sbatch --parsable "$GRN_SBATCH")
 echo "[grn-arboreto] soumis : job array $GRN_JID (0-1 = P4,P16)"
 echo "[grn-arboreto] suivi  : squeue -j $GRN_JID"
 echo "[grn-arboreto] logs   : tail -f $LOG_DIR/grnboost2_arboreto_${GRN_JID}_0.out"
-echo "[grn-arboreto] sortie : $DIFF_DIR/adjacencies_{P4,P16}_arboreto.csv"
+echo "[grn-arboreto] sortie : $DIFF_DIR/adjacencies_{P4,P16}.arboreto.csv"
 echo
 echo "[grn-arboreto] ====== APRÈS COMPLETED ======"
 echo "  Comparaison avec adjacencies_{P4,P16}.csv (sklearn-local) :"
-echo "    head adjacencies_P4{,_arboreto}.csv"
-echo "    wc -l adjacencies_P4{,_arboreto}.csv"
-echo "  Pour fusionner et générer un coexpr_diff alternatif, renomme"
-echo "  d'abord les *_arboreto.csv puis :"
-echo "    bash scripts/run_diff_coexpr.sh --step merge --diff-dir <alt-dir>"
+echo "    head adjacencies_P4.csv adjacencies_P4.arboreto.csv"
+echo "    wc -l adjacencies_P4.csv adjacencies_P4.arboreto.csv"
+echo "  Grille V4.3 méthode×prune (consomme directement le suffixe .arboreto.csv) :"
+echo "    bash scripts/run_coexpr_method_compare.sh --only-method arboreto"
+echo "    bash scripts/run_ablation_grid.sh --version V4.3-method-compare \\"
+echo "        --seeds \"1 2 3\"   # avec V43_METHODS=\"arboreto\" si Phase B"
