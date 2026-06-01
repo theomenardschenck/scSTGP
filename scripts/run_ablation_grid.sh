@@ -8,7 +8,7 @@
 #
 # Interface : produit cartésien `--version × --ablations`.
 #
-# --version {V3, V4, V4.1, V4.2, V4.2-sweep, V4_1, V4_2}   (défaut : V4.1)
+# --version {V3, V4, V4.1, V4.2, V4.2-sweep, V4.3-method-compare, V5, V4_1, V4_2}   (défaut : V4.1)
 #     Définit les configs de base à tester.
 #         V3   : 1 config (full, no OmniPath, no flags). Reproduit V3.6 baseline.
 #         V4   : 4 configs avec edge_types `signaling` / `tf_curated` opt-in.
@@ -64,6 +64,42 @@
 # Validation de version (rejoue la phase 1) :
 #     bash scripts/run_ablation_grid.sh --version V4.1 --seeds "1 2 3"
 #     # = 4 configs × 3 seeds = 12 tâches, pas d'ablation extra
+#
+# === V5 (TIER 1c, smoke-testé 2026-05-22) ============================
+# BASE V5 = V4.1-full (coexpr p16_only LEGACY par défaut, décision 2026-05-27).
+# 4 sous-configs : v5-baseline / v5-sm / v5-sd / v5-full.
+#
+# Pourquoi base p16_only et pas differential ? V4.2-differential n'est pas
+# encore validé cross-seed (AUC k2q8=0.953 vs V4.1 0.972, manque le
+# driver_score cross-seed). Greffer V5 sur V4.1 (terrain validé) évite de
+# confondre l'effet *signed* avec l'effet *coexpr différentielle V4.2*.
+#
+# Prérequis : aucun spécifique V5 (mêmes données qu'V4.1).
+#             `diff-coexpr` requiert coexpr_diff.tsv (V4.2 préalable).
+#
+# Validation factorielle 2×2 V5 (les 4 sous-configs sans ablation) :
+#     bash scripts/run_ablation_grid.sh --version V5 --seeds "1 2 3"
+#     # 4 configs × 3 seeds = 12 tâches (smoke A/B {sm,sd} ON/OFF)
+#
+# Grille V5 recommandée (5 ablations × v5-full × 3 seeds = 15 tâches) :
+#     bash scripts/run_ablation_grid.sh --version V5 \
+#         --ablations v5-recommended --seeds "1 2 3"
+#     # ablations : no-coexpr, diff-coexpr (override p16_only→differential),
+#     # no-humess, no-coexpr+no-humess, dedup-ppi-remove
+#     # Restriction à v5-full (= signed-message + signed-decoder activés).
+#     # Pour la validation factorielle 2×2 (sm/sd × baseline/full), utiliser
+#     # `--version V5` sans --ablations (12 tâches).
+#
+# Ablations standard sur v5-full uniquement (15 tâches) :
+#     bash scripts/run_ablation_grid.sh --version V5 \
+#         --ablations all-other-standard --seeds "1 2 3"
+#
+# Ablation single (composable) :
+#     bash scripts/run_ablation_grid.sh --version V5 --ablations diff-coexpr \
+#         --seeds "1 2 3"
+#     # = 4 sub-configs × diff-coexpr × 3 seeds = 12 tâches
+#     # NB : `diff-coexpr` override --coexpr-mode (argparse last-wins).
+#     # À lancer une fois V4.2-k2q8 validé cross-seed.
 #
 # Aliases backward-compat :
 #     --mode v4_validation     == --version V4    --ablations ""
@@ -183,8 +219,74 @@ case "$VERSION" in
             "v4.2-coex.k2q8::$V41_FULL $COEXDIFF --diff-coexpr-file ${DD_BASE}.k2q8.tsv"
         )
         ;;
+    V4.3-method-compare)
+        # V4.3 (cf. §14bis.6septdecies) — grille méthode×prune sur la couche
+        # coexpr. Chaque config combine :
+        #   --coexpr-method ∈ {sklearn, arboreto, corr, mi}
+        #   --coexpr-prune  ∈ {topk, quantile, mr, zscore}
+        # gnn_vgae.py auto-résout le chemin coexpr_diff.<method>.<prune>.tsv
+        # (les 16 fichiers doivent avoir été générés par
+        # scripts/run_coexpr_method_compare.sh AVANT cette grille).
+        # Par défaut on N'INCLUT QUE les configs dont la combinaison fait
+        # sens (méthodes corr/mi n'ont pas de delta P4/P16 enrichi, mais
+        # le format adjacencies → merge-adjacencies reste compatible).
+        # Variables d'env optionnelles V43_METHODS / V43_PRUNES pour
+        # restreindre la grille (e.g. V43_METHODS="sklearn" pour Phase A).
+        V41_FULL="$OP_SIG $OP_TF $OP_INC"
+        COEXDIFF="--coexpr-mode differential"
+        # Grille V4.3 figée 2026-05-29 : {arboreto, sklearn} × {topk, quantile, mr}.
+        # Exclus : corr/mi (pas encore générés en routine), zscore (113k/149k
+        # arêtes — noie le décodeur, §14bis.6sexdecies). mr utilise K=10
+        # (cf. coexpr_diff.{m}.mr.tsv régénérés avec K=10 ; à K=5 perte des
+        # drivers ASNS/IL6/IL1B sur arboreto).
+        V43_METHODS="${V43_METHODS:-arboreto sklearn}"
+        V43_PRUNES="${V43_PRUNES:-topk quantile mr}"
+        BASE_CONFIGS=()
+        for _m in $V43_METHODS; do
+            for _p in $V43_PRUNES; do
+                BASE_CONFIGS+=( "v4.3-${_m}.${_p}::$V41_FULL $COEXDIFF --coexpr-method ${_m} --coexpr-prune ${_p}" )
+            done
+        done
+        ;;
+    V5)
+        # V5 = V4.1-full (coexpr p16_only legacy) + message-passing/décodeur
+        # signés. 4 sous-configs pour l'ablation factorielle 2×2 :
+        # {sm OFF/ON} × {sd OFF/ON}. Cf. §14bis.6septies + TIER 1c
+        # du TODO (smoke-test 2026-05-22).
+        #
+        # BASE V5 = V4.1-full = OP_SIG + OP_TF + OP_INC.
+        # Coexpr legacy (p16_only) PAR DÉFAUT (décision 2026-05-27) : V4.2-
+        # differential n'est pas encore validé cross-seed (AUC k2q8=0.953
+        # vs V4.1 0.972, pas de driver_score cross-seed dispo). Garder la
+        # base sur du terrain V4.1 validé évite de confondre l'effet signed
+        # de l'effet V4.2. La coexpr différentielle reste accessible via
+        # `--ablations diff-coexpr` quand V4.2 sera validé.
+        #
+        # Ablations V5 typiquement passées via --ablations :
+        #   no-coexpr           : retire complètement coexpr (legacy V3.3 disruptif)
+        #   diff-coexpr         : override p16_only → differential (V4.2)
+        #   no-humess           : retire HuMess (config la plus défendable V4.1.1)
+        #   no-coexpr+no-humess : double ablation
+        #   dedup-ppi-remove    : supprime les PPI redondants avec arêtes
+        #                         signées (bénéfice prévu PLEIN avec V5,
+        #                         cf. §14bis.6quaterdecies)
+        # + standards : no-reactome, no-ppi, no-scenic-regulons, no-cgrp,
+        #               ex-degrees (via all-other-standard).
+        #
+        # Prérequis : aucun spécifique V5 (coexpr p16_only legacy = même
+        # données que V4.1). `diff-coexpr` requiert coexpr_diff.tsv.
+        V41_FULL="$OP_SIG $OP_TF $OP_INC"
+        SM="--signed-message"
+        SD="--signed-decoder"
+        BASE_CONFIGS=(
+            "v5-baseline::$V41_FULL"
+            "v5-sm::$V41_FULL $SM"
+            "v5-sd::$V41_FULL $SD"
+            "v5-full::$V41_FULL $SM $SD"
+        )
+        ;;
     *)
-        echo "Version inconnue : $VERSION (V3 | V4 | V4.1 | V4.2 | V4.2-sweep)"; exit 1 ;;
+        echo "Version inconnue : $VERSION (V3 | V4 | V4.1 | V4.2 | V4.2-sweep | V4.3-method-compare | V5)"; exit 1 ;;
 esac
 
 # --- Parsing de --ablations en variantes -----------------------------------
@@ -193,7 +295,10 @@ esac
 declare -a ABL_VARIANTS=()
 RESTRICT_TO_FULL=0   # vrai pour all-standard / all-other-standard
 
-# Helper : mappe une ablation simple → ses flags CLI
+# Helper : mappe une ablation simple → ses flags CLI.
+# NB : argparse prend la dernière occurrence d'un flag à choix → on peut
+# overrider un flag déjà fixé dans BASE_CONFIGS en le repassant ici
+# (utilisé pour `legacy-coexpr` qui override --coexpr-mode differential).
 _abl_flags() {
     case "$1" in
         no-coexpr)          echo "--no-coexpr" ;;
@@ -203,6 +308,14 @@ _abl_flags() {
         no-scenic-regulons) echo "--no-scenic-regulons" ;;
         no-cgrp)            echo "--no-cell-group-edges" ;;
         ex-degrees)         echo "--exclude-features ppi_degree,reg_degree" ;;
+        # V5-spécifiques (override de flags base via argparse last-wins)
+        diff-coexpr)        echo "--coexpr-mode differential" ;;
+        legacy-coexpr)      echo "--coexpr-mode p16_only" ;;
+        dedup-ppi-remove)   echo "--dedup-ppi-signed remove" ;;
+        dedup-ppi-annotate) echo "--dedup-ppi-signed annotate" ;;
+        # Toggles V5 isolés (utiles pour ablations partielles vs v5-full)
+        no-signed-message)  echo "" ;;   # placeholder : il faut retirer --signed-message du base (cf. §V5)
+        no-signed-decoder)  echo "" ;;
         "")                 echo "" ;;
         *) echo "__INVALID__" ;;
     esac
@@ -224,6 +337,27 @@ case "$ABLATIONS" in
             ABL_VARIANTS+=( "${abl}::$(_abl_flags "$abl")" )
         done
         ;;
+    v5-recommended)
+        # Grille recommandée V5 (à appliquer sur --version V5) :
+        # 5 ablations × 1 sous-config (v5-full) = 5 configs.
+        # RESTRICT_TO_FULL=1 : ablations appliquées uniquement sur v5-full
+        # (= signed-message + signed-decoder + V4.1-full backbone).
+        # Pour isoler l'effet sm/sd pur (sans ablation), utiliser la
+        # validation factorielle 2×2 : `--version V5` sans --ablations.
+        # Base V5 = p16_only legacy ; `diff-coexpr` override → differential
+        # (testable une fois V4.2 validé cross-seed).
+        RESTRICT_TO_FULL=1
+        for abl in no-coexpr diff-coexpr no-humess no-coexpr+no-humess dedup-ppi-remove; do
+            tag="$abl"
+            flags=""
+            IFS='+' read -ra _COMPS <<< "$abl"
+            for c in "${_COMPS[@]}"; do
+                f="$(_abl_flags "$c")"
+                flags="${flags}${flags:+ }${f}"
+            done
+            ABL_VARIANTS+=( "${tag}::${flags}" )
+        done
+        ;;
     *)
         # Custom : split par ',' → variantes séparées.
         # Chaque variante peut elle-même être composite via '+'.
@@ -236,8 +370,9 @@ case "$ABLATIONS" in
                 f="$(_abl_flags "$c")"
                 if [[ "$f" == "__INVALID__" ]]; then
                     echo "Ablation inconnue : '$c' (dans '$v')."
-                    echo "Valides : no-coexpr no-humess no-reactome no-ppi no-scenic-regulons no-cgrp ex-degrees"
-                    echo "Pseudos : all-standard all-other-standard"
+                    echo "Standards : no-coexpr no-humess no-reactome no-ppi no-scenic-regulons no-cgrp ex-degrees"
+                    echo "V5        : legacy-coexpr dedup-ppi-remove dedup-ppi-annotate"
+                    echo "Pseudos   : all-standard all-other-standard v5-recommended"
                     exit 1
                 fi
                 flags="${flags}${flags:+ }${f}"
@@ -327,7 +462,7 @@ if [[ ! -d "$DATA_ROOT" ]]; then
     echo "       Vérifie qu'il correspond à gnn_vgae.py:381 (LAB_DIR/gnn/data)."
     echo "       Override : --data-root <path> ou export GNN_DATA_ROOT=<path>"
 fi
-if [[ "$VERSION" == "V4" || "$VERSION" == "V4.1" || "$VERSION" == "V4.2" || "$VERSION" == "V4.2-sweep" ]]; then
+if [[ "$VERSION" == "V4" || "$VERSION" == "V4.1" || "$VERSION" == "V4.2" || "$VERSION" == "V4.2-sweep" || "$VERSION" == "V5" ]]; then
     CACHE_TF="$DATA_ROOT/omnipath/tf_collectri.tsv.gz"
     CACHE_SIG="$DATA_ROOT/omnipath/signed_ppi_signor.tsv.gz"
     if [[ ! -f "$CACHE_TF" ]]; then
@@ -341,6 +476,9 @@ if [[ "$VERSION" == "V4" || "$VERSION" == "V4.1" || "$VERSION" == "V4.2" || "$VE
 fi
 
 # --- Sécurité V4.2 : prérequis coexpr différentiel + Reactome FI -----------
+# V5 base utilise coexpr p16_only legacy (pas de prérequis spécifique).
+# Si --ablations diff-coexpr passé à V5, coexpr_diff.tsv est requis — mais
+# c'est l'utilisateur qui choisit, garde-fou softé en warning.
 if [[ "$VERSION" == "V4.2" ]]; then
     DIFF_FILE="$DATA_ROOT/pyscenic/diff_coexpr/coexpr_diff.tsv"
     RFI_FILE="$DATA_ROOT/reactome_fi/FIsInGene_with_annotations.txt"
@@ -357,6 +495,16 @@ if [[ "$VERSION" == "V4.2" ]]; then
         echo "[warn] Reactome FI absent : $RFI_FILE"
         echo "       Les configs *.rfi auront un edge_type reactome_fi vide."
         echo "       Lance : bash scripts/cache_reactome_fi.sh $DATA_ROOT/reactome_fi"
+    fi
+fi
+
+# --- Sécurité V5 : warning souple si --ablations contient diff-coexpr ------
+if [[ "$VERSION" == "V5" && "$ABLATIONS" == *"diff-coexpr"* ]]; then
+    DIFF_FILE="$DATA_ROOT/pyscenic/diff_coexpr/coexpr_diff.tsv"
+    if [[ ! -f "$DIFF_FILE" ]]; then
+        echo "[warn] V5 + ablation diff-coexpr demandée mais $DIFF_FILE absent."
+        echo "       Les configs *+diff-coexpr échoueront à l'exécution."
+        echo "       Pour les configs sans diff-coexpr (base p16_only), tout va bien."
     fi
 fi
 

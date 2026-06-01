@@ -27,6 +27,10 @@ en cours de modularisation (cf. [TODO](TODO) Tier 2.5).
   schéma `config.yaml`, plan de migration vers Snakemake.
 - **Backlog priorisé** : [`TODO`](TODO) — Tier 1 (priorité défense)
   → Tier 4 (post-stage).
+- **Documentation technique par script** :
+  [`docs/technical/`](docs/technical/) — 1 fichier `.md` par script
+  (20 + README), format frontmatter standardisé. Architecture interne,
+  CLI exhaustive, limites connues, références.
 - **Outils apparentés** : §18 du rapport — positionnement vs
   CellOracle, scTenifoldKnk, GEARS, DREAMwalk, decoupler-py.
 
@@ -103,7 +107,7 @@ python src/perturbation/perturb_top_genes.py \
     --modes KO,KD,OE --all-genes
 
 # 3. Single-seed report (figures + ranking)
-python src/validation/perturb_report.py \
+python src/validation/reports/perturb_report.py \
     --perturb-dir output/V3.6/run_s42/perturbation
 ```
 
@@ -115,7 +119,7 @@ bash scripts/run_ablation_grid.sh
 bash scripts/run_perturbation_grid.sh
 
 # Aggregation cross-seed
-python src/validation/perturb_report.py \
+python src/validation/reports/perturb_report.py \
     --cross-seed \
     --perturb-dirs output/V3.6/run_s4{2..51}/perturbation \
     --de-magnitude-csv data/gnn_data/DEGs_P4_vs_P16_MAST.csv \
@@ -126,13 +130,13 @@ python src/validation/perturb_report.py \
 
 ```bash
 # Test hypergéométrique vs aging DBs
-python src/validation/ora_consensus.py \
+python src/validation/ora/ora_consensus.py \
     --db aging \
     --consensus-runs output/V3.6/run_s4{2..51} \
     --out-dir output/V3.6/ora
 
 # Annotation biologique des cell_groups
-python src/validation/cluster_annotation.py \
+python src/validation/cluster/cluster_annotation.py \
     --run-dir output/V3.6/run_s42 \
     --cross-seed-dirs output/V3.6/run_s4{2..51}
 ```

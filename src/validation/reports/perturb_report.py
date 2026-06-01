@@ -2,55 +2,94 @@
 """
 perturb_report.py — Aggregate & visualise GNN perturbation results.
 
-Walks a perturbation directory (produced by gnn_perturbation.py or
-perturb_top_genes.py) and produces a comparison table plus a set of
-figures, split by perturbation mode (knockdown / knockout / overexpress).
+Consumes the output of `gnn_perturbation.py` / `perturb_top_genes.py` and
+emits comparison tables, ranking TSVs and figures, split by perturbation
+mode (knockdown / knockout / overexpress). Three input modes are
+supported, selected by mutually-exclusive CLI flags:
+
+  - ``--perturb-dir <dir>`` — single seed, top-N layout (one sub-folder
+    per perturbed target). Writes ``<dir>/report/``.
+  - ``--all <tsv> [<tsv> ...]`` — one or more aggregated per-mode TSVs
+    from ``perturb_top_genes --all-genes/--all-pathways``. They are
+    materialised into a temporary ``perturbation/`` layout and the rest
+    of the pipeline runs unchanged; genome-wide figure mode is
+    auto-enabled.
+  - ``--cross-seed <dir> [<dir> ...]`` — two or more per-seed
+    perturbation directories. Aggregates per-target robustness, sign
+    stability and the three composite scores (``driver_score``,
+    ``validation_score``, ``discovery_score``); writes
+    ``cross_seed_drivers.tsv``, ``cross_seed_gene_ranking.tsv`` and a
+    dedicated figure set into the version-level ``cross_seed_report/``.
 
 Artifact filter
 ---------------
 Some genes (often lncRNAs / pseudogenes like NPPA-AS1, RP1-140K8.5) move
-up by hundreds of ranks across *many unrelated* perturbations, because
+up by hundreds of ranks across *many unrelated* perturbations because
 their baseline importance is dominated by components that don't change
-under perturbation (e.g. low `vgae_specificity`) — this is a scoring
+under perturbation (e.g. low ``vgae_specificity``) — this is a scoring
 artifact, not a biological signal.
 
 We build a data-driven blocklist **per mode**: any gene appearing in the
-top-K risers of more than `--universal-threshold` (default 0.30 = 30%)
-of the runs *of that mode* is considered a universal riser and filtered
-out before computing max_up/max_down and the top-K riser sets.
-Per-mode is important because artifacts tend to be mode-specific:
-NPPA-AS1 rises in ~60% of knockout runs but is absent from knockdown /
-overexpress runs, so a global threshold would miss it.
+top-K risers of more than ``--universal-threshold`` (default 0.45) of
+the runs *of that mode* is flagged as a universal riser and dropped
+before computing max_up/max_down and the top-K riser sets. Per-mode
+filtering matters because artifacts tend to be mode-specific (NPPA-AS1
+rises in ~60% of knockout runs but is absent from knockdown / overexpress
+runs, so a global threshold would miss it).
 
-`--min-baseline-pct` (default 25) additionally drops bottom-percentile
+``--min-baseline-pct`` (default 25) additionally drops bottom-percentile
 importance genes.
 
 Usage
 -----
-    python src/perturb_report.py \\
+    # Single-seed report (top-N layout)
+    python src/validation/reports/perturb_report.py \\
         --perturb-dir output/gnn_vgae/V3_Run3/perturbation
 
-    # Looser / stricter artifact filter
-    python src/perturb_report.py \\
+    # Looser artifact filter
+    python src/validation/reports/perturb_report.py \\
         --perturb-dir output/gnn_vgae/V3_Run3/perturbation \\
         --min-baseline-pct 10
-    
-    python src/validation/reports/perturb_report.py --cross-seed output/gnn_vgae/V3.6/full/* --top-per-side 3
 
-Outputs (inside <perturb-dir>/report/)
---------------------------------------
+    # Genome-wide (one TSV per mode from perturb_top_genes --all-genes)
+    python src/validation/reports/perturb_report.py \\
+        --all output/gnn_vgae/V4.1/full.s1/perturbation_all_genes_*.tsv
+
+    # Cross-seed aggregation (V4 axis), 3 seeds
+    python src/validation/reports/perturb_report.py \\
+        --cross-seed output/gnn_vgae/V4.1/full.s{1,2,3}/perturbation \\
+        --axis-tag axisV4 --top-per-side 3
+
+Outputs
+-------
+``--perturb-dir`` / ``--all`` modes (inside ``<seed>/report/``):
     comparison_table.tsv              — headline stats per perturbation
     comparison_table_filtered.tsv     — same, with max_up/down recomputed
                                          after the baseline-importance filter
     overview_movers_<mode>.png        — filtered max-up / max-down per mode
     overview_updown_<mode>.png        — rising vs falling per mode
-    shift_gene_weighted_<mode>.png    — Option 1: max shift at gene level (amplified)
-    projection_signed_<mode>.png      — Option 2: signed direction on senescence axis
-                                         (red = pro-senescence, green = anti-senescence)
-    pathway_heatmap_<mode>.png        — top pathways × perturbation (-log10 p.adj)
+    shift_gene_weighted_<mode>.png    — Option 1: max shift at gene level
+    projection_signed_<mode>.png      — Option 2: signed projection on the
+                                         senescence axis (red = pro-sen,
+                                         green = anti-sen)
+    pathway_heatmap_<mode>.png        — top pathways × perturbation
+                                         (-log10 p.adj)
     top_risers_overlap_<mode>.png     — Jaccard matrix (ordered + hierarchical)
     top_risers_clustermap_<mode>.png  — clustered Jaccard with dendrograms
     delta_rank_dist_<mode>.png        — violin of |Δrank| per run
+
+``--cross-seed`` mode (inside ``<version>/cross_seed_report/``):
+    cross_seed_drivers.tsv            — per-target robustness / stability /
+                                         scores aggregated across seeds
+    cross_seed_gene_ranking.tsv       — gene-level ranking with
+                                         driver_score / validation_score /
+                                         discovery_score, evidence_tier
+                                         (A_confirmed / B_discovery /
+                                         C_effector / D_hub / E_noise),
+                                         DE / aging-DB annotations
+    cross_seed_pathway_ranking.tsv    — pathway-level analogue
+    cross_seed_*.png                  — robustness, sign stability,
+                                         tier distribution, driver figures
 """
 
 from __future__ import annotations

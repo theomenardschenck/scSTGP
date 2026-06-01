@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
-"""ablation_attribution.py — attribution automatique des sources d'information.
+"""ablation_attribution.py — Attribute ranking shifts to ablated information
+sources.
 
-Étant donné un ranking de référence (typiquement `v4.1-baseline` ou
-`v4.1-full`) et un ou plusieurs rankings d'ablation (`+no-coexpr`,
-`+no-humess`, …), ce script :
+Given a reference ranking (typically ``v4.1-baseline`` or ``v4.1-full``)
+and one or more ablation rankings (``+no-coexpr``, ``+no-humess``, …),
+this script:
 
-1. **Aligne** les `cross_seed_gene_ranking.tsv` sur le set de gènes commun.
-2. **Calcule** `Δrank[gene][ablation] = rank_ref - rank_ablation` (>0 →
-   gène promu par l'ablation, <0 → dému).
-3. **Identifie** les top-K genes promus et démus par chaque ablation.
-4. **Enrichit** chaque set via ORA hypergéométrique :
-   - REACTOME pathways (modules biologiques).
-   - Bases de données aging (SenMayo, CellAge, GenAge, Fridman).
-5. **Produit** :
-   - `delta_rank_table.tsv` : wide-format gènes × ablations.
-   - `top_movers_<ablation>.tsv` : top démus + top promus avec
-     `evidence_tier`, `direction`, `n_aging_dbs`, `is_de_significant`.
-   - `ora_<ablation>_<set>.tsv` : ORA REACTOME / aging pour
-     démus et promus séparément.
-   - `attribution_report.md` : synthèse markdown auto-générée pour
-     interprétation rapide. Inclut titre, tableaux résumés, top-20
-     gènes par direction × ablation, top-10 pathways enrichis.
+1. **Aligns** the ``cross_seed_gene_ranking.tsv`` files on their common
+   gene set.
+2. **Computes** ``Δrank[gene][ablation] = rank_ref − rank_ablation``
+   (>0 → gene promoted by the ablation, <0 → demoted).
+3. **Identifies** the top-K promoted and demoted genes per ablation.
+4. **Enriches** each gene set via hypergeometric ORA against:
+   - REACTOME pathways (biological modules).
+   - Aging databases (SenMayo, CellAge, GenAge, Fridman).
+5. **Emits**:
+   - ``delta_rank_table.tsv`` — wide-format gene × ablation table.
+   - ``top_movers_<ablation>.tsv`` — top promoted + top demoted with
+     ``evidence_tier``, ``direction``, ``n_aging_dbs``,
+     ``is_de_significant``.
+   - ``ora_<ablation>_<set>.tsv`` — REACTOME / aging ORA, computed
+     separately for the promoted and demoted sets.
+   - ``attribution_report.md`` — auto-generated markdown synthesis
+     (summary tables, top-20 movers per direction × ablation, top-10
+     enriched pathways) for rapid interpretation.
 
 Usage
 -----
@@ -32,7 +35,7 @@ Usage
         --top-k 50 \\
         --out-dir output/gnn_vgae/V4.1/attribution_baseline
 
-    # Sur la branche full V4.1 :
+    # V4.1 full branch:
     python src/validation/reports/ablation_attribution.py \\
         --reference output/gnn_vgae/V4.1/cross_seed_v4.1-full_axisV4 \\
         --ablations \\
@@ -40,14 +43,14 @@ Usage
             output/gnn_vgae/V4.1/cross_seed_v4.1-full+no-humess_axisV4 \\
         --out-dir output/gnn_vgae/V4.1/attribution_full
 
-Références
+References
 ----------
-- Ramaswamy 2021 *Bioinformatics* : edge perturbation ranking.
-- Ying 2019 *NeurIPS* GNNExplainer : interprétation formelle (TODO
-  Tier 2 Phase 5) ; ici, on fait une attribution statistique, plus
-  rapide mais moins formelle.
-- decoupler-py (Badia-i-Mompel 2022) : on utilise ora_consensus.run_ora
-  pour l'ORA hypergéométrique.
+- Ramaswamy 2021 *Bioinformatics* — edge perturbation ranking.
+- Ying 2019 *NeurIPS* GNNExplainer — formal interpretation framework
+  (TODO Tier 2 Phase 5); here we perform a faster but less formal
+  statistical attribution.
+- decoupler-py (Badia-i-Mompel 2022) — we reuse ``ora_consensus.run_ora``
+  for the hypergeometric ORA.
 """
 from __future__ import annotations
 

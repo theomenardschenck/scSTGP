@@ -1,29 +1,57 @@
 #!/usr/bin/env python3
 """
-Analyse inter-runs / inter-ablations pour les rankings VGAE.
+compare_runs.py — Cross-run / cross-ablation / cross-version analysis of
+VGAE-derived gene rankings.
 
-Combine la découverte de runs, l'agrégation par type d'ablation, le calcul
-de stabilité inter-seed, l'impact d'ablation vs baseline, et la génération
-de figures de synthèse — en un seul pipeline.
+Bundles run discovery, per-ablation grouping, inter-seed stability,
+ablation-vs-baseline impact, and summary figures into a single pipeline.
 
-L'abstraction `RankingSource` permettra d'ajouter par la suite les rankings
-produits par `perturb_report.py` (driver_score / validation_score /
-discovery_score, cross_seed_gene_ranking.tsv, cross_seed_pathway_ranking.tsv).
-Pour l'instant, seule la source `vgae` (gene_ranking_vgae.csv par run) est
-implémentée.
+Ranking sources (`--source`)
+----------------------------
+The `RankingSource` abstraction supports four ranking flavours, selected
+via ``--source``:
 
-Usage:
-    # Pipeline complet sur la grille V3.6 (8 ablations × 3 seeds)
+  - ``vgae`` (default, per_seed): ``gene_ranking_vgae.csv`` produced by
+    `gnn_vgae.py` for each seeded run. Layouts: ``<base>/<run>/...`` (flat)
+    or ``<base>/<ablation>/<run>/...`` (nested, V3.6+ ablation grids).
+  - ``perturb_driver`` (per_ablation): ``driver_score`` column of
+    ``cross_seed_gene_ranking.tsv`` produced by
+    `perturb_report.py --cross-seed`.
+  - ``perturb_validation`` (per_ablation): ``validation_score`` column of
+    the same TSV.
+  - ``perturb_discovery`` (per_ablation): ``discovery_score`` column.
+
+Per-seed sources expose inter-seed correlations and ablation grouping;
+per-ablation sources are already aggregated across seeds and support
+``--cross-ablation`` robustness exports.
+
+Usage
+-----
+    # Full pipeline on a V3.6 ablation grid (8 ablations × 3 seeds, VGAE)
     python compare_runs.py --auto-discover \\
         --base-dir output/gnn_vgae/V3.6 \\
         --output-dir output/gnn_vgae/V3.6/comparison_ablation
 
-    # Comparaison explicite de quelques runs
+    # Explicit subset of runs (VGAE)
     python compare_runs.py --runs full.s1 full.s2 no-ppi.s1 \\
         --base-dir output/gnn_vgae/V3.6
 
-    # Désactiver une étape
+    # Cross-ablation robustness on driver scores aggregated by
+    # perturb_report --cross-seed (per_ablation source)
+    python compare_runs.py --source perturb_driver --auto-discover \\
+        --base-dir output/gnn_vgae/V4.1 --cross-ablation \\
+        --output-dir output/gnn_vgae/V4.1/cross_ablation_driver
+
+    # Skip figures / wide table
     python compare_runs.py --auto-discover --base-dir <...> --no-figures
+
+Layout caveat (per_ablation sources)
+------------------------------------
+``perturb_driver/validation/discovery`` expect
+``<base_dir>/<run>/cross_seed_report/cross_seed_gene_ranking.tsv``. If your
+cross-seed report directories use custom names (e.g.
+``cross_seed_v4.1-full_axisV4``), symlink them to ``cross_seed_report``
+under a common parent before invoking, or normalise the directory names.
 """
 
 from __future__ import annotations

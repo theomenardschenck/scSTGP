@@ -2,8 +2,10 @@
 output/
 data/
 figures/
+docs/
 # ── Python ──────────────────────────────────────────────────────────
 __pycache__/
+__init__.py
 *.py[cod]
 *$py.class
 *.egg-info/
@@ -49,3 +51,8 @@ scripts/logs/
 *.pt
 *.pth
 *.ckpt
+
+# ── Other ──────────────────────────
+CLAUDE.md
+TODO
+*.md
