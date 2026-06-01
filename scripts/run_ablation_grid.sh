@@ -159,6 +159,7 @@ esac
 [[ "$VERSION" == "V4_1" ]] && VERSION="V4.1"
 [[ "$VERSION" == "V4_2" ]] && VERSION="V4.2"
 [[ "$VERSION" == "V4_2-sweep" || "$VERSION" == "V4_2_sweep" ]] && VERSION="V4.2-sweep"
+[[ "$VERSION" == "V5_3" ]] && VERSION="V5.3"
 
 # --- Définition des sub-configs par version ---------------------------------
 # Format : "<tag>::<flags>" — flags passés tels quels à gnn_vgae.py.
@@ -285,8 +286,34 @@ case "$VERSION" in
             "v5-full::$V41_FULL $SM $SD"
         )
         ;;
+    V5.3)
+        # V5.3 = V5.1-full + V5.2 (inclusion arêtes signées dans pool reco,
+        # déjà actif côté gnn_vgae.py:2652) + tête sub-espace `signed_proj`
+        # (V5.3 par défaut quand --signed-decoder) + `dedup-ppi-signed remove`
+        # (élimine la redondance PPI quand une arête signée existe sur la
+        # même paire — bénéfice plein quand le bilinéaire vit dans son
+        # sous-espace, cf. §14bis.6unvicesies).
+        #
+        # 4 sous-configs comme V5 mais avec `--dedup-ppi-signed remove`
+        # ajouté partout. La projection `signed_proj` est active dès que
+        # --signed-decoder ON (donc dans v5.3-sd et v5.3-full).
+        #
+        # signed-decoder-dim optionnel : par défaut LATENT_DIM (= 64) → init
+        # identité, équivalence V5.2 au départ. Passer 32 ou 16 pour
+        # compresser le sous-espace.
+        V41_FULL="$OP_SIG $OP_TF $OP_INC"
+        SM="--signed-message"
+        SD="--signed-decoder"
+        DEDUP="--dedup-ppi-signed remove"
+        BASE_CONFIGS=(
+            "v5.3-baseline::$V41_FULL $DEDUP"
+            "v5.3-sm::$V41_FULL $SM $DEDUP"
+            "v5.3-sd::$V41_FULL $SD $DEDUP"
+            "v5.3-full::$V41_FULL $SM $SD $DEDUP"
+        )
+        ;;
     *)
-        echo "Version inconnue : $VERSION (V3 | V4 | V4.1 | V4.2 | V4.2-sweep | V4.3-method-compare | V5)"; exit 1 ;;
+        echo "Version inconnue : $VERSION (V3 | V4 | V4.1 | V4.2 | V4.2-sweep | V4.3-method-compare | V5 | V5.3)"; exit 1 ;;
 esac
 
 # --- Parsing de --ablations en variantes -----------------------------------
@@ -462,7 +489,7 @@ if [[ ! -d "$DATA_ROOT" ]]; then
     echo "       Vérifie qu'il correspond à gnn_vgae.py:381 (LAB_DIR/gnn/data)."
     echo "       Override : --data-root <path> ou export GNN_DATA_ROOT=<path>"
 fi
-if [[ "$VERSION" == "V4" || "$VERSION" == "V4.1" || "$VERSION" == "V4.2" || "$VERSION" == "V4.2-sweep" || "$VERSION" == "V5" ]]; then
+if [[ "$VERSION" == "V4" || "$VERSION" == "V4.1" || "$VERSION" == "V4.2" || "$VERSION" == "V4.2-sweep" || "$VERSION" == "V5" || "$VERSION" == "V5.3" ]]; then
     CACHE_TF="$DATA_ROOT/omnipath/tf_collectri.tsv.gz"
     CACHE_SIG="$DATA_ROOT/omnipath/signed_ppi_signor.tsv.gz"
     if [[ ! -f "$CACHE_TF" ]]; then
@@ -499,7 +526,7 @@ if [[ "$VERSION" == "V4.2" ]]; then
 fi
 
 # --- Sécurité V5 : warning souple si --ablations contient diff-coexpr ------
-if [[ "$VERSION" == "V5" && "$ABLATIONS" == *"diff-coexpr"* ]]; then
+if [[ ( "$VERSION" == "V5" || "$VERSION" == "V5.3" ) && "$ABLATIONS" == *"diff-coexpr"* ]]; then
     DIFF_FILE="$DATA_ROOT/pyscenic/diff_coexpr/coexpr_diff.tsv"
     if [[ ! -f "$DIFF_FILE" ]]; then
         echo "[warn] V5 + ablation diff-coexpr demandée mais $DIFF_FILE absent."
