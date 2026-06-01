@@ -176,7 +176,30 @@ def _parse_cli_args():
     p.add_argument("--diff-coexpr-file",
                    default="data/pyscenic/diff_coexpr/coexpr_diff.tsv",
                    help="V4.2 : chemin du TSV différentiel produit par "
-                        "build_diff_coexpr.py merge-adjacencies.")
+                        "build_diff_coexpr.py merge-adjacencies. Si laissé "
+                        "à la valeur par défaut ET que --coexpr-method/"
+                        "--coexpr-prune sont != défaut, le chemin sera "
+                        "auto-résolu vers coexpr_diff.<method>.<prune>.tsv.")
+    # --- V4.3 : grille comparaison méthodes GRN × élagage ---
+    # Auto-résolution du chemin coexpr_diff selon (method, prune) si
+    # --diff-coexpr-file n'a pas été surchargé. method='sklearn' +
+    # prune='topk' = comportement V4.2 (fichier historique coexpr_diff.tsv).
+    p.add_argument("--coexpr-method",
+                   choices=["sklearn", "arboreto", "corr", "mi"],
+                   default="sklearn",
+                   help="V4.3 : méthode d'inférence GRN amont. sklearn = "
+                        "grnboost2-local (défaut, comportement V4.2) ; "
+                        "arboreto = grnboost2-diff canonique ; corr = "
+                        "Pearson/Spearman ; mi = mutual_info_regression. "
+                        "Persisté dans vgae_metrics.json.")
+    p.add_argument("--coexpr-prune",
+                   choices=["topk", "quantile", "mr", "zscore"],
+                   default="topk",
+                   help="V4.3 : méthode d'élagage des arêtes dans le "
+                        "réseau coexpr. topk = per-target-topk (défaut) ; "
+                        "quantile = global-quantile (baseline -) ; mr = "
+                        "mutual-rank Obayashi 2018 ; zscore = z-score "
+                        "per-target. Persisté dans vgae_metrics.json.")
 
     # --- V4.2 : Reactome FI (arêtes signées additionnelles) ---
     p.add_argument("--use-reactome-fi", dest="use_reactome_fi",
@@ -244,6 +267,30 @@ def _parse_cli_args():
                         "recon_loss principale ; 0.5 = demi-poids. Défaut "
                         "1.0.")
 
+    # --- V5 phase 2 : VRAI hold-out signed pour gate 1c.5 rigoureux ---
+    # Sans ces flags, la signed_aux_loss voit TOUTES les arêtes signées
+    # à l'entraînement → gate 1c.5 reste in-sample. Avec --holdout-signed-tf-
+    # fraction X > 0, on tire X% des « régulateurs » (= union des sym source
+    # des edge_types signés) et on MASQUE leurs arêtes signées de la loss.
+    # L'encodeur continue de voir ces arêtes via le message-passing
+    # (SignedGATConv propage), mais leur signe n'est PAS appris.
+    # test_signed_auc.py lit la liste persistée dans run_config.json et
+    # évalue uniquement sur les arêtes hold-out → vrai test de
+    # généralisation à des TFs jamais utilisés pour la loss.
+    p.add_argument("--holdout-signed-tf-fraction", type=float, default=0.0,
+                   help="V5 phase 2 : fraction des régulateurs (= union des "
+                        "sym source des edge_types signés) à réserver au test "
+                        "1c.5 rigoureux. Leurs arêtes signées sont retirées "
+                        "de la signed_aux_loss (mais conservées dans le "
+                        "graphe → encoder les voit toujours). 0.0 = pas de "
+                        "hold-out (défaut, comportement V5.1). Valeur typique "
+                        "défense : 0.2 (Liu 2024 NAR SGAT-bilinear §3).")
+    p.add_argument("--holdout-signed-tf-seed", type=int, default=None,
+                   help="V5 phase 2 : seed RNG pour le split TF hold-out. "
+                        "Défaut : prend --seed (reproductibilité couplée au "
+                        "training). Passer une valeur fixée (ex. 42) pour "
+                        "comparer des configs A/B sur le MÊME set hold-out.")
+
     # --- Exclusion fine de features de noeud gene ---
     # Liste possible : is_tf, variance, ppi_degree, reg_degree,
     #                  imp_P4, imp_P16, imp_delta, has_humess
@@ -277,6 +324,18 @@ def _parse_cli_args():
     if args.no_humess:
         args.use_humess_edges = False
         args.use_humess_features = False
+
+    # V4.3 : auto-résolution du chemin coexpr_diff si --diff-coexpr-file
+    # n'a pas été surchargé (= reste sur la valeur par défaut historique).
+    # method='sklearn' + prune='topk' → fichier V4.2 historique
+    # `coexpr_diff.tsv` conservé (pas de cassure ascendante).
+    _default_diff = "data/pyscenic/diff_coexpr/coexpr_diff.tsv"
+    if args.diff_coexpr_file == _default_diff and (
+            args.coexpr_method != "sklearn" or args.coexpr_prune != "topk"):
+        args.diff_coexpr_file = (
+            f"data/pyscenic/diff_coexpr/coexpr_diff."
+            f"{args.coexpr_method}.{args.coexpr_prune}.tsv"
+        )
 
     return args
 
@@ -367,6 +426,11 @@ def _build_run_tag():
     if MODULES["include_omnipath_genes"]:   parts.append("op-genes")
     if MODULES["use_reactome_fi"]:          parts.append("rfi")
     if COEXPR_DIFFERENTIAL:                 parts.append("coexdiff")
+    # V4.3 : tag des choix méthode×prune (uniquement si != défaut).
+    if CLI_ARGS.coexpr_method != "sklearn":
+        parts.append(f"grn-{CLI_ARGS.coexpr_method}")
+    if CLI_ARGS.coexpr_prune != "topk":
+        parts.append(f"prune-{CLI_ARGS.coexpr_prune}")
     if EDGE_TYPE_WEIGHTS:                   parts.append("gw")
     if getattr(CLI_ARGS, "dedup_ppi_signed", "off") != "off":
         parts.append(f"dedup-{CLI_ARGS.dedup_ppi_signed}")
@@ -488,6 +552,18 @@ with open(_MANIFEST_PATH, "w") as _fh:
         "reactome_fi_file": CLI_ARGS.reactome_fi_file,
         "edge_type_weights": EDGE_TYPE_WEIGHTS,
         "dedup_ppi_signed": getattr(CLI_ARGS, "dedup_ppi_signed", "off"),
+        # V4.3
+        "coexpr_method": CLI_ARGS.coexpr_method,
+        "coexpr_prune": CLI_ARGS.coexpr_prune,
+        # V5 (TIER 1c) — wiring signed message + bilinear decoder
+        "signed_message": CLI_ARGS.signed_message,
+        "signed_decoder": CLI_ARGS.signed_decoder,
+        "signed_loss_weight": CLI_ARGS.signed_loss_weight,
+        # V5 phase 2 (TIER 1c.5 strict) — hold-out signed TF pour gate rigoureux
+        # Les clés `holdout_signed_tf_set` et `holdout_signed_tf_seed_used`
+        # sont enrichies plus tard (cf. section 10) une fois le pool construit.
+        "holdout_signed_tf_fraction": CLI_ARGS.holdout_signed_tf_fraction,
+        "holdout_signed_tf_seed": CLI_ARGS.holdout_signed_tf_seed,
     }, _fh, indent=2)
 print(f"  Manifest écrit    : {_MANIFEST_PATH}")
 
@@ -2018,15 +2094,12 @@ class BilinearSignedDecoder(nn.Module):
 
     def forward_signed(self, z: torch.Tensor, edge_index: torch.Tensor,
                        edge_sign: torch.Tensor) -> torch.Tensor:
-        """Logits bilinéaires par canal sélectionné selon edge_sign.
+        """Logits bilinéaires — TRAINING uniquement.
 
-        Args:
-            z : (n_nodes, latent_dim) embeddings.
-            edge_index : (2, E) paires (src, dst).
-            edge_sign : (E,) sign ∈ {-1, 0, +1}.
-
-        Returns:
-            (E,) logits. Appliquer σ pour proba.
+        Sélectionne le canal selon `edge_sign` (info connue à l'entraînement).
+        ⚠ NE PAS utiliser pour l'évaluation `AUC(activate vs inhibit)` :
+        la sélection donne déjà la réponse. Pour l'inférence sign-agnostique,
+        utiliser `predict_sign_score()`.
         """
         z_src = z[edge_index[0]]
         z_dst = z[edge_index[1]]
@@ -2037,6 +2110,19 @@ class BilinearSignedDecoder(nn.Module):
         mask_neg = (edge_sign < 0).float()
         mask_zero = (edge_sign == 0).float()
         return mask_pos * logit_pos + mask_neg * logit_neg + mask_zero * logit_zero
+
+    def predict_sign_score(self, z: torch.Tensor,
+                           edge_index: torch.Tensor) -> torch.Tensor:
+        """Score sign-agnostique pour évaluation AUC(activate vs inhibit).
+
+        Retourne `logit_pos − logit_neg` SANS utiliser le sign cible.
+        Score correct pour gate 1c.5 (Liu 2024 *NAR* SGAT-bilinear §3).
+        """
+        z_src = z[edge_index[0]]
+        z_dst = z[edge_index[1]]
+        logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
+        logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
+        return logit_pos - logit_neg
 
 
 class _ScaledConv(nn.Module):
@@ -2563,12 +2649,35 @@ print("=" * 70)
 # Collecter toutes les arêtes gene↔gene (non dirigées, dédupliquées).
 # On stocke chaque arête comme (min(i,j), max(i,j)) pour dédupliquer
 # les arêtes bidirectionnelles (i→j et j→i comptent comme une seule paire).
+#
+# V5.2 (2026-05-29) : les edge_types SIGNÉS (signaling, tf_curated,
+# reactome_fi) sont MAINTENANT inclus dans le pool de reconstruction.
+# Justification (cf. §14bis.6vicies du rapport) :
+#   - Avant V5.2 : signed edges étaient injectées dans le graphe pour
+#     l'encoder mais ABSENTES de all_gene_edges → décodeur cosinus
+#     aveugle au sous-graphe signed + fuite par negative sampling
+#     (paires signed tirées comme "négatifs" alors qu'elles existent).
+#   - À partir de V5.2 : signed edges contribuent à la loss recon
+#     comme arêtes positives (sans distinction de signe — la sémantique
+#     signed reste l'affaire du BilinearSignedDecoder via la
+#     signed_aux_loss). Plus de fuite ; cosinus apprend l'existence
+#     de toutes les arêtes du graphe.
+#   - tf_curated_by est la copie inverse de tf_curated (mêmes paires
+#     (TF, target) avec src/dst swappés) → dédup automatique via
+#     (min, max), pas de double comptage.
+#   - n_edges passe typiquement de ~100k à ~150k → AUC recon **non
+#     comparable** aux versions V3/V4/V4.1/V5.1.
 all_gene_edges = set()
 for src_list, dst_list in [
     (ppi_src, ppi_dst),
     (react_src, react_dst),
     (reg_src, reg_dst), (reg_dst, reg_src),  # Regulates + regulated_by
     (coexpr_src, coexpr_dst),
+    # V5.2 — inclusion des edge_types signés.
+    (op_sig_src, op_sig_dst),       # signaling (OmniPath kinase + SIGNOR)
+    (op_tf_src, op_tf_dst),         # tf_curated (CollecTRI) — tf_curated_by
+                                    # est la copie inverse, dédupliquée auto.
+    (reactome_fi_src, reactome_fi_dst),  # Reactome FI signé
 ]:
     for s, d in zip(src_list, dst_list):
         pair = (min(s, d), max(s, d))
@@ -2576,7 +2685,19 @@ for src_list, dst_list in [
 
 all_edges = np.array(list(all_gene_edges))
 n_edges = len(all_edges)
-print(f"  Arêtes gene↔gene uniques : {n_edges}")
+# Décomposition pour audit (V5.2) : combien d'arêtes ont été ajoutées par
+# l'inclusion des signed ? Aide à comparer V5.1 (sans) vs V5.2 (avec).
+_signed_pair_count = 0
+for src_list, dst_list in [
+    (op_sig_src, op_sig_dst),
+    (op_tf_src, op_tf_dst),
+    (reactome_fi_src, reactome_fi_dst),
+]:
+    for s, d in zip(src_list, dst_list):
+        _signed_pair_count += 1
+print(f"  Arêtes gene↔gene uniques : {n_edges} "
+      f"(dont ~{_signed_pair_count} arêtes signées brutes contribuant au pool, "
+      f"après dédup avec PPI/REACTOME)")
 
 # Split train/test aléatoire — utilise CLI_ARGS.seed (défaut 42) pour
 # reproductibilité ET multi-seed inter-runs (V3.6+).
@@ -2676,6 +2797,118 @@ if CLI_ARGS.signed_decoder:
         print("  [warn] --signed-decoder ON mais signed_pos_pool vide "
               "(pas d'edge_type signé avec sign≠0 dans le graphe).")
 
+# V5 phase 2 (TIER 1c.5 strict) : split TF hold-out pour gate rigoureux.
+# On retire de la signed_aux_loss les arêtes dont src OU dst est un
+# régulateur hold-out. L'encoder voit toujours ces arêtes via le
+# message-passing → seul le SIGNE est masqué de la loss aux.
+# Liste hold-out persistée dans run_config.json + signed_holdout_edges.tsv
+# pour `test_signed_auc.py --mode holdout`.
+signed_holdout_pool: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+HOLDOUT_TF_SET: list[str] = []
+HOLDOUT_TF_SEED = (CLI_ARGS.holdout_signed_tf_seed
+                   if CLI_ARGS.holdout_signed_tf_seed is not None
+                   else CLI_ARGS.seed)
+if (CLI_ARGS.signed_decoder and signed_pos_pool
+        and CLI_ARGS.holdout_signed_tf_fraction > 0.0):
+    # 1. Set des régulateurs = union des sym source de TOUTES les arêtes signées
+    #    présentes (ie. les nœuds qui apparaissent en src d'au moins un
+    #    edge_type signé). Pour tf_curated_by les sym src sont les targets ;
+    #    mais comme on filtre ensuite par (src OU dst) ∈ hold-out, tout
+    #    régulateur de tf_curated sera attrapé en tf_curated_by aussi.
+    _regulator_idx = set()
+    for et_key, (ei, _) in signed_pos_pool.items():
+        _regulator_idx.update(ei[0].tolist())
+    _regulator_syms = sorted(str(gene_symbols[i]) for i in _regulator_idx
+                             if i < len(gene_symbols))
+    if len(_regulator_syms) < 5:
+        print(f"  [warn] --holdout-signed-tf-fraction ON mais seulement "
+              f"{len(_regulator_syms)} régulateurs trouvés — hold-out désactivé.")
+    else:
+        _rng = np.random.default_rng(HOLDOUT_TF_SEED)
+        _n_holdout = max(1, int(len(_regulator_syms)
+                                * CLI_ARGS.holdout_signed_tf_fraction))
+        HOLDOUT_TF_SET = sorted(_rng.choice(_regulator_syms,
+                                            size=_n_holdout,
+                                            replace=False).tolist())
+        _holdout_idx_set = {gene_to_idx[s] for s in HOLDOUT_TF_SET
+                            if s in gene_to_idx}
+
+        # 2. Split par edge_type : edge en hold-out si src OR dst ∈ set.
+        for et_key in list(signed_pos_pool.keys()):
+            ei, sign = signed_pos_pool[et_key]
+            _src = ei[0].numpy()
+            _dst = ei[1].numpy()
+            # vectorisé : True si src ou dst dans set
+            _src_in = np.isin(_src, list(_holdout_idx_set))
+            _dst_in = np.isin(_dst, list(_holdout_idx_set))
+            _is_holdout = _src_in | _dst_in
+            _is_train = ~_is_holdout
+
+            if _is_holdout.sum() > 0:
+                signed_holdout_pool[et_key] = (
+                    ei[:, _is_holdout].clone(),
+                    sign[_is_holdout].clone(),
+                )
+            if _is_train.sum() > 0:
+                signed_pos_pool[et_key] = (
+                    ei[:, _is_train].clone(),
+                    sign[_is_train].clone(),
+                )
+            else:
+                # Tout est en hold-out (rare avec X≤0.5) → on retire l'edge_type
+                signed_pos_pool.pop(et_key, None)
+
+        # 3. Log + persistance TSV des arêtes hold-out (pour test_signed_auc.py).
+        _ho_summary = {et[1]: int(ei.shape[1])
+                       for et, (ei, _) in signed_holdout_pool.items()}
+        _tr_summary = {et[1]: int(ei.shape[1])
+                       for et, (ei, _) in signed_pos_pool.items()}
+        print(f"  V5 phase 2 hold-out signed TF (seed={HOLDOUT_TF_SEED}, "
+              f"frac={CLI_ARGS.holdout_signed_tf_fraction:.0%}) :")
+        print(f"    régulateurs : {len(HOLDOUT_TF_SET)}/{len(_regulator_syms)} "
+              f"({100*len(HOLDOUT_TF_SET)/len(_regulator_syms):.1f}%)")
+        print(f"    arêtes train (loss aux) : {_tr_summary}")
+        print(f"    arêtes hold-out (eval pure) : {_ho_summary}")
+
+        # TSV : 1 ligne par (edge_type, src_sym, dst_sym, sign).
+        _ho_rows = []
+        for et_key, (ei, sign) in signed_holdout_pool.items():
+            for j in range(ei.shape[1]):
+                _ho_rows.append({
+                    "edge_type": et_key[1],
+                    "src_sym": str(gene_symbols[int(ei[0, j])]),
+                    "dst_sym": str(gene_symbols[int(ei[1, j])]),
+                    "src_idx": int(ei[0, j]),
+                    "dst_idx": int(ei[1, j]),
+                    "sign": float(sign[j]),
+                })
+        if _ho_rows:
+            pd.DataFrame(_ho_rows).to_csv(
+                os.path.join(OUT_DIR, "signed_holdout_edges.tsv"),
+                sep="\t", index=False,
+            )
+            print(f"    persisté : signed_holdout_edges.tsv "
+                  f"({len(_ho_rows)} arêtes)")
+
+        # 4. Réécriture du manifest avec le set hold-out résolu (= reproductible).
+        try:
+            with open(_MANIFEST_PATH) as _fh:
+                _manifest = json.load(_fh)
+            _manifest.update({
+                "holdout_signed_tf_set": HOLDOUT_TF_SET,
+                "holdout_signed_tf_seed_used": HOLDOUT_TF_SEED,
+                "holdout_signed_edges_per_edge_type": _ho_summary,
+                "signed_train_edges_per_edge_type": _tr_summary,
+            })
+            with open(_MANIFEST_PATH, "w") as _fh:
+                json.dump(_manifest, _fh, indent=2)
+            print(f"    manifest enrichi : {_MANIFEST_PATH}")
+        except Exception as _e:
+            print(f"    [warn] échec enrichissement manifest : {_e}")
+elif CLI_ARGS.holdout_signed_tf_fraction > 0.0 and not CLI_ARGS.signed_decoder:
+    print(f"  [warn] --holdout-signed-tf-fraction={CLI_ARGS.holdout_signed_tf_fraction} "
+          f"ignoré (nécessite --signed-decoder).")
+
 # Historique pour les plots
 train_losses = []      # Loss totale à chaque epoch
 recon_losses = []      # Loss de reconstruction à chaque epoch
@@ -2731,21 +2964,34 @@ for epoch in range(N_EPOCHS):
     )
     recon_loss = pos_loss + neg_loss
 
-    # --- V5 (TIER 1c.4) : loss auxiliaire signée (BilinearSignedDecoder) ---
+    # --- V5.1 (TIER 1c.4) : loss auxiliaire signée CONTRASTIVE -----------
     # Cible binaire : sign>0 → 1 (activation), sign<0 → 0 (inhibition).
-    # BCE par edge_type signé sur logits bilinéaires, moyenne pondérée par
-    # le nombre d'arêtes. Active uniquement si --signed-decoder.
+    # BCE sur le score SIGN-AGNOSTIQUE `predict_sign_score = logit_pos −
+    # logit_neg`. Optimise directement la métrique du gate 1c.5.
+    #
+    # ⚠ Correction V5.1 (2026-05-29) — la formulation V5.0 utilisait
+    # `forward_signed(z, ei, sign)` qui SÉLECTIONNAIT le canal selon le
+    # sign cible. Conséquence : `logit_pos` était entraîné haut pour les
+    # activations, `logit_neg` bas pour les inhibitions, mais les deux
+    # canaux n'étaient PAS contraints l'un par rapport à l'autre. Le
+    # score différentiel `logit_pos − logit_neg` était donc indépendant
+    # du sign cible → AUC ≈ 0.5 sur le gate 1c.5 (mesuré 2026-05-29 sur
+    # v5-full.s{1,2,3}, cf. §14bis.6septies du rapport).
+    #
+    # V5.1 fix : on entraîne directement le score différentiel, ce qui
+    # force `logit_pos > logit_neg` pour activations et inverse pour
+    # inhibitions. Cf. SGAT-bilinear Liu 2024 *NAR* §3.
     signed_aux_loss = torch.tensor(0.0, device=z.device)
     if CLI_ARGS.signed_decoder and signed_pos_pool:
         _aux_terms = []
         for et_key, (ei, sign) in signed_pos_pool.items():
             ei = ei.to(z.device)
             sign = sign.to(z.device)
-            # Logits bilinéaires sur les arêtes signées dirigées.
-            logits = model.decode_signed(z, ei, sign)
+            # Score différentiel : (z_src·W_+·z_dst) − (z_src·W_-·z_dst)
+            score = model.bilinear_decoder.predict_sign_score(z, ei)
             target = (sign > 0).float()  # +1 → 1 ; -1 → 0
             _aux_terms.append(F.binary_cross_entropy_with_logits(
-                logits, target
+                score, target
             ))
         if _aux_terms:
             signed_aux_loss = torch.stack(_aux_terms).mean()
@@ -3952,6 +4198,16 @@ _metrics = {
         "latent_dim": int(LATENT_DIM),
         "edge_sample_ratio": float(EDGE_SAMPLE_RATIO),
         "grad_clip_norm": float(GRAD_CLIP_NORM),
+        # V5 flags — requis par gnn_perturbation.load_run pour reconstruire
+        # le bon encoder (SignedGATConv) et accepter le state_dict
+        # (clés bilinear_decoder.*). Sans ces flags persistés, le load
+        # silencieusement ignore les signes ou refuse le state_dict.
+        "signed_message": bool(getattr(CLI_ARGS, "signed_message", False)),
+        "signed_decoder": bool(getattr(CLI_ARGS, "signed_decoder", False)),
+        "signed_loss_weight": float(getattr(CLI_ARGS, "signed_loss_weight", 0.0)),
+        # V4.3 — choix méthode×prune amont (consommé par cross-method report).
+        "coexpr_method": CLI_ARGS.coexpr_method,
+        "coexpr_prune": CLI_ARGS.coexpr_prune,
     },
     "edge_stats": _edge_stats_block,
 }

@@ -93,6 +93,76 @@ CELL_GROUPS = ("P4", "P16_cluster_0", "P16_cluster_1",
 # --------------------------------------------------------------------------- #
 # Model (duplicated from gnn_vgae.py to keep this tool self-contained).
 # --------------------------------------------------------------------------- #
+# V5 (TIER 1c) — edge_types qui portent un `sign` (colonne 1 de edge_attr).
+# DOIT rester synchro avec gnn_vgae.SIGNED_EDGE_TYPES.
+SIGNED_EDGE_TYPES: set = {
+    ("gene", "signaling", "gene"),
+    ("gene", "tf_curated", "gene"),
+    ("gene", "tf_curated_by", "gene"),
+    ("gene", "reactome_fi", "gene"),
+}
+
+
+class SignedGATConv(GATConv):
+    """GATConv qui multiplie chaque message par son `sign` d'arête (V5).
+
+    Duplique `_vgae_model.SignedGATConv` pour import-safety (Tier 2.5).
+    Aucun nouveau paramètre vs GATConv — les state_dicts sont
+    interchangeables, seul le forward diffère.
+    """
+
+    def __init__(self, *args, sign_col: int = 1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sign_col = sign_col
+        self._current_edge_sign = None
+
+    def forward(self, x, edge_index, edge_attr=None, size=None,
+                return_attention_weights=None):
+        if edge_attr is not None and edge_attr.ndim >= 2 \
+                and edge_attr.shape[1] > self.sign_col:
+            self._current_edge_sign = edge_attr[:, self.sign_col]
+        else:
+            self._current_edge_sign = None
+        return super().forward(x, edge_index, edge_attr=edge_attr, size=size,
+                               return_attention_weights=return_attention_weights)
+
+    def message(self, x_j, alpha):
+        out = super().message(x_j, alpha)
+        sign = self._current_edge_sign
+        if sign is None:
+            return out
+        scale = torch.where(sign == 0, torch.ones_like(sign), sign)
+        scale = scale.view(-1, *([1] * (out.ndim - 1)))
+        return out * scale
+
+
+class BilinearSignedDecoder(nn.Module):
+    """Décodeur bilinéaire signé (V5) — duplicate import-safe.
+
+    Paramètres `W_pos`, `W_neg`, `W_zero` (latent×latent). En perturbation,
+    on n'appelle pas `forward_signed()` (l'importance utilise le décodeur
+    cosinus), mais la classe doit exister pour que le state_dict charge.
+    """
+
+    def __init__(self, latent_dim: int):
+        super().__init__()
+        eye = torch.eye(latent_dim)
+        self.W_pos = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
+        self.W_neg = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
+        self.W_zero = nn.Parameter(eye + 0.01 * torch.randn(latent_dim, latent_dim))
+
+    def forward_signed(self, z, edge_index, edge_sign):
+        z_src = z[edge_index[0]]
+        z_dst = z[edge_index[1]]
+        logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
+        logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
+        logit_zero = (z_src @ self.W_zero * z_dst).sum(dim=-1)
+        mask_pos = (edge_sign > 0).float()
+        mask_neg = (edge_sign < 0).float()
+        mask_zero = (edge_sign == 0).float()
+        return mask_pos * logit_pos + mask_neg * logit_neg + mask_zero * logit_zero
+
+
 class HeteroEncoder(nn.Module):
     # Catalogue de tous les edge_types possibles (V3.6+) — mirroir de
     # gnn_vgae.HeteroEncoder.EDGE_TYPE_CATALOG. Filtré dynamiquement à
@@ -113,15 +183,23 @@ class HeteroEncoder(nn.Module):
         (("gene", "signaling", "gene"), 2),
         (("gene", "tf_curated", "gene"), 2),
         (("gene", "tf_curated_by", "gene"), 2),
+        (("gene", "reactome_fi", "gene"), 2),  # V4.2
     ]
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
-                 n_heads=4, dropout=0.2, available_edge_types=None):
+                 n_heads=4, dropout=0.2, available_edge_types=None,
+                 edge_dim_overrides=None,
+                 signed_message=False, signed_edge_types=None):
         super().__init__()
         self.n_layers = n_layers
         head_dim = hidden // n_heads
         self.gene_proj = nn.Linear(gene_in, hidden)
         self.cell_proj = nn.Linear(cell_in, hidden)
+        # V5 (TIER 1c.2) : flag SignedGATConv pour edge_types signés.
+        self._signed_message = bool(signed_message)
+        self._signed_edge_types = set(
+            tuple(et) for et in (signed_edge_types or SIGNED_EDGE_TYPES)
+        )
 
         if available_edge_types is None:
             edge_types_dims = list(self.EDGE_TYPE_CATALOG)
@@ -138,6 +216,15 @@ class HeteroEncoder(nn.Module):
                 "HeteroEncoder : aucun edge_type actif. Vérifie le graphe "
                 "sauvegardé (data.edge_types)."
             )
+        # V4.2 : edge_dim peut différer du catalogue (coexpr différentielle
+        # 1→6, ppi 1→2 sous --dedup-ppi-signed annotate). Les overrides sont
+        # inférés depuis data[et].edge_attr.shape[1] côté load_run().
+        overrides = edge_dim_overrides or {}
+        if overrides:
+            edge_types_dims = [
+                (et, overrides.get(tuple(et), dim))
+                for et, dim in edge_types_dims
+            ]
         self.edge_dims = {et: dim for et, dim in edge_types_dims}
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -148,7 +235,18 @@ class HeteroEncoder(nn.Module):
                                    dropout=dropout, add_self_loops=False)
                 if ed is not None:
                     conv_kwargs["edge_dim"] = ed
-                conv_dict[et] = GATConv(hidden, head_dim, **conv_kwargs)
+                # V5 : SignedGATConv si flag actif ET edge_type signé ET
+                # edge_dim≥2 (besoin de la colonne `sign`).
+                _use_signed = (
+                    self._signed_message
+                    and tuple(et) in self._signed_edge_types
+                    and ed is not None and ed >= 2
+                )
+                if _use_signed:
+                    conv_dict[et] = SignedGATConv(hidden, head_dim,
+                                                  sign_col=1, **conv_kwargs)
+                else:
+                    conv_dict[et] = GATConv(hidden, head_dim, **conv_kwargs)
             self.convs.append(HeteroConv(conv_dict, aggr="sum"))
             self.norms.append(nn.ModuleDict({
                 "gene": nn.BatchNorm1d(hidden),
@@ -206,11 +304,18 @@ class HeteroEncoder(nn.Module):
 
 
 class VGAE(nn.Module):
-    def __init__(self, encoder, tau_init=2.0, tau_max=3.0):
+    def __init__(self, encoder, tau_init=2.0, tau_max=3.0,
+                 bilinear_decoder=None):
         super().__init__()
         self.encoder = encoder
         self.log_tau = nn.Parameter(torch.tensor(float(np.log(tau_init))))
         self.log_tau_max = np.log(tau_max)
+        # V5 (TIER 1c.3) : décodeur bilinéaire signé optionnel. En
+        # perturbation on n'appelle PAS forward_signed() — la métrique
+        # d'importance utilise toujours le décodeur cosinus historique —
+        # mais la sous-module doit exister pour que load_state_dict accepte
+        # les clés `bilinear_decoder.*` d'un checkpoint trainé `--signed-decoder`.
+        self.bilinear_decoder = bilinear_decoder
 
     def encode(self, x_dict, edge_index_dict, edge_attr_dict=None):
         mu, logvar = self.encoder(x_dict, edge_index_dict, edge_attr_dict)
@@ -715,6 +820,37 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
               "sera sauté (relancer gnn_vgae.py pour le régénérer).")
         group_expr = None
 
+    # V4.2 : edge_dim peut différer du catalogue (coexpr 1→6 en differential,
+    # ppi 1→2 si --dedup-ppi-signed annotate). On infère depuis edge_attr
+    # du graphe sauvé pour aligner l'encoder sur le state_dict.
+    edge_dim_overrides = {}
+    for et in data.edge_types:
+        store = data[et]
+        ea = getattr(store, "edge_attr", None)
+        if ea is not None and ea.ndim >= 2 and ea.shape[1] > 0:
+            edge_dim_overrides[tuple(et)] = int(ea.shape[1])
+
+    # V5 (TIER 1c) : lire les flags signed_message/signed_decoder depuis
+    # vgae_metrics.json (persisté à l'entraînement). Sans ces flags, on
+    # (i) instancierait des GATConv plain au lieu de SignedGATConv → le
+    # state_dict charge mais les signes seraient ignorés à l'inférence, et
+    # (ii) refuserait les clés bilinear_decoder.* présentes dans les
+    # checkpoints `--signed-decoder`.
+    signed_message = False
+    signed_decoder = False
+    metrics_path = run_dir / "vgae_metrics.json"
+    if metrics_path.exists():
+        try:
+            import json as _json
+            with open(metrics_path) as _f:
+                _m = _json.load(_f)
+            _hp = _m.get("hyperparams", {}) if isinstance(_m, dict) else {}
+            signed_message = bool(_hp.get("signed_message", False))
+            signed_decoder = bool(_hp.get("signed_decoder", False))
+        except Exception as _e:
+            print(f"[warn] lecture {metrics_path.name} échouée : {_e} — "
+                  f"V5 flags supposés False (backward-compat V4.x).")
+
     encoder = HeteroEncoder(
         gene_in=data["gene"].x.shape[1],
         cell_in=data["cell_group"].x.shape[1],
@@ -723,12 +859,30 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
         # présents dans le graphe entraîné — sinon le state_dict refuse
         # de charger sur les ablations (--no-ppi, --no-coexpr, etc.).
         available_edge_types=list(data.edge_types),
+        edge_dim_overrides=edge_dim_overrides or None,
+        signed_message=signed_message,
     )
-    model = VGAE(encoder)
+    bilinear_decoder = BilinearSignedDecoder(latent) if signed_decoder else None
+    model = VGAE(encoder, bilinear_decoder=bilinear_decoder)
+    if signed_message or signed_decoder:
+        print(f"  [load_run] V5 flags : signed_message={signed_message} "
+              f"signed_decoder={signed_decoder}")
+
     state_path = run_dir / "best_vgae.pt"
     if not state_path.exists():
         state_path = run_dir / "vgae_weights.pt"
-    model.load_state_dict(torch.load(state_path, weights_only=True))
+    state_dict = torch.load(state_path, weights_only=True)
+    # V5 safety : si vgae_metrics.json absent OU faux négatif sur
+    # signed_decoder mais que le state_dict contient bilinear_decoder.*,
+    # on instancie le module a posteriori pour ne pas planter sur strict=True.
+    has_bilinear_keys = any(k.startswith("bilinear_decoder.")
+                            for k in state_dict.keys())
+    if has_bilinear_keys and model.bilinear_decoder is None:
+        print("  [load_run] bilinear_decoder.* détecté dans le state_dict "
+              "mais signed_decoder=False dans vgae_metrics.json — "
+              "instanciation a posteriori pour accepter le checkpoint.")
+        model.bilinear_decoder = BilinearSignedDecoder(latent)
+    model.load_state_dict(state_dict)
     model.eval()
     return data, model, gene_symbols, gene_to_idx, baseline, group_expr
 

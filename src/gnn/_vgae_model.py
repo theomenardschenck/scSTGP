@@ -280,7 +280,14 @@ class BilinearSignedDecoder(nn.Module):
 
     def forward_signed(self, z: torch.Tensor, edge_index: torch.Tensor,
                        edge_sign: torch.Tensor) -> torch.Tensor:
-        """Décode des arêtes signées.
+        """Décode des arêtes signées — usage TRAINING uniquement.
+
+        Sélectionne le canal selon `edge_sign` (info connue à l'entraînement).
+        La BCE compare ensuite `σ(logit_canal)` à 0/1 selon le sign cible.
+
+        ⚠ Inutilisable pour l'évaluation `AUC(activate vs inhibit)` : on
+        donnerait déjà la réponse via la sélection du canal. Pour
+        l'inférence sign-agnostique, utiliser `predict_sign_score()`.
 
         Args:
             z : embedding latent (n_nodes, latent_dim).
@@ -288,7 +295,7 @@ class BilinearSignedDecoder(nn.Module):
             edge_sign : (E,) — sign ∈ {-1, 0, +1}.
 
         Returns:
-            logits : (E,) — logit non-normalisé. Appliquer σ pour proba.
+            logits : (E,) — logit non-normalisé du canal sélectionné par sign.
         """
         z_src = z[edge_index[0]]  # (E, D)
         z_dst = z[edge_index[1]]  # (E, D)
@@ -301,6 +308,22 @@ class BilinearSignedDecoder(nn.Module):
         mask_neg = (edge_sign < 0).float()
         mask_zero = (edge_sign == 0).float()
         return mask_pos * logit_pos + mask_neg * logit_neg + mask_zero * logit_zero
+
+    def predict_sign_score(self, z: torch.Tensor,
+                           edge_index: torch.Tensor) -> torch.Tensor:
+        """Score sign-agnostique pour évaluation AUC(activate vs inhibit).
+
+        Pour chaque arête (i, j), retourne `logit_pos − logit_neg` SANS
+        utiliser le sign cible. AUC entre ce score et `(sign > 0).int()`
+        mesure la séparation activate / inhibit apprise par le décodeur.
+
+        C'est le score correct pour le gate 1c.5 (Liu 2024 *NAR* §3).
+        """
+        z_src = z[edge_index[0]]
+        z_dst = z[edge_index[1]]
+        logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
+        logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
+        return logit_pos - logit_neg
 
     def forward_cosine(self, z: torch.Tensor, edge_index: torch.Tensor,
                        tau: float = 1.0) -> torch.Tensor:
