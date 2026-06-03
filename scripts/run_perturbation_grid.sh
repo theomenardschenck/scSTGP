@@ -56,13 +56,18 @@ OUT_DIR_BASE="${OUT_DIR_BASE:-$OUT_DIR_BASE_DEFAULT}"
 DEFAULT_PATTERN="${OUT_DIR_BASE}/*.s*"
 
 DEFAULT_MODES=(knockout knockdown overexpress)   # 3 modes — cohérent avec V3.3 cross-seed
-DEFAULT_AXIS="v3"           # backward-compat : axe historique P4 quiescent
+DEFAULT_AXIS="v4"           # backward-compat : axe historique P4 quiescent
 MAX_PARALLEL=10
 TIME_LIMIT="0-12:00:00"
 DRY_RUN=0
 ALSO_PATHWAYS=0
 SKIP_REPORT=0               # par défaut : on chaîne perturb_report --all après
 SKIP_CROSS_SEED=0           # par défaut : cross-seed report auto post-perturb
+# V5.4 — sémantique KO. cut (défaut) = statu quo (coupe arêtes incidentes).
+# mask = feature=0 sans coupure (= KD topology-wise, fix bug "incoherent").
+# soft = feature × ko_soft_factor (défaut 0.1).
+KO_MODE="cut"
+KO_SOFT_FACTOR="0.1"
 
 # --- Parsing CLI ------------------------------------------------------------
 PATTERN=""
@@ -81,6 +86,8 @@ while [[ $# -gt 0 ]]; do
         --axis)           AXIS="$2"; shift 2 ;;
         --skip-report)    SKIP_REPORT=1; shift ;;
         --skip-cross-seed) SKIP_CROSS_SEED=1; shift ;;
+        --ko-mode)        KO_MODE="$2"; shift 2 ;;
+        --ko-soft-factor) KO_SOFT_FACTOR="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,40p' "$0"; exit 0 ;;
         *) echo "Argument inconnu : $1"; exit 1 ;;
@@ -219,6 +226,13 @@ if [[ -n "\$OUT_SUFFIX" ]]; then
     EXTRA_ARGS+=(--out-suffix "\$OUT_SUFFIX")
 fi
 EXTRA_ARGS+=(--quiescent-groups "\$QGROUPS")
+# V5.4 — ko_mode (cut=statu quo / mask / soft). Passé même en --mode knockdown
+# ou --mode overexpress : perturb_top_genes l'ignorera (uniquement utilisé
+# si knockout).
+EXTRA_ARGS+=(--ko-mode "$KO_MODE")
+if [[ "$KO_MODE" == "soft" ]]; then
+    EXTRA_ARGS+=(--ko-soft-factor "$KO_SOFT_FACTOR")
+fi
 
 # NB cluster Nautilus : tous les .py sont déployés à plat sous src/
 # (pas de sous-dossiers gnn/, perturbation/, validation/ comme en local).
