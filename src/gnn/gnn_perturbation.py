@@ -190,6 +190,19 @@ class BilinearSignedDecoder(nn.Module):
         logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
         return logit_pos - logit_neg
 
+    def predict_signed_existence(self, z, edge_index):
+        """V5.4 (decoder-split) — existence = logsumexp(W+,W-,W0).
+        Non utilisé en perturbation (importance = cosinus) mais présent
+        pour cohérence avec gnn_vgae.py / _vgae_model.py."""
+        z_signed = self._project(z)
+        z_src = z_signed[edge_index[0]]
+        z_dst = z_signed[edge_index[1]]
+        logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
+        logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
+        logit_zero = (z_src @ self.W_zero * z_dst).sum(dim=-1)
+        return torch.logsumexp(
+            torch.stack([logit_pos, logit_neg, logit_zero], dim=-1), dim=-1)
+
 
 class HeteroEncoder(nn.Module):
     # Catalogue de tous les edge_types possibles (V3.6+) — mirroir de

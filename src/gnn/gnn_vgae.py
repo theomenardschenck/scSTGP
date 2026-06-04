@@ -334,6 +334,18 @@ def _parse_cli_args():
     p.add_argument("--patience", type=int, default=150,
                    help="Patience de l'early stopping (epochs sans amélioration "
                         "AUC val avant arrêt). Défaut 100.")
+    # --- V5.4 (decoder-split, §14bis.6duovicies) ---
+    p.add_argument("--decoder-split", dest="decoder_split", action="store_true",
+                   help="V5.4 : route les arêtes SIGNÉES vers le décodeur "
+                        "bilinéaire (existence via logsumexp) et libère le "
+                        "cosinus des arêtes dirigées (recon cosinus = pool V5.1). "
+                        "Nécessite --signed-decoder. Défaut OFF (backward-compat V5.3).")
+    # --- V4.3-tune : hyperparamètres surchargeables (étaient hardcodés) ---
+    p.add_argument("--kl-beta-max", dest="kl_beta_max", type=float, default=0.0005,
+                   help="V4.3-tune : β final du KL annealing (0→kl_beta_max). "
+                        "Défaut 0.0005. kl1 = 0.0001.")
+    p.add_argument("--latent-dim", dest="latent_dim", type=int, default=64,
+                   help="V4.3-tune : dimension de l'espace latent. Défaut 64.")
 
     args, _unknown = p.parse_known_args()
 
@@ -576,6 +588,10 @@ with open(_MANIFEST_PATH, "w") as _fh:
         "signed_message": CLI_ARGS.signed_message,
         "signed_decoder": CLI_ARGS.signed_decoder,
         "signed_loss_weight": CLI_ARGS.signed_loss_weight,
+        # V5.4 (decoder-split) + V4.3-tune (kl_beta_max, latent_dim)
+        "decoder_split": bool(getattr(CLI_ARGS, "decoder_split", False)),
+        "kl_beta_max": CLI_ARGS.kl_beta_max,
+        "latent_dim": CLI_ARGS.latent_dim,
         # V5.3 (TIER 1c.7) — tête sub-espace signed_proj
         "signed_decoder_dim": CLI_ARGS.signed_decoder_dim,
         # V5 phase 2 (TIER 1c.5 strict) — hold-out signed TF pour gate rigoureux
@@ -610,7 +626,8 @@ HIDDEN_DIM = 128
 # LATENT_DIM : dimension de l'espace latent (μ et log(σ²) ont cette taille).
 #   C'est l'espace dans lequel on calcule le score d'importance. 64 offre
 #   un bon compromis entre expressivité et risque de KL collapse.
-LATENT_DIM = 64
+#   Surchargeable via --latent-dim (défaut 64).
+LATENT_DIM = CLI_ARGS.latent_dim
 # N_LAYERS : nombre de couches de message passing. Chaque couche permet
 #   à un gène de "voir" un voisin de plus. Avec 3 couches, chaque gène
 #   agrège l'information de ses voisins jusqu'à distance 3 dans le graphe.
@@ -654,7 +671,7 @@ N_CLUSTERS = 8
 #   2. Free bits : on impose un minimum de KL par dimension latente (FREE_BITS).
 #      Si une dimension a KL < FREE_BITS, on ne la pénalise pas. Cela force le
 #      modèle à utiliser au moins FREE_BITS nats d'information par dimension.
-KL_BETA_MAX = 0.0005      # β final — calibré empiriquement : AUC > 0.90 à ce β, dégrade au-delà
+KL_BETA_MAX = CLI_ARGS.kl_beta_max   # β final ; --kl-beta-max (défaut 0.0005 ; kl1=0.0001)
 KL_WARMUP_EPOCHS = 50     # Warmup court puis β stable — le cosinus n'a pas besoin de long warmup
 FREE_BITS = 0.5           # Minimum KL par dimension latente (en nats)
 
@@ -2169,6 +2186,28 @@ class BilinearSignedDecoder(nn.Module):
         logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
         return logit_pos - logit_neg
 
+    def predict_signed_existence(self, z: torch.Tensor,
+                                 edge_index: torch.Tensor) -> torch.Tensor:
+        """V5.4 (decoder-split, §14bis.6duovicies) — score d'EXISTENCE bilinéaire.
+
+        `logsumexp(logit_pos, logit_neg, logit_zero)` = enveloppe
+        différentiable de `max` (Bishop 2006 §4.5) : reproduit `max`
+        asymptotiquement quand un canal domine, mais diffuse le gradient
+        sur les 3 canaux quand ils sont proches. Utilisé par
+        `recon_loss_signed` quand `--decoder-split` : le bilinéaire prend
+        en charge la reconstruction d'EXISTENCE des arêtes signées (le
+        cosinus ne les voit plus → libéré des arêtes dirigées). Distinct
+        de `predict_sign_score` (= logit_pos − logit_neg), qui porte le SIGNE.
+        """
+        z_signed = self._project(z)
+        z_src = z_signed[edge_index[0]]
+        z_dst = z_signed[edge_index[1]]
+        logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
+        logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
+        logit_zero = (z_src @ self.W_zero * z_dst).sum(dim=-1)
+        return torch.logsumexp(
+            torch.stack([logit_pos, logit_neg, logit_zero], dim=-1), dim=-1)
+
 
 class _ScaledConv(nn.Module):
     """Wrapper V4.2 : multiplie la sortie d'un conv par γ_t (scalaire fixe).
@@ -2719,21 +2758,42 @@ print("=" * 70)
 #     (min, max), pas de double comptage.
 #   - n_edges passe typiquement de ~100k à ~150k → AUC recon **non
 #     comparable** aux versions V3/V4/V4.1/V5.1.
-all_gene_edges = set()
-for src_list, dst_list in [
+# V5.4 (decoder-split, §14bis.6duovicies) : si --decoder-split (+ --signed-decoder),
+# les arêtes SIGNÉES quittent le pool cosinus (all_gene_edges) → elles sont
+# reconstruites par le bilinéaire (existence, voir signed_exist_pairs plus bas).
+# Le cosinus retrouve alors le pool V5.1 (non-signé) → AUC comparable V5.1 (~0.97).
+# Sinon (V5.2/V5.3), les signées restent dans le pool cosinus (AUC ~0.94).
+DECODER_SPLIT = (bool(getattr(CLI_ARGS, "decoder_split", False))
+                 and CLI_ARGS.signed_decoder)
+_unsigned_sources = [
     (ppi_src, ppi_dst),
     (react_src, react_dst),
     (reg_src, reg_dst), (reg_dst, reg_src),  # Regulates + regulated_by
     (coexpr_src, coexpr_dst),
-    # V5.2 — inclusion des edge_types signés.
+]
+_signed_sources = [
     (op_sig_src, op_sig_dst),       # signaling (OmniPath kinase + SIGNOR)
-    (op_tf_src, op_tf_dst),         # tf_curated (CollecTRI) — tf_curated_by
-                                    # est la copie inverse, dédupliquée auto.
+    (op_tf_src, op_tf_dst),         # tf_curated (CollecTRI) — tf_curated_by inverse
     (reactome_fi_src, reactome_fi_dst),  # Reactome FI signé
-]:
+]
+all_gene_edges = set()
+for src_list, dst_list in (_unsigned_sources if DECODER_SPLIT
+                           else _unsigned_sources + _signed_sources):
     for s, d in zip(src_list, dst_list):
         pair = (min(s, d), max(s, d))
         all_gene_edges.add(pair)
+
+# V5.4 : pool d'EXISTENCE signé (décodé par le bilinéaire via
+# predict_signed_existence). Paires signées dédupliquées, PRIVÉES de celles
+# déjà présentes dans le pool cosinus (évite double label). Vide si pas de split.
+signed_exist_pairs: set = set()
+if DECODER_SPLIT:
+    for src_list, dst_list in _signed_sources:
+        for s, d in zip(src_list, dst_list):
+            signed_exist_pairs.add((min(s, d), max(s, d)))
+    signed_exist_pairs -= all_gene_edges
+    print(f"  V5.4 decoder-split ON : pool cosinus {len(all_gene_edges)} "
+          f"(non-signé) + pool existence bilinéaire {len(signed_exist_pairs)} (signé)")
 
 all_edges = np.array(list(all_gene_edges))
 n_edges = len(all_edges)
@@ -2776,6 +2836,24 @@ pos_test_bidir = torch.cat([pos_test, pos_test.flip(0)], dim=1)
 
 print(f"  Train : {len(train_edges)} arêtes positives")
 print(f"  Test  : {len(test_edges)} arêtes positives")
+
+# V5.4 (decoder-split) : split 90/10 du pool d'existence signé, bidirectionnel,
+# avec le MÊME seed que le pool cosinus (cohérence train/test). Ces tenseurs
+# alimentent recon_loss_signed (existence bilinéaire) + l'AUC combinée.
+pos_train_signed_bidir = None
+pos_test_signed_bidir = None
+if DECODER_SPLIT and signed_exist_pairs:
+    _se = np.array(list(signed_exist_pairs))
+    _perm_s = np.random.permutation(len(_se))
+    _n_test_s = max(1, int(len(_se) * EDGE_SAMPLE_RATIO))
+    _se_test = _se[_perm_s[:_n_test_s]]
+    _se_train = _se[_perm_s[_n_test_s:]]
+    _pt_s = torch.tensor(_se_train.T, dtype=torch.long)
+    pos_train_signed_bidir = torch.cat([_pt_s, _pt_s.flip(0)], dim=1)
+    _pte_s = torch.tensor(_se_test.T, dtype=torch.long)
+    pos_test_signed_bidir = torch.cat([_pte_s, _pte_s.flip(0)], dim=1)
+    print(f"  V5.4 signed-existence : {len(_se_train)} train / "
+          f"{len(_se_test)} test (bilinéaire)")
 
 # =============================================================================
 # 10. ENTRAÎNEMENT DU VGAE
@@ -3016,6 +3094,24 @@ for epoch in range(N_EPOCHS):
     )
     recon_loss = pos_loss + neg_loss
 
+    # --- V5.4 (decoder-split) : recon_loss_signed (EXISTENCE bilinéaire) ---
+    # Le cosinus ne voit plus les arêtes signées ; le bilinéaire reconstruit
+    # leur existence via predict_signed_existence = logsumexp(W+,W-,W0).
+    # BCE(existence(pos signées), 1) + BCE(existence(neg), 0). Le SIGNE reste
+    # porté par signed_aux_loss (predict_sign_score). Cf. §14bis.6duovicies.
+    if DECODER_SPLIT and pos_train_signed_bidir is not None:
+        _ps = pos_train_signed_bidir.to(z.device)
+        _neg_s = negative_sampling(
+            _ps, num_nodes=n_genes, num_neg_samples=_ps.shape[1],
+        )
+        _exist_pos = model.bilinear_decoder.predict_signed_existence(z, _ps)
+        _exist_neg = model.bilinear_decoder.predict_signed_existence(z, _neg_s)
+        recon_loss_signed = (
+            F.binary_cross_entropy_with_logits(_exist_pos, torch.ones_like(_exist_pos))
+            + F.binary_cross_entropy_with_logits(_exist_neg, torch.zeros_like(_exist_neg))
+        )
+        recon_loss = recon_loss + recon_loss_signed
+
     # --- V5.1 (TIER 1c.4) : loss auxiliaire signée CONTRASTIVE -----------
     # Cible binaire : sign>0 → 1 (activation), sign<0 → 0 (inhibition).
     # BCE sur le score SIGN-AGNOSTIQUE `predict_sign_score = logit_pos −
@@ -3096,6 +3192,25 @@ for epoch in range(N_EPOCHS):
                 torch.zeros(neg_test_scores.shape[0]),
             ])
             test_scores = torch.cat([pos_test_scores, neg_test_scores])
+
+            # V5.4 (decoder-split) : AUC COMBINÉE sur tout le graphe — on ajoute
+            # les scores d'EXISTENCE bilinéaire sur le test pool signé (que le
+            # cosinus ne voit plus). La métrique rapportée couvre cosinus
+            # (non-signé) + bilinéaire (signé). Cf. §14bis.6duovicies propriété 3.
+            if DECODER_SPLIT and pos_test_signed_bidir is not None:
+                _pts = pos_test_signed_bidir.to(z_eval.device)
+                _neg_s = negative_sampling(
+                    _pts, num_nodes=n_genes, num_neg_samples=_pts.shape[1],
+                )
+                _ex_pos = torch.sigmoid(
+                    model.bilinear_decoder.predict_signed_existence(z_eval, _pts))
+                _ex_neg = torch.sigmoid(
+                    model.bilinear_decoder.predict_signed_existence(z_eval, _neg_s))
+                test_labels = torch.cat([
+                    test_labels,
+                    torch.ones(_ex_pos.shape[0]), torch.zeros(_ex_neg.shape[0]),
+                ])
+                test_scores = torch.cat([test_scores, _ex_pos, _ex_neg])
 
             # AUC-ROC et Average Precision (AP)
             # AUC = 0.5 → modèle aléatoire (collapse)
@@ -4257,6 +4372,9 @@ _metrics = {
         "signed_message": bool(getattr(CLI_ARGS, "signed_message", False)),
         "signed_decoder": bool(getattr(CLI_ARGS, "signed_decoder", False)),
         "signed_loss_weight": float(getattr(CLI_ARGS, "signed_loss_weight", 0.0)),
+        # V5.4 (decoder-split) — requis pour identifier les runs V5.4 et
+        # reproduire le régime (cosinus non-signé + bilinéaire existence).
+        "decoder_split": bool(getattr(CLI_ARGS, "decoder_split", False)),
         # V4.3 — choix méthode×prune amont (consommé par cross-method report).
         "coexpr_method": CLI_ARGS.coexpr_method,
         "coexpr_prune": CLI_ARGS.coexpr_prune,

@@ -359,6 +359,24 @@ class BilinearSignedDecoder(nn.Module):
         logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
         return logit_pos - logit_neg
 
+    def predict_signed_existence(self, z: torch.Tensor,
+                                 edge_index: torch.Tensor) -> torch.Tensor:
+        """V5.4 (decoder-split) — score d'EXISTENCE = logsumexp(W+,W-,W0).
+
+        Enveloppe différentiable de max (Bishop 2006 §4.5). Reconstruit
+        l'existence des arêtes signées (le cosinus ne les voit plus sous
+        --decoder-split). Distinct de predict_sign_score (= W+ − W-, le signe).
+        Source de vérité, dupliquée dans gnn_vgae.py + gnn_perturbation.py.
+        """
+        z_signed = self._project(z)
+        z_src = z_signed[edge_index[0]]
+        z_dst = z_signed[edge_index[1]]
+        logit_pos = (z_src @ self.W_pos * z_dst).sum(dim=-1)
+        logit_neg = (z_src @ self.W_neg * z_dst).sum(dim=-1)
+        logit_zero = (z_src @ self.W_zero * z_dst).sum(dim=-1)
+        return torch.logsumexp(
+            torch.stack([logit_pos, logit_neg, logit_zero], dim=-1), dim=-1)
+
     def forward_cosine(self, z: torch.Tensor, edge_index: torch.Tensor,
                        tau: float = 1.0) -> torch.Tensor:
         """Fallback compat V4 : décodeur cosinus pour edge_types unsigned.
