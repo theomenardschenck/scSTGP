@@ -331,7 +331,7 @@ def _parse_cli_args():
     p.add_argument("--n-epochs", dest="n_epochs", type=int, default=1200,
                    help="Nombre maximal d'epochs (early stopping arrête souvent "
                         "avant). Défaut 1000.")
-    p.add_argument("--patience", type=int, default=100,
+    p.add_argument("--patience", type=int, default=150,
                    help="Patience de l'early stopping (epochs sans amélioration "
                         "AUC val avant arrêt). Défaut 100.")
 
