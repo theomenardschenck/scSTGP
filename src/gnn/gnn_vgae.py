@@ -328,7 +328,7 @@ def _parse_cli_args():
                         "Inclus dans RUN_TAG (sauf si --run-tag <libre>) pour "
                         "ne pas écraser un run d'un autre seed.")
 
-    p.add_argument("--n-epochs", dest="n_epochs", type=int, default=1000,
+    p.add_argument("--n-epochs", dest="n_epochs", type=int, default=1200,
                    help="Nombre maximal d'epochs (early stopping arrête souvent "
                         "avant). Défaut 1000.")
     p.add_argument("--patience", type=int, default=100,
