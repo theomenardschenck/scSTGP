@@ -312,8 +312,148 @@ case "$VERSION" in
             "v5.3-full::$V41_FULL $SM $SD $DEDUP"
         )
         ;;
+    V5.3-finalist)
+        # V5.3-finalist (2026-06-02) — Phase 3 : 3-seed validation des
+        # finalistes V5.3-compose. 4 configs × 3 seeds = 12 tâches,
+        # time limit 4h. Cf. §14bis.6duovicies.
+        V41_FULL="$OP_SIG $OP_TF $OP_INC"
+        LEG_BASE="$V41_FULL --signed-message --signed-decoder"
+        SPLIT="--decoder-split"
+        KL1="--kl-beta-max 0.0001"
+        RFI="--use-reactome-fi"
+        DEDUP="--dedup-ppi-signed remove"
+        NOREACT="--no-reactome"
+        PAT200="--patience 200"
+        BASE_CONFIGS=(
+            "v5.3-leg.split.rfi.dedup::$LEG_BASE $SPLIT $RFI $DEDUP $PAT200"
+            "v5.3-leg.split.rfi.dedup.kl1::$LEG_BASE $SPLIT $RFI $DEDUP $KL1 $PAT200"
+            "v5.3-leg.split.rfi.dedup.no-react::$LEG_BASE $SPLIT $RFI $DEDUP $NOREACT $PAT200"
+            "v5.3-leg.split.rfi.dedup.kl1.no-react::$LEG_BASE $SPLIT $RFI $DEDUP $KL1 $NOREACT $PAT200"
+        )
+        ;;
+    V5.4-ablation)
+        # V5.4-ablation (2026-06-03) — ablations sur la config gagnante V5.4
+        # (= split + rfi + dedup + kl1). Test des sources d'information
+        # pour identifier celles qui portent le saut métabolique.
+        #
+        # Hypothèses :
+        #   (a) Si no-rfi ramène le ranking vers V5.1 → c'est Reactome FI
+        #       qui porte le basculement métabolique
+        #   (b) Si no-coexpr stable → coexpr n'est plus discriminante
+        #       en V5.4 (déjà testé V5.3-tune mais ici en signed-aware)
+        #   (c) Si no-humess change peu → HuMess ne porte plus l'ETC bias
+        #       en V5.4 (Reactome FI a pris le relais)
+        #   (d) Si ex-degrees promeut Tier-1 V3.3 → MYC/HMGB1 etc. sont
+        #       hub-bias en V5.4 (encore que is_hub_inflated=False)
+        #   (e) backbone-only (PPI+REACTOME+signed seulement) = quel est
+        #       le minimum nécessaire pour le bilinéaire signed ?
+        #
+        # 12 configs × 1 seed = 12 tâches ≈ 30h cluster (parallélisable).
+        V41_FULL="$OP_SIG $OP_TF $OP_INC"
+        # V54_NODEDUP = V5.4 sans le dedup-ppi (pour le test causal no-dedup) ;
+        # V54_BASE = V54_NODEDUP + dedup (config V5.4 nominale).
+        V54_NODEDUP="$V41_FULL --signed-message --signed-decoder --decoder-split \
+                  --use-reactome-fi --kl-beta-max 0.0001 --patience 200"
+        V54_BASE="$V54_NODEDUP --dedup-ppi-signed remove"
+        BASE_CONFIGS=(
+            # === 5 ablations standard (isolation par source) ===
+            "v5.4.no-coexpr::$V54_BASE --no-coexpr"
+            "v5.4.no-humess::$V54_BASE --no-humess"
+            "v5.4.no-reactome::$V54_BASE --no-reactome"
+            "v5.4.no-scenic::$V54_BASE --no-scenic-regulons"
+            "v5.4.ex-degrees::$V54_BASE --exclude-features ppi_degree,reg_degree"
+
+            # === 3 ablations progressives (ajout cumulatif) ===
+            "v5.4.no-coexpr+no-humess::$V54_BASE --no-coexpr --no-humess"
+            "v5.4.no-coexpr+no-humess+no-scenic::$V54_BASE --no-coexpr --no-humess --no-scenic-regulons"
+            "v5.4.no-coexpr+no-humess+no-scenic+ex-degrees::$V54_BASE --no-coexpr --no-humess --no-scenic-regulons --exclude-features ppi_degree,reg_degree"
+
+            # === 4 combos ciblés (mes propositions) ===
+            # Test 1 : isole l'effet Reactome FI (= V5.4 sans rfi)
+            "v5.4.no-rfi::$V54_BASE --no-reactome-fi"
+            # Test 2 : V5.4 sans rfi + anti-hub (récupère Tier-1 V3.3 ?)
+            "v5.4.no-rfi+ex-degrees::$V54_BASE --no-reactome-fi --exclude-features ppi_degree,reg_degree"
+            # Test 3 : backbone-only (PPI+REACTOME+signed minimaliste)
+            "v5.4.backbone::$V54_BASE --no-coexpr --no-humess --no-scenic-regulons"
+            # Test 4 : signed-pur (= backbone sans REACTOME pathway, ne reste
+            # que PPI + arêtes signées). Test extrême : le bilinéaire suffit-il
+            # à porter le signal sans pathway non-orienté ?
+            "v5.4.signed-only::$V54_BASE --no-coexpr --no-humess --no-scenic-regulons --no-reactome"
+            # Test 5 (2026-06-04) : no-dedup — TEST CAUSAL de la chute MYC/RAN.
+            # = V5.4 SANS --dedup-ppi-signed. Prédiction falsifiable :
+            #   doit REMONTER MYC (#915→~10) et RAN, et NE PAS bouger
+            #   FHL2/HMGB2/H2AFZ (overlap PPI∩signé ~0). Si vérifié ⇒ dedup-ppi
+            #   est le levier causal de la démotion des hubs (cf. gnn_futur.md §7).
+            "v5.4.no-dedup::$V54_NODEDUP"
+        )
+        ;;
+    V5.3-coexpr-source)
+        # V5.3-coexpr-source (2026-06-03) — diagnostic contrôlé :
+        # le saut de ranking V5.4 vs V3.3/V4.1/V5.1 (ρ Spearman 0.33-0.38,
+        # Tier-1 V3.3 effondré sauf ENO1/ASNS) est-il dû au fichier
+        # source coexpr ou à l'architecture V5 signed-aware ?
+        #
+        # Plan : tester V3.6 (baseline historique, sans signed) ET V5.4
+        # (config gagnante split.rfi.dedup) sur 5 sources coexpr distinctes :
+        #   1. legacy P16-only sklearn (defaut V3/V4/V5 : adjacencies_P16.csv)
+        #   2. legacy P16-only arboreto (canonique)
+        #   3. différentielle P4∪P16 arboreto mutual-rank (mr, 37k paires)
+        #   4. différentielle P4∪P16 arboreto quantile (49k paires)
+        #   5. différentielle P4∪P16 arboreto quantile LIMITED (7000 paires
+        #      matching legacy cardinalité, créé 2026-06-03)
+        #
+        # Lecture : si V3.6 ranking change autant que V5.4 avec ces sources
+        # → coexpr est le facteur. Si V3.6 stable et V5.4 instable →
+        # l'archi V5 amplifie l'effet coexpr. Si les deux stables sur
+        # leurs propres baselines → c'est rfi+dedup+split qui font tout.
+        #
+        # 1 seed par config × 10 configs (5 sources × 2 versions) =
+        # 10 tâches ≈ 30 h cluster (V3.6 ~2h, V5.4 ~3h).
+        V41_FULL="$OP_SIG $OP_TF $OP_INC"
+        V5_BASE="$V41_FULL --signed-message --signed-decoder --decoder-split \
+                  --use-reactome-fi --dedup-ppi-signed remove \
+                  --kl-beta-max 0.0001 --patience 200"
+        V3_BASE=""  # V3.6 = aucune option OmniPath, aucun signed
+        DD="data/pyscenic/diff_coexpr"
+        BASE_CONFIGS=(
+            # --- V3.6 × 5 sources ---
+            "v3.6.legacy-p16-sklearn::"
+            "v3.6.legacy-p16-arboreto::--coexpr-method arboreto --coexpr-prune topk --diff-coexpr-file $DD/coexpr_diff.arboreto.topk.tsv"
+            "v3.6.diff-arboreto-mr::--coexpr-mode differential --coexpr-method arboreto --coexpr-prune mr --diff-coexpr-file $DD/coexpr_diff.arboreto.mr.tsv"
+            "v3.6.diff-arboreto-quantile::--coexpr-mode differential --coexpr-method arboreto --coexpr-prune quantile --diff-coexpr-file $DD/coexpr_diff.arboreto.quantile.tsv"
+            "v3.6.diff-arboreto-quantile-limited::--coexpr-mode differential --coexpr-method arboreto --coexpr-prune quantile --diff-coexpr-file $DD/coexpr_diff.arboreto.quantile.limited.tsv"
+            # --- V5.4 × 5 sources (= split.rfi.dedup.kl1 = V5.4 par défaut) ---
+            "v5.4.legacy-p16-sklearn::$V5_BASE"
+            "v5.4.legacy-p16-arboreto::$V5_BASE --coexpr-method arboreto --coexpr-prune topk --diff-coexpr-file $DD/coexpr_diff.arboreto.topk.tsv"
+            "v5.4.diff-arboreto-mr::$V5_BASE --coexpr-mode differential --coexpr-method arboreto --coexpr-prune mr --diff-coexpr-file $DD/coexpr_diff.arboreto.mr.tsv"
+            "v5.4.diff-arboreto-quantile::$V5_BASE --coexpr-mode differential --coexpr-method arboreto --coexpr-prune quantile --diff-coexpr-file $DD/coexpr_diff.arboreto.quantile.tsv"
+            "v5.4.diff-arboreto-quantile-limited::$V5_BASE --coexpr-mode differential --coexpr-method arboreto --coexpr-prune quantile --diff-coexpr-file $DD/coexpr_diff.arboreto.quantile.limited.tsv"
+        )
+        ;;
+    V5.3-finalist-long)
+        # V5.3-finalist-long (2026-06-02 nuit) — mêmes configs que finalist
+        # mais N_EPOCHS=1500 + patience 250 pour exploiter la marge de
+        # convergence (Phase 1 montrait 4/7 runs frôlant le plafond 1000).
+        # Time limit recommandé : --time "0-05:00:00" (1500 epochs lat-free).
+        # Sert de **base entraînée pour la vague 2** de perturbation (ko_mode mask).
+        V41_FULL="$OP_SIG $OP_TF $OP_INC"
+        LEG_BASE="$V41_FULL --signed-message --signed-decoder"
+        SPLIT="--decoder-split"
+        KL1="--kl-beta-max 0.0001"
+        RFI="--use-reactome-fi"
+        DEDUP="--dedup-ppi-signed remove"
+        NOREACT="--no-reactome"
+        PAT250="--patience 250"
+        EP1500="--n-epochs 1500"
+        BASE_CONFIGS=(
+            "v5.3-leg.split.rfi.dedup.long::$LEG_BASE $SPLIT $RFI $DEDUP $PAT250 $EP1500"
+            "v5.3-leg.split.rfi.dedup.kl1.long::$LEG_BASE $SPLIT $RFI $DEDUP $KL1 $PAT250 $EP1500"
+            "v5.3-leg.split.rfi.dedup.no-react.long::$LEG_BASE $SPLIT $RFI $DEDUP $NOREACT $PAT250 $EP1500"
+            "v5.3-leg.split.rfi.dedup.kl1.no-react.long::$LEG_BASE $SPLIT $RFI $DEDUP $KL1 $NOREACT $PAT250 $EP1500"
+        )
+        ;;
     *)
-        echo "Version inconnue : $VERSION (V3 | V4 | V4.1 | V4.2 | V4.2-sweep | V4.3-method-compare | V5 | V5.3)"; exit 1 ;;
+        echo "Version inconnue : $VERSION (V3 | V4 | V4.1 | V4.2 | V4.2-sweep | V4.3-method-compare | V5 | V5.3 | V5.3-finalist | V5.3-finalist-long | V5.3-coexpr-source | V5.4-ablation)"; exit 1 ;;
 esac
 
 # --- Parsing de --ablations en variantes -----------------------------------
@@ -340,6 +480,7 @@ _abl_flags() {
         legacy-coexpr)      echo "--coexpr-mode p16_only" ;;
         dedup-ppi-remove)   echo "--dedup-ppi-signed remove" ;;
         dedup-ppi-annotate) echo "--dedup-ppi-signed annotate" ;;
+        no-rfi)             echo "--no-reactome-fi" ;;
         # Toggles V5 isolés (utiles pour ablations partielles vs v5-full)
         no-signed-message)  echo "" ;;   # placeholder : il faut retirer --signed-message du base (cf. §V5)
         no-signed-decoder)  echo "" ;;
@@ -489,7 +630,7 @@ if [[ ! -d "$DATA_ROOT" ]]; then
     echo "       Vérifie qu'il correspond à gnn_vgae.py:381 (LAB_DIR/gnn/data)."
     echo "       Override : --data-root <path> ou export GNN_DATA_ROOT=<path>"
 fi
-if [[ "$VERSION" == "V4" || "$VERSION" == "V4.1" || "$VERSION" == "V4.2" || "$VERSION" == "V4.2-sweep" || "$VERSION" == "V5" || "$VERSION" == "V5.3" ]]; then
+if [[ "$VERSION" == "V4" || "$VERSION" == "V4.1" || "$VERSION" == "V4.2" || "$VERSION" == "V4.2-sweep" || "$VERSION" == "V5" || "$VERSION" == "V5.3" || "$VERSION" == "V5.3-finalist" || "$VERSION" == "V5.3-finalist-long" || "$VERSION" == "V5.3-coexpr-source" || "$VERSION" == "V5.4-ablation" ]]; then
     CACHE_TF="$DATA_ROOT/omnipath/tf_collectri.tsv.gz"
     CACHE_SIG="$DATA_ROOT/omnipath/signed_ppi_signor.tsv.gz"
     if [[ ! -f "$CACHE_TF" ]]; then

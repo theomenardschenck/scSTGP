@@ -24,6 +24,8 @@ htmlcov/
 venv/
 env/
 ENV/
+.venv-local/
+.venv-local/*
 
 # ── Notebooks ───────────────────────────────────────────────────────
 .ipynb_checkpoints/

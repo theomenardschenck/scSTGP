@@ -449,58 +449,92 @@ def compute_importance(model, data, baseline_specificity):
 # Perturbation.
 # --------------------------------------------------------------------------- #
 def apply_perturbation(data, target_idx: torch.Tensor, mode: str, factor: float,
-                       ko_mode: str = "cut", ko_soft_factor: float = 0.1):
+                       ko_mode: str = "mask", ko_soft_factor: float = 0.1,
+                       kd_factor: float = 0.15, ko_edge_factor: float = 1.0,
+                       legacy: bool = False):
     """Apply a knockdown / knockout / overexpression to the target genes.
+
+    Sémantique V5.5 (refactor 2026-06-04, biologiquement monotone
+    OE > WT > KD > KO ; cf. docs/gnn_futur.md §6.1) :
+      knockdown   : feature × kd_factor (défaut 0.15 ≈ résidu siRNA,
+                    le mode de la validation in vitro), GARDE les arêtes.
+      knockout    : feature → 0 (perte totale du produit) + arêtes GARDÉES
+                    par défaut (= ``mask``) ; atténuation partielle optionnelle
+                    via ``ko_edge_factor`` < 1.0 (fraction d'arêtes incidentes
+                    conservée, tirage déterministe).
+      overexpress : feature × factor.
+
+    Le KO ``mask`` (feature=0, arêtes gardées) corrige le bug du KO ``cut``
+    (V3.3-V5.4) : retirer toutes les arêtes — y compris IN — provoquait un
+    choc topologique (l'embedding du nœud KO s'effondrait, ne pouvant plus
+    agréger ses voisins) → KO incohérent avec KD/OE sur ~4 160 gènes.
 
     Args:
         data        : HeteroData baseline.
         target_idx  : torch.Tensor of gene indices to perturb.
         mode        : "knockdown" | "knockout" | "overexpress".
         factor      : multiplier for overexpress (ignored otherwise).
-        ko_mode     : (V5.4+, only for mode=="knockout") :
-            "cut"  : feature → 0 ET coupe les arêtes incidentes (statu quo
-                     V3.3-V5.3, défaut backward-compat).
-            "mask" : feature → 0, GARDE les arêtes intactes (= KD
-                     topology-wise, fix bug "incoherent" 4 160 gènes V3.3).
-            "soft" : feature → feature × ko_soft_factor (défaut 0.1),
-                     GARDE les arêtes. Sémantique "résidu d'expression
-                     baseline" évitant la discontinuité numérique.
-        ko_soft_factor : multiplicateur appliqué quand ko_mode="soft".
-                         Défaut 0.1 (TODO TIER 1c.5 §V3.3 KO investigation).
-
-    Diagnostic V3.3 (TODO 14ter ligne 462) : 4 160 gènes flagués
-    `incoherent` avec pattern « KD↔OE cohérents, KO opposite » → biais
-    d'implémentation du KO `cut`. Test prévu : si `mask` résoud > 70 %
-    des incoherent → adopté comme défaut V5.5.
+        ko_mode     : "mask" (défaut, feature→0 arêtes gardées) | "cut"
+                      (feature→0 + arêtes coupées, legacy) | "soft"
+                      (feature × ko_soft_factor, arêtes gardées).
+        ko_soft_factor : multiplicateur quand ko_mode="soft" (défaut 0.1).
+        kd_factor   : multiplicateur du knockdown (défaut 0.15, ∈ [0.1, 0.2]).
+        ko_edge_factor : fraction des arêtes incidentes à CONSERVER lors d'un
+                      KO non-cut (défaut 1.0 = mask intégral ; <1.0 = atténuation
+                      partielle déterministe).
+        legacy      : si True, restaure le comportement V3.3-V5.4
+                      (KD: feature→0 ; KO: feature→0 + cut arêtes). Flag
+                      temporaire en attendant la validation expérimentale.
     """
     pert = data.clone()
     x = pert["gene"].x.clone()
-    if mode == "knockdown":
-        x[target_idx] = 0.0
-    elif mode == "overexpress":
-        x[target_idx] = x[target_idx] * factor
-    elif mode == "knockout":
-        if ko_mode == "soft":
-            x[target_idx] = x[target_idx] * ko_soft_factor
-        else:  # cut ou mask : feature à zéro
+    if legacy:
+        # --- Comportement historique V3.3-V5.4 ---
+        if mode == "knockdown":
             x[target_idx] = 0.0
+        elif mode == "overexpress":
+            x[target_idx] = x[target_idx] * factor
+        elif mode == "knockout":
+            x[target_idx] = 0.0
+        else:
+            raise ValueError(f"unknown mode: {mode}")
     else:
-        raise ValueError(f"unknown mode: {mode}")
+        # --- Sémantique V5.5 ---
+        if mode == "knockdown":
+            x[target_idx] = x[target_idx] * kd_factor          # soft
+        elif mode == "overexpress":
+            x[target_idx] = x[target_idx] * factor
+        elif mode == "knockout":
+            if ko_mode == "soft":
+                x[target_idx] = x[target_idx] * ko_soft_factor
+            else:                                              # mask | cut
+                x[target_idx] = 0.0
+        else:
+            raise ValueError(f"unknown mode: {mode}")
     pert["gene"].x = x
 
-    # V5.4 : la coupure d'arêtes n'a lieu QUE si ko_mode="cut" (statu quo).
-    # Modes "mask" et "soft" gardent le graphe topologique intact pour
-    # adresser le bug "KD↔OE cohérents, KO opposite" (cf. docstring).
-    if mode == "knockout" and ko_mode == "cut":
+    # Gestion des arêtes pour le KO :
+    #   * cut total : legacy OU ko_mode=="cut" (statu quo)
+    #   * atténuation partielle : ko_edge_factor < 1.0 (garde une fraction)
+    #   * sinon (mask, défaut) : arêtes intactes.
+    cut_all = mode == "knockout" and (legacy or ko_mode == "cut")
+    partial = (mode == "knockout" and not cut_all and ko_edge_factor < 1.0)
+    if cut_all or partial:
+        gen = torch.Generator().manual_seed(0)   # déterministe (reproductible)
         for et in list(pert.edge_types):
             ei = pert[et].edge_index
             if ei is None or ei.numel() == 0:
                 continue
-            keep = torch.ones(ei.shape[1], dtype=torch.bool)
+            incident = torch.zeros(ei.shape[1], dtype=torch.bool)
             if et[0] == "gene":
-                keep &= ~torch.isin(ei[0], target_idx)
+                incident |= torch.isin(ei[0], target_idx)
             if et[2] == "gene":
-                keep &= ~torch.isin(ei[1], target_idx)
+                incident |= torch.isin(ei[1], target_idx)
+            if cut_all:
+                keep = ~incident
+            else:   # garde une fraction ko_edge_factor des arêtes incidentes
+                rand = torch.rand(ei.shape[1], generator=gen)
+                keep = (~incident) | (rand < ko_edge_factor)
             pert[et].edge_index = ei[:, keep]
             if "edge_attr" in pert[et] and pert[et].edge_attr is not None:
                 pert[et].edge_attr = pert[et].edge_attr[keep]
@@ -1037,7 +1071,8 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
                           axis_global=None, axes_cluster=None,
                           out_dir=None, write_full=True,
                           include_details=False,
-                          ko_mode="cut", ko_soft_factor=0.1):
+                          ko_mode="mask", ko_soft_factor=0.1,
+                          kd_factor=0.15, ko_edge_factor=1.0, legacy=False):
     """Run a single perturbation and return its summary dict.
 
     Args:
@@ -1072,7 +1107,10 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
 
     pert_data = apply_perturbation(data, target_idx, mode, factor,
                                    ko_mode=ko_mode,
-                                   ko_soft_factor=ko_soft_factor)
+                                   ko_soft_factor=ko_soft_factor,
+                                   kd_factor=kd_factor,
+                                   ko_edge_factor=ko_edge_factor,
+                                   legacy=legacy)
     pert = compute_importance(model, pert_data, spec)
     pert_imp = pert["importance"]
     pert_rank = rankdata(-pert_imp, method="ordinal").astype(int)
@@ -1296,18 +1334,28 @@ def main():
     ap.add_argument("--factor", type=float, default=2.0,
                     help="Multiplier used in --mode overexpress (default 2.0).")
     ap.add_argument("--ko-mode", choices=["cut", "mask", "soft"],
-                    default="cut",
-                    help="V5.4+ : sémantique du knockout (seulement si "
-                         "--mode knockout). cut (DÉFAUT, statu quo V3.3-V5.3) "
-                         "= feature à 0 + coupe les arêtes incidentes. mask = "
-                         "feature à 0 mais GARDE le graphe topologique intact "
-                         "(= KD topology-wise). soft = feature × ko_soft_factor "
-                         "(défaut 0.1), garde aussi le graphe. mask/soft "
-                         "adressent le bug V3.3 « KD↔OE cohérents, KO opposite » "
-                         "sur 4 160 gènes incoherent (cf. TODO 14ter §V3.3).")
+                    default="mask",
+                    help="V5.5 : sémantique du knockout (si --mode knockout). "
+                         "mask (DÉFAUT) = feature à 0, GARDE le graphe intact "
+                         "(corrige le bug 'KD↔OE cohérents, KO opposite' sur "
+                         "4 160 gènes). cut (legacy) = feature à 0 + coupe les "
+                         "arêtes incidentes (choc topologique). soft = feature × "
+                         "ko_soft_factor, garde le graphe.")
     ap.add_argument("--ko-soft-factor", type=float, default=0.1,
                     help="Multiplicateur appliqué quand --ko-mode soft "
                          "(défaut 0.1 = résidu 10%% d'expression).")
+    ap.add_argument("--kd-factor", type=float, default=0.15,
+                    help="V5.5 : multiplicateur du knockdown soft (défaut 0.15, "
+                         "∈ [0.1, 0.2] ≈ résidu siRNA réel). Ignoré si --legacy "
+                         "(KD = feature à 0).")
+    ap.add_argument("--ko-edge-factor", type=float, default=1.0,
+                    help="V5.5 : fraction des arêtes incidentes CONSERVÉES lors "
+                         "d'un KO non-cut (défaut 1.0 = mask intégral ; <1.0 = "
+                         "atténuation partielle déterministe).")
+    ap.add_argument("--legacy", action="store_true",
+                    help="Restaure la sémantique V3.3-V5.4 (KD: feature→0 ; "
+                         "KO: feature→0 + coupe arêtes). Flag TEMPORAIRE en "
+                         "attendant la validation expérimentale du refactor V5.5.")
     ap.add_argument("--top-k", type=int, default=100,
                     help="Top-K rising genes used for delta-ORA (default 100).")
     ap.add_argument("--hidden", type=int, default=DEFAULT_HIDDEN)
@@ -1382,10 +1430,16 @@ def main():
         group_expr=group_expr,
         axis_global=axis_global, axes_cluster=axes_cluster,
         out_dir=out_dir, write_full=not args.summary_only,
-        ko_mode=args.ko_mode, ko_soft_factor=args.ko_soft_factor)
+        ko_mode=args.ko_mode, ko_soft_factor=args.ko_soft_factor,
+        kd_factor=args.kd_factor, ko_edge_factor=args.ko_edge_factor,
+        legacy=args.legacy)
     summary["ko_mode"] = args.ko_mode
+    summary["legacy"] = args.legacy
+    summary["kd_factor"] = args.kd_factor if not args.legacy else 0.0
     if args.ko_mode == "soft":
         summary["ko_soft_factor"] = args.ko_soft_factor
+    if args.ko_edge_factor < 1.0:
+        summary["ko_edge_factor"] = args.ko_edge_factor
     summary["run_dir"] = str(args.run_dir)
 
     print(json.dumps(summary, indent=2, ensure_ascii=False))

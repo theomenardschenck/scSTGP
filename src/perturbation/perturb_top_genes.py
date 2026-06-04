@@ -121,32 +121,60 @@ def _run_perturbation_compat(model, data, gene_symbols, gene_to_idx,
                             targets, mode, factor, top_k, fdr,
                             reactome, background, group_expr=None,
                             axis_global=None, axes_cluster=None,
-                            out_dir=None, include_details=False):
+                            out_dir=None, include_details=False,
+                            ko_mode="mask", ko_soft_factor=0.1,
+                            kd_factor=0.15, ko_edge_factor=1.0, legacy=False):
     """Wrapper to run_perturbation_once that handles rétro-compatibility.
-    
-    Tries to pass include_details if supported; falls back to older signature.
+
+    Tries to pass include_details + ko_mode (+ V5.5 kd_factor/ko_edge_factor/
+    legacy) if supported; falls back to older signatures.
     """
     from gnn_perturbation import run_perturbation_once
-    
+
     global _SUPPORTS_INCLUDE_DETAILS
     if not _SUPPORTS_INCLUDE_DETAILS:
-        # Old signature: no include_details parameter.
+        # Old signature: no include_details parameter (and no ko_mode).
         return run_perturbation_once(
             model, data, gene_symbols, gene_to_idx,
             spec, base_imp, base_rank, z_cg_base, mu_base,
             targets, mode, factor, top_k, fdr,
             reactome, background, group_expr,
             axis_global, axes_cluster, out_dir)
-    
+
     try:
         return run_perturbation_once(
             model, data, gene_symbols, gene_to_idx,
             spec, base_imp, base_rank, z_cg_base, mu_base,
             targets, mode, factor, top_k, fdr,
             reactome, background, group_expr,
-            axis_global, axes_cluster, out_dir, 
-            write_full=True, include_details=include_details)
+            axis_global, axes_cluster, out_dir,
+            write_full=True, include_details=include_details,
+            ko_mode=ko_mode, ko_soft_factor=ko_soft_factor,
+            kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy)
     except TypeError as e:
+        # V5.5 kd_factor/ko_edge_factor/legacy pas supportés → retry sans eux
+        if "kd_factor" in str(e) or "ko_edge_factor" in str(e) or "legacy" in str(e):
+            print("[compat] gnn_perturbation sans params V5.5 (kd_factor/"
+                  "ko_edge_factor/legacy) ; retry avec ko_mode seul.")
+            return run_perturbation_once(
+                model, data, gene_symbols, gene_to_idx,
+                spec, base_imp, base_rank, z_cg_base, mu_base,
+                targets, mode, factor, top_k, fdr,
+                reactome, background, group_expr,
+                axis_global, axes_cluster, out_dir,
+                write_full=True, include_details=include_details,
+                ko_mode=ko_mode, ko_soft_factor=ko_soft_factor)
+        # V5.4 ko_mode pas supporté → fallback sans, comportement = cut historique
+        if "ko_mode" in str(e) or "ko_soft_factor" in str(e):
+            print(f"[compat] gnn_perturbation sans ko_mode (V5.3 ou antérieur), "
+                  f"fallback en mode 'cut' (statu quo)")
+            return run_perturbation_once(
+                model, data, gene_symbols, gene_to_idx,
+                spec, base_imp, base_rank, z_cg_base, mu_base,
+                targets, mode, factor, top_k, fdr,
+                reactome, background, group_expr,
+                axis_global, axes_cluster, out_dir,
+                write_full=True, include_details=include_details)
         if "include_details" in str(e):
             _SUPPORTS_INCLUDE_DETAILS = False
             print(f"[compat] Falling back to old signature (include_details not supported)")
@@ -309,7 +337,10 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
 
 def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                   top_k: int, fdr: float, out_prefix: Path,
-                  reactome_for_pw: dict | None = None) -> None:
+                  reactome_for_pw: dict | None = None,
+                  ko_mode: str = "mask", ko_soft_factor: float = 0.1,
+                  kd_factor: float = 0.15, ko_edge_factor: float = 1.0,
+                  legacy: bool = False) -> None:
     """Perturb every gene in the graph, for each mode, into one TSV per mode.
 
     Output files are `{out_prefix}_{mode}.tsv` (e.g.
@@ -338,7 +369,9 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                 reactome=ctx["reactome"], background=ctx["background"],
                 group_expr=ctx["group_expr"],
                 axis_global=ctx["axis_global"], axes_cluster=ctx["axes_cluster"],
-                out_dir=None, include_details=True)
+                out_dir=None, include_details=True,
+                ko_mode=ko_mode, ko_soft_factor=ko_soft_factor,
+                kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy)
             if summary is None:
                 continue
             rows_by_mode[mode].append(
@@ -359,7 +392,11 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
 
 def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
                      top_k: int, fdr: float, out_prefix: Path,
-                     pw_min_size: int, pw_max_size: int) -> None:
+                     pw_min_size: int, pw_max_size: int,
+                     ko_mode: str = "mask",
+                     ko_soft_factor: float = 0.1,
+                     kd_factor: float = 0.15, ko_edge_factor: float = 1.0,
+                     legacy: bool = False) -> None:
     """Perturb every REACTOME pathway (within size bounds), one TSV per mode.
 
     Output files are `{out_prefix}_{mode}.tsv`.
@@ -393,7 +430,9 @@ def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
                 reactome=ctx["reactome"], background=ctx["background"],
                 group_expr=ctx["group_expr"],
                 axis_global=ctx["axis_global"], axes_cluster=ctx["axes_cluster"],
-                out_dir=None, include_details=True)
+                out_dir=None, include_details=True,
+                ko_mode=ko_mode, ko_soft_factor=ko_soft_factor,
+                kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy)
             if summary is None:
                 continue
             rows_by_mode[mode].append(
@@ -555,6 +594,24 @@ def main():
     ap.add_argument("--also-pathway", action="store_true",
                     help="For each top gene, also perturb its dominant "
                          "REACTOME pathway (smallest containing set).")
+    ap.add_argument("--ko-mode", choices=["cut", "mask", "soft"],
+                    default="mask",
+                    help="V5.5 : sémantique du knockout. mask (DÉFAUT) = "
+                         "feature=0, GARDE le graphe (corrige le bug KO-cut). "
+                         "cut (legacy) = feature=0 + coupe arêtes incidentes. "
+                         "soft = feature × ko_soft_factor.")
+    ap.add_argument("--ko-soft-factor", type=float, default=0.1,
+                    help="Multiplicateur appliqué quand --ko-mode soft "
+                         "(défaut 0.1).")
+    ap.add_argument("--kd-factor", type=float, default=0.15,
+                    help="V5.5 : multiplicateur du knockdown soft (défaut 0.15 "
+                         "≈ résidu siRNA). Ignoré si --legacy (KD=feature 0).")
+    ap.add_argument("--ko-edge-factor", type=float, default=1.0,
+                    help="V5.5 : fraction d'arêtes incidentes conservées au KO "
+                         "non-cut (défaut 1.0 = mask ; <1.0 = atténuation).")
+    ap.add_argument("--legacy", action="store_true",
+                    help="Restaure la sémantique V3.3-V5.4 (KD: feature→0 ; "
+                         "KO: cut arêtes). Flag TEMPORAIRE (validation exp.).")
     ap.add_argument("--oe-factor", type=float, default=3.0,
                     help="Multiplier used for overexpress (default 3.0).")
     ap.add_argument("--force", action="store_true",
@@ -620,13 +677,23 @@ def main():
         if args.all_genes:
             run_all_genes(ctx, modes, args.oe_factor,
                           args.top_k, args.fdr,
-                          out_prefix=run_dir / f"perturbation_all_genes{_suffix}")
+                          out_prefix=run_dir / f"perturbation_all_genes{_suffix}",
+                          ko_mode=args.ko_mode,
+                          ko_soft_factor=args.ko_soft_factor,
+                          kd_factor=args.kd_factor,
+                          ko_edge_factor=args.ko_edge_factor,
+                          legacy=args.legacy)
         if args.all_pathways:
             run_all_pathways(ctx, modes, args.oe_factor,
                              args.top_k, args.fdr,
                              out_prefix=run_dir / f"perturbation_all_pathways{_suffix}",
                              pw_min_size=args.pw_min_size,
-                             pw_max_size=args.pw_max_size)
+                             pw_max_size=args.pw_max_size,
+                             ko_mode=args.ko_mode,
+                             ko_soft_factor=args.ko_soft_factor,
+                             kd_factor=args.kd_factor,
+                             ko_edge_factor=args.ko_edge_factor,
+                             legacy=args.legacy)
         return
 
     # --------------------------------------------------------------- #
