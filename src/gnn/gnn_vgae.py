@@ -328,6 +328,13 @@ def _parse_cli_args():
                         "Inclus dans RUN_TAG (sauf si --run-tag <libre>) pour "
                         "ne pas écraser un run d'un autre seed.")
 
+    p.add_argument("--n-epochs", dest="n_epochs", type=int, default=1000,
+                   help="Nombre maximal d'epochs (early stopping arrête souvent "
+                        "avant). Défaut 1000.")
+    p.add_argument("--patience", type=int, default=100,
+                   help="Patience de l'early stopping (epochs sans amélioration "
+                        "AUC val avant arrêt). Défaut 100.")
+
     args, _unknown = p.parse_known_args()
 
     # Application du raccourci --no-humess
@@ -618,7 +625,8 @@ N_HEADS = 4
 DROPOUT = 0.2
 # N_EPOCHS : nombre maximal d'epochs (itérations complètes sur les données).
 #   L'early stopping arrêtera souvent avant (typiquement epoch 30-80).
-N_EPOCHS = 550
+#   Surchargeable via --n-epochs (défaut 1000).
+N_EPOCHS = CLI_ARGS.n_epochs
 # LR : learning rate de l'optimiseur Adam. 0.005 est relativement élevé
 #   (typique des GNN qui convergent vite) mais compensé par le gradient
 #   clipping et le weight decay.
@@ -2964,9 +2972,9 @@ eval_epochs = []       # Numéros d'epoch où on a évalué
 best_test_auc = 0.0    # Meilleure AUC test observée
 best_test_ap = 0.0     # AP au meilleur epoch (par AUC)
 best_epoch = 0         # Epoch correspondante
-# PATIENCE = 100 epochs : si l'AUC ne s'améliore pas pendant 80 epochs
-# (= 8 évaluations), on arrête. Le pic est typiquement autour de epoch 30-50.
-PATIENCE = 100
+# PATIENCE : si l'AUC val ne s'améliore pas pendant PATIENCE epochs, on arrête.
+# Surchargeable via --patience (défaut 100).
+PATIENCE = CLI_ARGS.patience
 # GRAD_CLIP_NORM = 1.0 : on clamp la norme du gradient total à 1.0.
 # Empêche les mises à jour explosives (ex : quand τ change brusquement).
 GRAD_CLIP_NORM = 1.0

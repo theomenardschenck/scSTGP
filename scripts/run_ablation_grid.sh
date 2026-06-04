@@ -118,11 +118,11 @@ set -euo pipefail
 
 # --- Paramètres par défaut --------------------------------------------------
 DEFAULT_SEEDS=(1 2 3)
-VERSION="V4.1"
+VERSION="V5.4"
 ABLATIONS=""
 MODE=""                        # legacy alias
 MAX_PARALLEL=10
-TIME_LIMIT="0-02:00:00"
+TIME_LIMIT="0-03:00:00"
 DRY_RUN=0
 DATA_ROOT_CLI=""               # --data-root (override DATA_ROOT)
 
@@ -352,11 +352,17 @@ case "$VERSION" in
         V41_FULL="$OP_SIG $OP_TF $OP_INC"
         # V54_NODEDUP = V5.4 sans le dedup-ppi (pour le test causal no-dedup) ;
         # V54_BASE = V54_NODEDUP + dedup (config V5.4 nominale).
+        # 2026-06-04 : --n-epochs 1500 + --patience 200 (marge de convergence ;
+        # les 1ers runs plafonnaient AUC ~0.94 à epoch 220-380).
         V54_NODEDUP="$V41_FULL --signed-message --signed-decoder --decoder-split \
-                  --use-reactome-fi --kl-beta-max 0.0001 --patience 200"
+                  --use-reactome-fi --kl-beta-max 0.0001 --patience 200 --n-epochs 1500"
         V54_BASE="$V54_NODEDUP --dedup-ppi-signed remove"
         DD="data/pyscenic/diff_coexpr"   # sources coexpr alternatives
         BASE_CONFIGS=(
+            # === Baseline V5.4 nominale (split.rfi.dedup.kl1, AUCUNE ablation) ===
+            # Comparateur de référence, MÊME régime (1500 epochs / patience 200).
+            "v5.4.baseline::$V54_BASE"
+
             # === 5 ablations standard (isolation par source) ===
             "v5.4.no-coexpr::$V54_BASE --no-coexpr"
             "v5.4.no-humess::$V54_BASE --no-humess"
