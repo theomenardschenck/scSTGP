@@ -355,6 +355,7 @@ case "$VERSION" in
         V54_NODEDUP="$V41_FULL --signed-message --signed-decoder --decoder-split \
                   --use-reactome-fi --kl-beta-max 0.0001 --patience 200"
         V54_BASE="$V54_NODEDUP --dedup-ppi-signed remove"
+        DD="data/pyscenic/diff_coexpr"   # sources coexpr alternatives
         BASE_CONFIGS=(
             # === 5 ablations standard (isolation par source) ===
             "v5.4.no-coexpr::$V54_BASE --no-coexpr"
@@ -385,6 +386,20 @@ case "$VERSION" in
             #   FHL2/HMGB2/H2AFZ (overlap PPI∩signé ~0). Si vérifié ⇒ dedup-ppi
             #   est le levier causal de la démotion des hubs (cf. gnn_futur.md §7).
             "v5.4.no-dedup::$V54_NODEDUP"
+
+            # === Sources coexpr alternatives (2026-06-04) ===
+            # V5.4 nominal utilise legacy P16-only sklearn. On teste si une
+            # source différentielle P4∪P16 change le ranking en signed-aware.
+            # (complète V5.3-coexpr-source qui le testait sans les autres ablations).
+            # arboreto.mr : différentielle mutual-rank K=10 (~37k paires)
+            "v5.4.coexpr-arboreto.mr::$V54_BASE --coexpr-mode differential --coexpr-method arboreto --coexpr-prune mr --diff-coexpr-file $DD/coexpr_diff.arboreto.mr.tsv"
+            # arboreto.mr5 : mutual-rank K=5 (~16k, champion AUC V4.3-tune)
+            "v5.4.coexpr-arboreto.mr5::$V54_BASE --coexpr-mode differential --coexpr-method arboreto --coexpr-prune mr --diff-coexpr-file $DD/coexpr_diff.arboreto.mr5.tsv"
+            # arboreto.quantile.limited : top-7000 matching cardinalité legacy
+            "v5.4.coexpr-arboreto.quantile-limited::$V54_BASE --coexpr-mode differential --coexpr-method arboreto --coexpr-prune quantile --diff-coexpr-file $DD/coexpr_diff.arboreto.quantile.limited.tsv"
+            # legacy P16-only arboreto (topk) : contrôle même méthode arboreto
+            # mais P16-only (≠ différentielle) → isole méthode vs différentiel
+            "v5.4.coexpr-legacy-arboreto::$V54_BASE --coexpr-method arboreto --coexpr-prune topk --diff-coexpr-file $DD/coexpr_diff.arboreto.topk.tsv"
         )
         ;;
     V5.3-coexpr-source)

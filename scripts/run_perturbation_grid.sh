@@ -63,10 +63,12 @@ DRY_RUN=0
 ALSO_PATHWAYS=0
 SKIP_REPORT=0               # par défaut : on chaîne perturb_report --all après
 SKIP_CROSS_SEED=0           # par défaut : cross-seed report auto post-perturb
-# V5.4 — sémantique KO. cut (défaut) = statu quo (coupe arêtes incidentes).
-# mask = feature=0 sans coupure (= KD topology-wise, fix bug "incoherent").
-# soft = feature × ko_soft_factor (défaut 0.1).
-KO_MODE="cut"
+# V5.5 — sémantique KO. mask (DÉFAUT) = feature=0 sans coupure d'arêtes
+# (corrige le bug KO-cut : choc topologique). cut = legacy (coupe arêtes).
+# soft = feature × ko_soft_factor. NB : perturb_top_genes applique aussi en
+# V5.5 un KD soft (×0.15) par défaut (le grid ne plumbe pas --legacy ; pour
+# un run 100% legacy, appeler perturb_top_genes.py directement avec --legacy).
+KO_MODE="mask"
 KO_SOFT_FACTOR="0.1"
 
 # --- Parsing CLI ------------------------------------------------------------
