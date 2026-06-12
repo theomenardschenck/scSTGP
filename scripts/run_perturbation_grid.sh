@@ -60,6 +60,10 @@ DEFAULT_AXIS="v4"           # backward-compat : axe historique P4 quiescent
 MAX_PARALLEL=10
 TIME_LIMIT="0-12:00:00"
 DRY_RUN=0
+ANALYSIS=0
+ANALYSIS_DECOY=0
+ANALYSIS_FIGURES=0
+GPU=0
 ALSO_PATHWAYS=0
 SKIP_REPORT=0               # par défaut : on chaîne perturb_report --all après
 SKIP_CROSS_SEED=0           # par défaut : cross-seed report auto post-perturb
@@ -90,6 +94,10 @@ while [[ $# -gt 0 ]]; do
         --skip-cross-seed) SKIP_CROSS_SEED=1; shift ;;
         --ko-mode)        KO_MODE="$2"; shift 2 ;;
         --ko-soft-factor) KO_SOFT_FACTOR="$2"; shift 2 ;;
+        --analysis)         ANALYSIS=1; shift ;;       # ne lance QUE l'analyse (local)
+        --analysis-decoy)   ANALYSIS_DECOY=1; shift ;; # + confidence décoy (lourd)
+        --analysis-figures) ANALYSIS_FIGURES=1; shift ;; # + figures (visualize_global/viz_explorer)
+        --gpu)              GPU=1; shift ;;             # essaie GPU (gres+partition) ; python --device auto
         -h|--help)
             sed -n '2,40p' "$0"; exit 0 ;;
         *) echo "Argument inconnu : $1"; exit 1 ;;
@@ -146,6 +154,47 @@ if [[ ${#VALID_RUNS[@]} -eq 0 ]]; then
     exit 1
 fi
 
+# --- Mode --analysis : ne lance QUE la partie ANALYSE (local, aucun SLURM) ---
+# Requiert des runs DÉJÀ perturbés. Groupe par catégorie (tag sans .s<N>) et
+# enchaîne run_analysis.sh (cross-seed report + baselines + interpret [+ décoy]).
+if [[ $ANALYSIS -eq 1 ]]; then
+    [[ "$AXIS" == "v3" ]] && ATAG="" || ATAG="axisV4"
+    EXTRA_FLAGS=""
+    [[ $ANALYSIS_DECOY -eq 1 ]] && EXTRA_FLAGS+=" --decoy"
+    [[ $ANALYSIS_FIGURES -eq 1 ]] && EXTRA_FLAGS+=" --figures"
+    declare -A A_CATS=()
+    for r in "${VALID_RUNS[@]}"; do
+        nm="$(basename "$r")"; A_CATS["${nm%.s*}"]+="$r "
+    done
+    for cat in "${!A_CATS[@]}"; do
+        runs=(${A_CATS[$cat]})
+        out="$(dirname "${runs[0]}")/analysis/$cat"
+        echo "[grid][analysis] $cat : ${#runs[@]} seed(s) → $out"
+        bash scripts/run_analysis.sh --out "$out" --axis-tag "$ATAG" \
+            $EXTRA_FLAGS --seeds "${runs[@]}" || echo "[grid][analysis] $cat ÉCHEC"
+    done
+
+    # --- Cross-config (≥2 catégories) : ablation_attribution + compare_runs ---
+    # Référence = catégorie 'baseline' (sinon la 1ère) ; sorties sous son interpret/.
+    cats=("${!A_CATS[@]}")
+    if [[ ${#cats[@]} -ge 2 ]]; then
+        f0=(${A_CATS[${cats[0]}]}); APAR="$(dirname "${f0[0]}")/analysis"
+        REF=""; for c in "${cats[@]}"; do [[ "$c" == *baseline* ]] && REF="$c" && break; done
+        [[ -z "$REF" ]] && REF="${cats[0]}"
+        ABL=(); for c in "${cats[@]}"; do [[ "$c" != "$REF" ]] && ABL+=("$APAR/$c"); done
+        REFINT="$APAR/$REF/interpret"
+        echo "[grid][analysis] cross-config : réf=$REF vs ${#ABL[@]} ablation(s) → $REFINT"
+        python3 src/validation/reports/ablation_attribution.py \
+            --reference "$APAR/$REF" --ablations "${ABL[@]}" \
+            --out-dir "$REFINT/ablation_attribution" || echo "  ablation_attribution ÉCHEC"
+        python3 src/validation/reports/compare_runs.py --source perturb_driver \
+            --base-dir "$APAR" --report-subdir "" --runs "${cats[@]}" \
+            --baseline "$REF" --output-dir "$REFINT/compare_runs" || echo "  compare_runs ÉCHEC"
+    fi
+    echo "[grid][analysis] terminé (catégories : ${!A_CATS[*]} ; aucun job SLURM)."
+    exit 0
+fi
+
 # --- Préparation logs + configs.tsv ----------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -189,6 +238,26 @@ echo "[grid] also-pathw : $ALSO_PATHWAYS"
 echo
 
 # --- Génération du sbatch script (job array) -------------------------------
+# GPU optionnel (--gpu) : directives gres+partition+clusters (GLiCID) + python
+# --device auto. ⚠️ qos GPU 'gpus' = MaxWall 3h + MaxJobsPU 1 → le job array se
+# SÉRIALISE (1 tâche GPU à la fois). Pour du parallélisme GPU, préférer 1 job
+# par config (run_v6_de_axis.sh) ou la qos 'quick' (3h, 50 jobs).
+GPU_DIRECTIVES=""
+DEVICE_ARG=""
+QOS="short"
+if [[ ${GPU:-0} -eq 1 ]]; then
+    QOS="${V6_GPU_QOS:-gpus}"
+    TIME_LIMIT="${V6_GPU_TIME:-0-03:00:00}"        # qos gpus plafonne à 3h
+    GPU_DIRECTIVES="#SBATCH --partition=${V6_GPU_PARTITION:-gpu}
+#SBATCH --gres=${V6_GPU_GRES:-gpu:1}
+#SBATCH --clusters=${V6_CLUSTER:-nautilus}"
+    [[ -n "${V6_GPU_CONSTRAINT:-}" ]] && GPU_DIRECTIVES+="
+#SBATCH --constraint=${V6_GPU_CONSTRAINT}"
+    DEVICE_ARG="--device auto"
+    echo "[grid] GPU → partition=${V6_GPU_PARTITION:-gpu} gres=${V6_GPU_GRES:-gpu:1} qos=$QOS time=$TIME_LIMIT (cap 3h) ; --device auto"
+    echo "[grid] ⚠️ qos gpus : MaxJobsPU=1 → l'array se sérialise."
+fi
+
 SBATCH_SCRIPT="$LOG_DIR/sbatch_perturb.sh"
 cat > "$SBATCH_SCRIPT" <<EOF
 #!/usr/bin/env bash
@@ -201,8 +270,9 @@ cat > "$SBATCH_SCRIPT" <<EOF
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=24G
-#SBATCH --qos=short
+#SBATCH --qos=$QOS
 #SBATCH --array=$ARRAY_RANGE
+$GPU_DIRECTIVES
 
 set -euo pipefail
 
@@ -242,6 +312,7 @@ python3 src/perturb_top_genes.py \\
     --run-dir "\$RUN_DIR" \\
     "\$TARGET_FLAG" \\
     --modes "\$MODE" \\
+    $DEVICE_ARG \\
     "\${EXTRA_ARGS[@]}"
 
 # --- Chaînage perturb_report --all après chaque perturbation ----------
