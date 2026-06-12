@@ -63,6 +63,9 @@ Outputs
 
     ALL mode:
       <run-dir>/perturbation_all_genes_{mode}.tsv               — flat TSV
+      <run-dir>/perturbation_all_genes_signed_fanout.tsv        — readout signé
+                  (long-format par arête S→T ; V5.5, gnn_futur §8.A/§9.2 ;
+                   --de-file pour le rôle DE ; DE-free sinon)
       <run-dir>/perturbation_all_pathways_{mode}.tsv            — flat TSV
 """
 
@@ -247,6 +250,17 @@ def flatten_summary(target_type: str, target: str,
         "max_proj_signed_cosine_group": summary.get("max_proj_signed_cosine_group"),
         "max_proj_signed_cosine": summary.get("max_proj_signed_cosine"),
         "target_ppi_degree": summary.get("target_ppi_degree"),
+        # Readout signé (fan-out 1-hop, gnn_futur §8.A / §9.2). APERÇU
+        # role_latent/role_de seulement (role_pert + flag = report-side).
+        "signed_fanout_n": summary.get("signed_fanout_n"),
+        "signed_readout_latent": summary.get("signed_readout_latent"),
+        "signed_coherence_latent": summary.get("signed_coherence_latent"),
+        "signed_coherence_latent_knownsign": summary.get("signed_coherence_latent_knownsign"),
+        "signed_pred_known_agree": summary.get("signed_pred_known_agree"),
+        "signed_has_bilinear": summary.get("signed_has_bilinear"),
+        "signed_readout_de": summary.get("signed_readout_de"),
+        "signed_coherence_de": summary.get("signed_coherence_de"),
+        "signed_role_latde_agree": summary.get("signed_role_latde_agree"),
     }
     for grp in CELL_GROUPS:
         row[f"shift_{grp}"] = shift.get(grp)
@@ -294,9 +308,78 @@ def flatten_summary(target_type: str, target: str,
     return row
 
 
+def _load_de_role_sign(de_file: Path, gene_symbols, de_sign: int = 1):
+    """Vecteur (n_genes,) du signe de rôle DE, aligné sur gene_symbols.
+
+    Source du rôle DE pour le readout signé (gnn_futur §8.A, alternative à
+    `role_latent`). role_DE = de_sign · sgn(avg_log2FC) — un gène up-en-P16
+    (pro-sén) doit recevoir +1. `de_sign` fixe la convention du fichier :
+      * +1 (DÉFAUT, vérifié sur `DEGs_P4_vs_P16.csv` : logFC>0 = UP en P16 =
+        pro-sén — CDKN2A +4.3, CDKN1A +1.2, LMNB1 −1.3) → role_DE = +sgn(logFC).
+      * -1 si le fichier est orienté l'inverse (logFC>0 = up côté jeune/prolif).
+    ⚠️ Le nom « P4_vs_P16 » est trompeur : le contraste Seurat a ident.1=P16.
+    Gènes absents → 0 (rôle indéfini, exclus du score DE). DE-free reste le
+    défaut ; ce canal n'est utilisé que si --de-file est fourni.
+    ⚠️ role_DE est un signal de MARQUEUR (niveau d'expression), pas causal :
+    un gène compensatoire up-en-P16 mais anti-sén sera mal étiqueté → diagnostic
+    seulement ; le headline reste role_pert (cosine_senescent causal, report).
+    """
+    import numpy as np
+    df = pd.read_csv(de_file)
+    cols = {c.lower(): c for c in df.columns}
+    gcol = cols.get("gene") or cols.get("hgnc_symbol")
+    lcol = cols.get("avg_log2fc") or cols.get("log2foldchange") or cols.get("logfc")
+    if not (gcol and lcol):
+        print(f"[warn] --de-file {de_file.name} : colonnes gene/avg_log2FC "
+              "introuvables — rôle DE ignoré.")
+        return None
+    lfc = dict(zip(df[gcol].astype(str),
+                   pd.to_numeric(df[lcol], errors="coerce")))
+    out = np.zeros(len(gene_symbols), dtype="float32")
+    for i, g in enumerate(gene_symbols):
+        v = lfc.get(str(g))
+        if v is not None and not (isinstance(v, float) and np.isnan(v)):
+            out[i] = de_sign * np.sign(v)
+    n = int((out != 0).sum())
+    print(f"[de-role] {n}/{len(gene_symbols)} gènes avec rôle DE "
+          f"(convention de_sign={de_sign:+d}).")
+    return out
+
+
+def _load_de_axis_anchors(de_file: Path, label: str, top_n: int,
+                          rank_col: str, padj_thresh: float):
+    """V6 (design_log §14bis.8 méthode A) — construit les ancres de l'axe
+    DE-ancré depuis un fichier DE bulk : pôle + (pro-sén) = top-N up, pôle −
+    (anti-sén) = top-N down. logFC reste un signal de READOUT (jamais feature
+    d'encoder). Renvoie (up_genes, down_genes) pour `effector_axis_genes`.
+    Validé GSE98440 : cos(axe scRNA, axe DE) ~0.9 à N≥150 (rank=stat)."""
+    import sys as _sys
+    _data = Path(__file__).resolve().parent.parent / "data"     # src/data (local)
+    if not (_data / "loaders").is_dir():
+        _data = Path(__file__).resolve().parent / "data"         # flat fallback
+    if str(_data) not in _sys.path:
+        _sys.path.insert(0, str(_data))
+    from loaders.bulk_rna import load_bulk_rna_de
+    de = load_bulk_rna_de(de_file, condition_label=label).dropna(subset=["log_fc"])
+    pool = de[de["padj"] < padj_thresh] if "padj" in de.columns else de
+    if rank_col not in pool.columns or pool[rank_col].isna().all():
+        print(f"[de-axis] colonne '{rank_col}' absente/vide → fallback log_fc")
+        rank_col = "log_fc"
+    if pool.empty:
+        pool = de
+    pool = pool.dropna(subset=[rank_col])
+    up = pool.nlargest(top_n, rank_col)["gene_symbol"].astype(str).tolist()
+    down = pool.nsmallest(top_n, rank_col)["gene_symbol"].astype(str).tolist()
+    print(f"[de-axis] {Path(de_file).name} : {len(up)}↑ (pro-sén) + {len(down)}↓ "
+          f"(anti-sén) ancres ; rank={rank_col}, padj<{padj_thresh}, label={label}")
+    return (up, down)
+
+
 def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
                              n_layers: int, n_heads: int,
-                             quiescent_groups=None, p16_groups=None):
+                             quiescent_groups=None, p16_groups=None,
+                             de_file: Path | None = None, de_sign: int = 1,
+                             effector_axis_genes=None, device: str = "cpu"):
     """Load the VGAE run + compute the shared baseline once.
 
     Imports gnn_perturbation lazily so the subprocess TOP-N mode doesn't
@@ -307,6 +390,9 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
             l'axe de sénescence. Défaut historique = ("P4",).
         p16_groups : optionnel — clusters P16 côté sénescent. Auto-dérivé
             si None.
+        de_file : optionnel — fichier DE (gene, avg_log2FC) pour le rôle DE
+            du readout signé (attaché à data._de_role_sign). DE-free si None.
+        de_sign : convention de signe du fichier DE (cf. _load_de_role_sign).
     """
     # Local import — gnn_perturbation needs torch + PyG which are heavy.
     from gnn_perturbation import (  # noqa: E402
@@ -315,10 +401,15 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
         load_background as _load_bg,
     )
     data, model, gene_symbols, gene_to_idx, baseline, group_expr = load_run(
-        run_dir, hidden, latent, n_layers, n_heads)
+        run_dir, hidden, latent, n_layers, n_heads, device=device)
+    if de_file is not None:
+        _de = _load_de_role_sign(de_file, gene_symbols, de_sign=de_sign)
+        if _de is not None:
+            data._de_role_sign = _de
     spec, base_imp, base_rank, z_cg_base, mu_base, axis_global, axes_cluster = prepare_baseline(
         model, data, baseline, gene_symbols, group_expr,
-        quiescent_groups=quiescent_groups, p16_groups=p16_groups)
+        quiescent_groups=quiescent_groups, p16_groups=p16_groups,
+        effector_axis_genes=effector_axis_genes)
     reactome = _load_gmt()
     background = _load_bg()
     print(f"Loaded run ({len(gene_symbols)} genes); baseline computed; "
@@ -355,6 +446,16 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
     rows_by_mode: dict[str, list[dict]] = {m: [] for m in modes}
     out_by_mode = {m: out_prefix.with_name(f"{out_prefix.name}_{m}.tsv")
                    for m in modes}
+    # Readout signé : accumulation de la table long-format par cible
+    # (fan-out 1-hop). Activée via flag sur `data` (lu par run_perturbation_once)
+    # → ne dépend pas du wrapper de compat. DE-free ; rôles joints côté report.
+    has_axis = ctx.get("axis_global") is not None
+    if has_axis:
+        ctx["data"]._collect_signed_fanout = True
+    fanout_cols = ("source", "target", "mode", "sign_known", "sign_pred",
+                   "proj_target", "role_latent_sign")
+    fanout_rows: dict[str, list] = {c: [] for c in fanout_cols}
+    out_fanout = out_prefix.with_name(f"{out_prefix.name}_signed_fanout.tsv")
     done = 0
     for gene in gene_symbols:
         for mode in modes:
@@ -374,6 +475,16 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                 kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy)
             if summary is None:
                 continue
+            fo = summary.pop("_signed_fanout_rows", None)
+            if fo:
+                k = len(fo["source"])
+                fanout_rows["source"].extend(fo["source"])
+                fanout_rows["target"].extend(fo["target"])
+                fanout_rows["mode"].extend([mode] * k)
+                fanout_rows["sign_known"].extend(fo["sign_known"])
+                fanout_rows["sign_pred"].extend(fo["sign_pred"])
+                fanout_rows["proj_target"].extend(fo["proj_target"])
+                fanout_rows["role_latent_sign"].extend(fo["role_latent_sign"])
             rows_by_mode[mode].append(
                 flatten_summary("gene", str(gene), "", mode, factor, summary))
             done += 1
@@ -388,6 +499,9 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
     for m, rs in rows_by_mode.items():
         pd.DataFrame(rs).to_csv(out_by_mode[m], sep="\t", index=False)
         print(f"\nWrote {out_by_mode[m]}  ({len(rs)} rows)")
+    if has_axis and fanout_rows["source"]:
+        pd.DataFrame(fanout_rows).to_csv(out_fanout, sep="\t", index=False)
+        print(f"Wrote {out_fanout}  ({len(fanout_rows['source'])} edge rows)")
 
 
 def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
@@ -637,6 +751,9 @@ def main():
     ap.add_argument("--latent", type=int, default=64)
     ap.add_argument("--n-layers", type=int, default=3)
     ap.add_argument("--n-heads", type=int, default=4)
+    ap.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"],
+                    help="device perturbation. 'auto' = cuda si dispo sinon cpu "
+                         "(recommandé sur cluster GPU). Défaut cpu.")
     # V4 — axe de sénescence : groupes côté quiescent (et P16 résiduels).
     # Permet d'agréger c0 avec P4 (c0 transcriptionnellement quiescent-like
     # cf. CLAUDE.md §V3.3). Backward-compat : défaut "P4" seul.
@@ -650,6 +767,43 @@ def main():
                          "sénescent. Si non fourni, dérivé automatiquement "
                          "de --quiescent-groups (P16_cluster_0..3 moins "
                          "ceux passés côté quiescent).")
+    ap.add_argument("--de-file", type=Path, default=None,
+                    help="optionnel — fichier DE (gene, avg_log2FC) pour le "
+                         "rôle DE du readout signé (colonnes signed_*_de). "
+                         "DE-free si non fourni.")
+    ap.add_argument("--de-sign", type=int, default=1, choices=[-1, 1],
+                    help="convention du --de-file. +1 (DÉFAUT, vérifié sur "
+                         "DEGs_P4_vs_P16.csv : logFC>0 = UP en P16 = pro-sén, "
+                         "CDKN2A +4.3) ; -1 si l'inverse. Le nom 'P4_vs_P16' est "
+                         "trompeur (ident.1=P16).")
+    # Axe effecteur-ancré (gnn_futur §2.2/§4b) — stabilise l'axe (cas ASNS §7.8).
+    ap.add_argument("--effector-axis", action="store_true",
+                    help="ancre axis_global sur des effecteurs canoniques "
+                         "(axis = unit(μ[pro]−μ[anti])) au lieu du contraste "
+                         "d'expression. Référence causale, ne pivote pas avec "
+                         "les hyperparamètres. Listes via --effector-pro/-anti.")
+    ap.add_argument("--effector-pro",
+                    default="CDKN2A,CDKN1A,CDKN2B,SERPINE1,GLB1",
+                    help="effecteurs PRO-sénescence (pôle +) pour --effector-axis.")
+    ap.add_argument("--effector-anti",
+                    default="LMNB1,MKI67,CCNB1,CCNA2,PCNA,TOP2A",
+                    help="effecteurs ANTI-sénescence/prolifération (pôle −).")
+    # Axe DE-ancré (V6 — readout bulk RNA-seq, design_log §14bis.8 méthode A).
+    ap.add_argument("--de-axis-file", type=Path, default=None,
+                    help="V6 : ancre axis_global sur un fichier DE bulk "
+                         "(logFC/padj) — pôle + = top-N up (pro-sén), pôle − = "
+                         "top-N down. Validé GSE98440 : cos(axe scRNA)~0.9 à "
+                         "N≥150. logFC JAMAIS en feature d'encoder (anti-circularité).")
+    ap.add_argument("--de-axis-label", default="sen_vs_pro",
+                    help="condition_label du DE (<A>_vs_<B>, log_fc>0 ⇔ up dans A "
+                         "= pôle pro-sén). Défaut sen_vs_pro.")
+    ap.add_argument("--de-axis-top-n", type=int, default=200,
+                    help="nb d'ancres par pôle (défaut 200 ; ≥150 recommandé).")
+    ap.add_argument("--de-axis-rank", default="stat", choices=["stat", "log_fc"],
+                    help="colonne de ranking des ancres (défaut stat = Wald DESeq2, "
+                         "robuste ; fallback log_fc).")
+    ap.add_argument("--de-axis-padj", type=float, default=0.1,
+                    help="seuil padj des ancres (défaut 0.1 ; NaN gardés).")
     ap.add_argument("--out-suffix", default="",
                     help="suffixe ajouté au préfixe d'output (avant '_<mode>.tsv'). "
                          "Évite d'écraser les TSV V3 quand on relance la même "
@@ -670,9 +824,19 @@ def main():
                    if s.strip()) if args.quiescent_groups else None
         _p = (tuple(s.strip() for s in args.p16_groups.split(",") if s.strip())
               if args.p16_groups else None)
+        _eff = None
+        if args.de_axis_file:
+            _eff = _load_de_axis_anchors(
+                args.de_axis_file, args.de_axis_label, args.de_axis_top_n,
+                args.de_axis_rank, args.de_axis_padj)
+        elif args.effector_axis:
+            _eff = (tuple(s.strip() for s in args.effector_pro.split(",") if s.strip()),
+                    tuple(s.strip() for s in args.effector_anti.split(",") if s.strip()))
         ctx = _load_model_and_baseline(run_dir, args.hidden, args.latent,
                                        args.n_layers, args.n_heads,
-                                       quiescent_groups=_q, p16_groups=_p)
+                                       quiescent_groups=_q, p16_groups=_p,
+                                       de_file=args.de_file, de_sign=args.de_sign,
+                                       effector_axis_genes=_eff, device=args.device)
         _suffix = args.out_suffix  # "" si non fourni → comportement V3 inchangé
         if args.all_genes:
             run_all_genes(ctx, modes, args.oe_factor,

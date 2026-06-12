@@ -10,6 +10,11 @@ a full REACTOME pathway. Runs a forward pass through the FROZEN encoder
   * delta_ranking.csv       — per-gene baseline vs perturbed rank & importance
   * delta_ora_top_up_reactome.tsv — REACTOME ORA on the top rising genes
   * summary.json            — top movers, stats, signature delta-pathways
+  * signed_fanout.tsv       — readout signé 1-hop (V5.5, gnn_futur §8.A/§9.2) :
+                              par cible T du fan-out signé de S, le signe
+                              prédit (bilinéaire) / curé de S→T + la réponse
+                              Δz_T·u. Brique du score signed_readout / cohérence
+                              (rôles de cible joints côté perturb_report).
 
 Perturbation modes
 ------------------
@@ -702,8 +707,17 @@ def compute_senescence_axes(mu_base: np.ndarray,
                              p4_group="P4",
                              p16_groups=("P16_cluster_0", "P16_cluster_1",
                                          "P16_cluster_2", "P16_cluster_3"),
-                             quiescent_groups=None):
+                             quiescent_groups=None,
+                             effector_axis_genes=None):
     """Axes quiescent -> sénescent dans l'espace latent des gènes.
+
+    effector_axis_genes : optionnel (pro_list, anti_list) de symboles. Si
+        fourni, **axis_global est ANCRÉ sur les effecteurs** :
+            axis = unit( mean(μ[pro]) − mean(μ[anti]) )
+        au lieu du contraste d'expression des cell_groups. Référence causale
+        (endpoints canoniques) plutôt que corrélationnelle → ne pivote pas
+        avec les hyperparamètres (cf. ASNS §7.8, gnn_futur §2.2/§4b). Les
+        axes_cluster restent expression-based (le headline = axis_global).
 
     Centroïdes pondérés par l'expression (par groupe) :
         c_g = Σᵢ expr_g[i] · μ_base[i]  /  Σᵢ expr_g[i]
@@ -777,6 +791,24 @@ def compute_senescence_axes(mu_base: np.ndarray,
     }
     print(f"  [axes] quiescent = mean({quiescent_list}) ; "
           f"sénescent = mean({p16_list})")
+
+    # Override effecteur-ancré (gnn_futur §2.2/§4b) : remplace l'axe global
+    # corrélationnel par un axe causal défini sur des effecteurs canoniques.
+    if effector_axis_genes is not None:
+        pro, anti = effector_axis_genes
+        s2i = {g: i for i, g in enumerate(gene_symbols)}
+        pro_i = [s2i[g] for g in pro if g in s2i]
+        anti_i = [s2i[g] for g in anti if g in s2i]
+        if pro_i and anti_i:
+            pro_c = mu_base[pro_i].mean(axis=0)
+            anti_c = mu_base[anti_i].mean(axis=0)
+            axis_global = unit(pro_c - anti_c, "effector")
+            print(f"  [axes] EFFECTOR-anchored axis_global : "
+                  f"pro={len(pro_i)}/{len(pro)} anti={len(anti_i)}/{len(anti)} gènes "
+                  f"(remplace le contraste d'expression).")
+        else:
+            print(f"[warn] effector axis : pro={len(pro_i)} anti={len(anti_i)} "
+                  "gènes trouvés — fallback axe expression.")
     return axis_global, axes_cluster, centers
 
 
@@ -906,9 +938,246 @@ def cell_group_shift_projected(mu_base: np.ndarray,
 
 
 # --------------------------------------------------------------------------- #
+# Readout signé — fan-out 1-hop (Solution A signée, gnn_futur §8.A / §9.2).
+# --------------------------------------------------------------------------- #
+# Types d'arêtes signées DIRIGÉES où le gène source S est le RÉGULATEUR
+# (S → cible T). On exclut `tf_curated_by` qui est l'arête miroir
+# (cible → TF), de direction inverse : l'inclure compterait S comme aval.
+# `reactome_fi` est conservée malgré une directionnalité parfois faible
+# (les FI Reactome sont souvent bidirectionnelles) ; à filtrer si besoin.
+FANOUT_EDGE_TYPES: tuple = (
+    ("gene", "signaling", "gene"),
+    ("gene", "tf_curated", "gene"),
+    ("gene", "reactome_fi", "gene"),
+)
+
+
+def precompute_signed_fanout_context(model, data, mu_base: np.ndarray,
+                                     axis_global: np.ndarray,
+                                     fanout_edge_types=FANOUT_EDGE_TYPES,
+                                     sign_col: int = 1) -> dict:
+    """Pré-calcule (une seule fois) le contexte du readout signé fan-out.
+
+    Invariant sur toutes les perturbations : ne dépend que de l'encoder gelé
+    (mu_base), de l'axe et du graphe signé. Mis en cache sur ``data._sf_ctx``.
+
+    Calcule :
+      * ``role_latent_sign`` (n_genes,) : signe du rôle AU REPOS de chaque gène
+        sur l'axe sénescence = sgn(mu_base·u − médiane). >0 = lean pro-sén,
+        <0 = lean anti-sén. Auto-référencé (médiane de la population de gènes)
+        → pas besoin du centroïde quiescent, robuste cross-version.
+      * ``proj_base`` (n_genes,) : projection brute mu_base·u (diagnostic).
+      * ``fanout`` : dict ``src_idx -> (dst_idx[], sign_known[], sign_pred[])``
+        sur les arêtes signées sortantes. ``sign_pred`` = signe du score
+        bilinéaire ``predict_sign_score`` (le signe APPRIS, §9.2) ; ``sign_known``
+        = signe curé (edge_attr[:, sign_col], CollecTRI/SIGNOR/Reactome).
+        Si pas de décodeur bilinéaire (checkpoint non-V5), ``sign_pred`` retombe
+        sur ``sign_known`` et ``has_bilinear`` est False.
+
+    Returns: le dict de contexte (aussi attaché à ``data._sf_ctx``).
+    """
+    axis = np.asarray(axis_global, dtype=np.float32)
+    proj_base = (np.asarray(mu_base, dtype=np.float32) @ axis)
+    role_med = float(np.median(proj_base))
+    role_latent_sign = np.sign(proj_base - role_med).astype(np.float32)
+
+    bilinear = getattr(model, "bilinear_decoder", None)
+    has_bilinear = bilinear is not None
+
+    # Collecte des arêtes signées sortantes (régulateur = src).
+    src_all, dst_all, sk_all = [], [], []
+    present_types = [tuple(et) for et in fanout_edge_types
+                     if tuple(et) in set(data.edge_types)]
+    for et in present_types:
+        store = data[et]
+        ei = store.edge_index.cpu().numpy()
+        ea = getattr(store, "edge_attr", None)
+        if ea is None or ea.ndim < 2 or ea.shape[1] <= sign_col:
+            continue
+        signs = ea[:, sign_col].cpu().numpy()
+        src_all.append(ei[0]); dst_all.append(ei[1]); sk_all.append(signs)
+
+    if not src_all:
+        ctx = {"role_latent_sign": role_latent_sign, "proj_base": proj_base,
+               "fanout": {}, "has_bilinear": has_bilinear,
+               "n_signed_edges": 0, "edge_types": []}
+        data._sf_ctx = ctx
+        return ctx
+
+    src = np.concatenate(src_all)
+    dst = np.concatenate(dst_all)
+    sign_known = np.sign(np.concatenate(sk_all)).astype(np.float32)
+
+    # Retrait des self-loops (T == S) qui ne sont pas un fan-out.
+    keep = src != dst
+    src, dst, sign_known = src[keep], dst[keep], sign_known[keep]
+
+    # Signe APPRIS via le décodeur bilinéaire (un seul passage sur z=mu_base).
+    if has_bilinear:
+        dev = next(bilinear.parameters()).device
+        z = torch.as_tensor(np.asarray(mu_base, dtype=np.float32), device=dev)
+        ei_t = torch.as_tensor(np.stack([src, dst]), dtype=torch.long, device=dev)
+        with torch.no_grad():
+            logit = bilinear.predict_sign_score(z, ei_t).cpu().numpy()
+        sign_pred = np.sign(logit).astype(np.float32)
+        # logit == 0 (rare) → retombe sur le signe connu.
+        zero = sign_pred == 0
+        sign_pred[zero] = sign_known[zero]
+    else:
+        sign_pred = sign_known.copy()
+
+    # Regroupement par source pour un slicing O(1) par gène perturbé.
+    order = np.argsort(src, kind="stable")
+    src_s, dst_s = src[order], dst[order]
+    sk_s, sp_s = sign_known[order], sign_pred[order]
+    boundaries = np.searchsorted(src_s, np.arange(src_s.max() + 2))
+    fanout = {}
+    uniq = np.unique(src_s)
+    for s in uniq:
+        a, b = boundaries[s], boundaries[s + 1]
+        fanout[int(s)] = (dst_s[a:b], sk_s[a:b], sp_s[a:b])
+
+    ctx = {
+        "role_latent_sign": role_latent_sign,
+        "proj_base": proj_base,
+        "fanout": fanout,
+        "has_bilinear": has_bilinear,
+        "n_signed_edges": int(src.size),
+        "edge_types": ["/".join(et) for et in present_types],
+    }
+    data._sf_ctx = ctx
+    return ctx
+
+
+def signed_fanout_scalars(data, mu_base: np.ndarray, mu_pert: np.ndarray,
+                          target_idx, axis_global: np.ndarray,
+                          de_role_sign: np.ndarray | None = None,
+                          return_table: bool = False):
+    """Readout signé + cohérence de fan-out pour la/les cible(s) perturbée(s) S.
+
+    Pour chaque arête signée sortante S→T (S ∈ target_idx) :
+      proj_T   = Δz_T · u            (réponse de T projetée sur l'axe ; signée)
+      |proj_T| = magnitude axe-pertinente du mouvement de T
+      align_T  = sgn(role_T) · sign_{S→T}   (∈ {−1, +1})
+                 role_T = rôle au repos de T ; sign = signe régulateur S→T.
+                 Inhiber-un-pro-sén (−·−) et activer-un-anti-sén (+·… ) reçoivent
+                 le même signe → s'additionnent au lieu de s'annuler (§8.A).
+
+    Score (pour chaque source de rôle × source de signe) :
+      signed_readout = Σ_T |proj_T| · align_T   (>0 pro-sén, <0 anti-sén)
+      signed_coherence = |Σ_T align_T| / N_T  ∈ [0,1]  (≈ le « % cohérent » §1.2)
+
+    Convention de signe identique aux projections : >0 pousse VERS P16.
+
+    Args:
+        de_role_sign : (n_genes,) signe du rôle DE par gène (∈{−1,0,+1}), ou None.
+        return_table : si True, renvoie aussi un DataFrame long par cible.
+
+    Returns:
+        (scalars: dict, table: pd.DataFrame|None). dict vide si pas de contexte
+        ou pas de fan-out signé pour S.
+    """
+    ctx = getattr(data, "_sf_ctx", None)
+    if ctx is None or not ctx["fanout"]:
+        return {}, None
+
+    axis = np.asarray(axis_global, dtype=np.float32)
+    dz = (np.asarray(mu_pert, dtype=np.float32)
+          - np.asarray(mu_base, dtype=np.float32))
+    role_sign = ctx["role_latent_sign"]
+    t_np = (target_idx.cpu().numpy() if isinstance(target_idx, torch.Tensor)
+            else np.asarray(target_idx))
+    src_set = set(int(s) for s in t_np)
+
+    dsts, sk, sp = [], [], []
+    for s in src_set:
+        if s in ctx["fanout"]:
+            d, k, p = ctx["fanout"][s]
+            dsts.append(d); sk.append(k); sp.append(p)
+    if not dsts:
+        return {}, None
+    dst = np.concatenate(dsts)
+    sign_known = np.concatenate(sk)
+    sign_pred = np.concatenate(sp)
+
+    proj_t = dz[dst] @ axis                    # (n_edges,) Δz_T · u
+    abs_proj = np.abs(proj_t)
+    role_lat = role_sign[dst]                  # sgn(role) latent
+
+    def _score(role_vec, sign_vec):
+        align = role_vec * sign_vec            # ∈ {−1,0,+1}
+        readout = float((abs_proj * align).sum())
+        n = int((align != 0).sum())
+        coherence = float(abs(align.sum()) / n) if n else 0.0
+        return readout, coherence, n
+
+    ro_lat_pred, coh_lat_pred, n_eff = _score(role_lat, sign_pred)
+    ro_lat_known, coh_lat_known, _ = _score(role_lat, sign_known)
+
+    n_fanout = int(dst.size)
+    pred_known_agree = (float((sign_pred == sign_known).mean())
+                        if n_fanout else None)
+
+    # Scalaires in-perturbation = APERÇU role_latent uniquement (pas de
+    # role_pert, qui est report-side). Suffixe `_latent` explicite : aucun
+    # « signed_readout » headline (cf. décision 2026-06-09, design_log
+    # §14bis.6quatervicies — role_latent n'est qu'un des 3 rôles, et pas le
+    # meilleur). Les scores autoritatifs (3 rôles + flag) sont dans
+    # cross_seed_gene_ranking.tsv via perturb_report.
+    scalars = {
+        "signed_fanout_n": n_fanout,
+        "signed_readout_latent": ro_lat_pred,        # rôle latent × signe appris
+        "signed_coherence_latent": coh_lat_pred,
+        "signed_coherence_latent_knownsign": coh_lat_known,  # × signe curé
+        "signed_pred_known_agree": pred_known_agree,
+        "signed_has_bilinear": bool(ctx["has_bilinear"]),
+    }
+
+    if de_role_sign is not None:
+        role_de = np.asarray(de_role_sign, dtype=np.float32)[dst]
+        ro_de_pred, coh_de_pred, _ = _score(role_de, sign_pred)
+        scalars["signed_readout_de"] = ro_de_pred
+        scalars["signed_coherence_de"] = coh_de_pred
+        # Concordance des deux rôles là où les deux sont définis.
+        both = (role_lat != 0) & (role_de != 0)
+        scalars["signed_role_latde_agree"] = (
+            float((role_lat[both] == role_de[both]).mean())
+            if both.any() else None)
+
+    table = None
+    if return_table:
+        src_col = np.concatenate([
+            np.full(len(ctx["fanout"][s][0]), s, dtype=np.int64)
+            for s in src_set if s in ctx["fanout"]])
+        gene_symbols = None  # rempli par l'appelant si besoin
+        table = pd.DataFrame({
+            "source_idx": src_col,
+            "target_idx": dst,
+            "sign_known": sign_known,
+            "sign_pred": sign_pred,
+            "proj_target": proj_t,
+            "abs_proj_target": abs_proj,
+            "role_latent_sign": role_lat,
+        })
+    return scalars, table
+
+
+# --------------------------------------------------------------------------- #
 # Run loader.
 # --------------------------------------------------------------------------- #
-def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
+def resolve_device(device: str = "auto") -> "torch.device":
+    """'auto' → cuda si dispo sinon cpu ; 'cuda'/'cpu' forcés."""
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        print("[device] cuda demandé mais indisponible → fallback cpu.")
+        device = "cpu"
+    print(f"[device] perturbation sur {device}"
+          + (f" ({torch.cuda.get_device_name(0)})" if device == "cuda" else ""))
+    return torch.device(device)
+
+
+def load_run(run_dir: Path, hidden, latent, n_layers, n_heads, device="cpu"):
     data = torch.load(run_dir / "hetero_graph_vgae.pt", weights_only=False)
     baseline = pd.read_csv(run_dir / "gene_ranking_vgae.csv")
     emb_df = pd.read_csv(run_dir / "gene_embeddings_vgae.csv", index_col=0)
@@ -1012,6 +1281,12 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
         print(f"  [load_run] V5.3 backward-compat : signed_proj initialisé "
               f"à identité (checkpoint V5.1/V5.2 sans signed_proj).")
     model.eval()
+    # GPU si demandé (data + model sur le device ; mu ramené en .cpu().numpy()
+    # dans compute_importance/encode → reste compatible avec le readout numpy).
+    dev = resolve_device(device) if isinstance(device, str) else device
+    if dev.type != "cpu":
+        data = data.to(dev)
+        model = model.to(dev)
     return data, model, gene_symbols, gene_to_idx, baseline, group_expr
 
 
@@ -1019,7 +1294,8 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads):
 # Reusable API — called both by main() and by perturb_top_genes.py (--all-*).
 # --------------------------------------------------------------------------- #
 def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None,
-                     quiescent_groups=None, p16_groups=None):
+                     quiescent_groups=None, p16_groups=None,
+                     effector_axis_genes=None):
     """Compute the baseline once; reused across many perturbations.
 
     Args:
@@ -1068,7 +1344,8 @@ def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None,
             mu_base, group_expr, gene_symbols,
             p16_groups=tuple(p16_groups),
             quiescent_groups=(tuple(quiescent_groups)
-                              if quiescent_groups is not None else None))
+                              if quiescent_groups is not None else None),
+            effector_axis_genes=effector_axis_genes)
         print(f"  axis_global ‖·‖ pre-unit = {np.linalg.norm(axis_global):.4f} "
               f"(1.0 attendu post-normalisation)")
     else:
@@ -1161,6 +1438,22 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
             mu_base, mu_pert, group_expr, gene_symbols, target_idx,
             axis_global, axes_cluster,
             target_degree=target_degree)
+
+    # --- Readout SIGNÉ (Solution A signée, §8.A / §9.2) : pondère chaque
+    # cible du fan-out signé de S par rôle_cible × signe_S→T → ne s'annule
+    # plus. Contexte (rôle au repos + signes prédits) calculé une seule fois,
+    # mis en cache sur `data`. DE-free par défaut ; rôle DE optionnel si
+    # `data._de_role_sign` a été attaché par l'appelant.
+    signed_scalars, signed_table = {}, None
+    _collect_fanout = bool(getattr(data, "_collect_signed_fanout", False))
+    if axis_global is not None:
+        if getattr(data, "_sf_ctx", None) is None:
+            precompute_signed_fanout_context(model, data, mu_base, axis_global)
+        signed_scalars, signed_table = signed_fanout_scalars(
+            data, mu_base, mu_pert, target_idx, axis_global,
+            de_role_sign=getattr(data, "_de_role_sign", None),
+            return_table=(_collect_fanout
+                          or (out_dir is not None and write_full)))
 
     delta_rank = base_rank - pert_rank
     delta_imp = pert_imp - base_imp
@@ -1279,6 +1572,25 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
                 summary[f"{out_name}_group"] = f"{row['group']}/{row['axis_type']}"
                 summary[out_name] = float(row[key])
 
+    # --- Readout signé : scalaires par source (fan-out 1-hop). Plats →
+    # consommables tels quels par flatten_summary / perturb_report.
+    if signed_scalars:
+        summary.update(signed_scalars)
+
+    # Table long-format par cible pour accumulation batch (mode all-genes) :
+    # primitives d'arête uniquement (les rôles = propriétés cible jointes
+    # côté report). Mappée en symboles ici, `mode` ajouté pour l'agrégation.
+    if _collect_fanout and signed_table is not None and len(signed_table) > 0:
+        t = signed_table
+        summary["_signed_fanout_rows"] = {
+            "source": gene_symbols[t["source_idx"].to_numpy()].tolist(),
+            "target": gene_symbols[t["target_idx"].to_numpy()].tolist(),
+            "sign_known": t["sign_known"].to_numpy().tolist(),
+            "sign_pred": t["sign_pred"].to_numpy().tolist(),
+            "proj_target": t["proj_target"].to_numpy().tolist(),
+            "role_latent_sign": t["role_latent_sign"].to_numpy().tolist(),
+        }
+
     if include_details:
         # Keep per-target ORA with p_adj (up to top_k, filter irrelevant ones
         # with p_adj > 0.5 to keep the payload bounded).
@@ -1327,6 +1639,12 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
                 shift_proj_df.to_csv(
                     out_dir / "cell_group_shift_projected.tsv",
                     sep="\t", index=False)
+            if signed_table is not None and len(signed_table) > 0:
+                tbl = signed_table.copy()
+                tbl.insert(0, "source", gene_symbols[tbl["source_idx"].to_numpy()])
+                tbl.insert(2, "target", gene_symbols[tbl["target_idx"].to_numpy()])
+                tbl.drop(columns=["source_idx", "target_idx"], inplace=True)
+                tbl.to_csv(out_dir / "signed_fanout.tsv", sep="\t", index=False)
             write_tsv(rows, out_dir / "delta_ora_top_up_reactome.tsv")
     return summary
 

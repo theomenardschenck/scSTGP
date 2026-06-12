@@ -21,6 +21,12 @@ supported, selected by mutually-exclusive CLI flags:
     ``cross_seed_drivers.tsv``, ``cross_seed_gene_ranking.tsv`` and a
     dedicated figure set into the version-level ``cross_seed_report/``.
 
+V5.4.1 — ``--driver-canon`` selects how ``driver_score`` aggregates the
+perturbation modes (see ``_canonicalize_modes``): ``aligned`` (default)
+sign-aligns and averages the coherent KO/KD/OE modes (true KO+KD+OE
+scoring, gnn_futur §6.2); ``oe-only`` reproduces the legacy OE-anchored
+behaviour (V3.4–V5.4).
+
 Artifact filter
 ---------------
 Some genes (often lncRNAs / pseudogenes like NPPA-AS1, RP1-140K8.5) move
@@ -86,7 +92,13 @@ Outputs
                                          discovery_score, evidence_tier
                                          (A_confirmed / B_discovery /
                                          C_effector / D_hub / E_noise),
-                                         DE / aging-DB annotations
+                                         DE / aging-DB annotations.
+                                         + colonnes NON-rankantes du readout
+                                         signé (gnn_futur §8.A/§9.2) si des
+                                         *_signed_fanout.tsv sont présents :
+                                         signed_readout / signed_coherence
+                                         (role_pert=cosine_senescent headline)
+                                         + variantes _de / _latent (diagnostic)
     cross_seed_pathway_ranking.tsv    — pathway-level analogue
     cross_seed_*.png                  — robustness, sign stability,
                                          tier distribution, driver figures
@@ -1145,6 +1157,112 @@ def apply_figure_filters(df: pd.DataFrame, args) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def _canonicalize_modes(oe, ko, kd,
+                        mode_agg: str = "aligned"
+                        ) -> tuple[float, float, float]:
+    """Combine the up-to-3 perturbation modes into one canonical
+    ``(sign, diff, cos)`` triple feeding the driver score.
+
+    Two strategies (CLI ``--driver-canon``):
+
+    * ``"oe-only"`` (legacy V3.4–V5.4) — anchor on **OE** (gain-of-function
+      pushes the gene's natural phenotypic direction); fall back to −loss
+      if OE is absent. KO/KD then contribute *only* via ``n_modes``
+      (coverage) and ``sign_cons`` (coherence) downstream. This is what
+      made the score effectively OE-driven (cf. gnn_futur §1.1).
+
+    * ``"aligned"`` (V5.4.1, gnn_futur §6.2) — **sign-align and average all
+      coherent modes**. OE keeps its sign; loss-of-function modes (KO/KD)
+      are flipped (``−diff``, ``−cos``) since a real driver's loss reverses
+      its natural action. A loss mode is **included only if it is coherent**
+      with the OE anchor (opposite raw sign) — this implements
+      "agréger KO+KD+OE si cohérent, sinon KD/OE" (§6.2) : an incoherent
+      KO (e.g. residual topological-shock artefact) is dropped rather than
+      allowed to cancel the signal. If OE is absent (or exactly 0), the
+      available loss modes are flipped to the natural direction and
+      averaged among themselves.
+
+    Note : only ``canon_diff`` / ``canon_cos`` change between strategies.
+    The per-mode ``KO_diff``/``KD_diff``/``OE_diff`` columns are exported
+    separately for transparency, so the aggregation never hides a mode.
+    """
+    def _d(m):
+        return float(m["avg_proj_signed_diff"]) if m is not None else None
+
+    def _c(m):
+        return float(m["avg_proj_signed_cosine"]) if m is not None else None
+
+    if mode_agg == "oe-only":
+        if oe is not None:
+            d, c = _d(oe), _c(oe)
+            return float(np.sign(d)), d, c
+        loss = ko if ko is not None else kd
+        if loss is not None:
+            d, c = _d(loss), _c(loss)
+            return float(-np.sign(d)), -d, -c
+        return 0.0, 0.0, 0.0
+
+    # mode_agg == "aligned" : sign-aligned mean over coherent modes.
+    diffs: list[float] = []
+    coss: list[float] = []
+    oe_d = _d(oe)
+    if oe is not None and oe_d != 0.0:
+        anchor = np.sign(oe_d)
+        diffs.append(oe_d)
+        coss.append(_c(oe))
+        for m in (ko, kd):
+            if m is None:
+                continue
+            md = _d(m)
+            if np.sign(md) == -anchor:        # loss opposes gain → coherent
+                diffs.append(-md)
+                coss.append(-_c(m))
+    else:
+        for m in (ko, kd):                    # no usable OE → loss-anchored
+            if m is None:
+                continue
+            diffs.append(-_d(m))
+            coss.append(-_c(m))
+    if not diffs:
+        return 0.0, 0.0, 0.0
+    canon_diff = float(np.mean(diffs))
+    canon_cos = float(np.mean(coss))
+    return float(np.sign(canon_diff)), canon_diff, canon_cos
+
+
+def _canon_metric(oe, ko, kd, col: str, mode_agg: str = "aligned") -> float:
+    """Aligned-mean of an arbitrary per-mode metric column, with the same
+    OE-anchored coherence rule as ``_canonicalize_modes`` (loss modes are
+    included only if their diff opposes OE, and sign-flipped). Used for the
+    visible degree-weighted diagnostic columns (e.g. amplitude). For
+    ``avg_proj_signed_diff`` / ``avg_proj_signed_cosine`` it returns the same
+    value as ``_canonicalize_modes`` — kept separate to canonicalize any
+    metric without touching the main score path."""
+    g = lambda m: float(m[col]) if m is not None else None
+    gd = lambda m: float(m["avg_proj_signed_diff"]) if m is not None else None
+    if mode_agg == "oe-only":
+        if oe is not None:
+            return g(oe)
+        loss = ko if ko is not None else kd
+        return -g(loss) if loss is not None else 0.0
+    vals: list[float] = []
+    oed = gd(oe)
+    if oe is not None and oed != 0.0:
+        anchor = np.sign(oed)
+        vals.append(g(oe))
+        for m in (ko, kd):
+            if m is None:
+                continue
+            if np.sign(gd(m)) == -anchor:
+                vals.append(-g(m))
+    else:
+        for m in (ko, kd):
+            if m is None:
+                continue
+            vals.append(-g(m))
+    return float(np.mean(vals)) if vals else 0.0
+
+
 def _compute_driver_score(canon_diff: float, canon_cos: float, n_modes: int,
                            sign_cons: bool | None, hub: bool,
                            vgae_rank: int | None = None,
@@ -1658,7 +1776,8 @@ def _pathway_interpretation(canon_diff: float, canon_cos: float,
 
 def build_pathway_ranking(df: pd.DataFrame,
                            min_robustness: float = 0.7,
-                           min_stability: float = 0.7) -> pd.DataFrame:
+                           min_stability: float = 0.7,
+                           mode_agg: str = "aligned") -> pd.DataFrame:
     """Per-pathway cross-mode ranking (pathways only).
 
     Mirrors `build_gene_ranking` but on the is_pathway==True subset and
@@ -1692,19 +1811,9 @@ def build_pathway_ranking(df: pd.DataFrame,
         mean_stability = float(sub["direction_stability"].mean())
         any_hub = bool(sub["is_hub_inflated"].any())
 
-        # Canonical direction = sign of OE (gain pushes natural direction).
-        if oe is not None:
-            canon_sign = float(np.sign(oe["avg_proj_signed_diff"]))
-            canon_diff = float(oe["avg_proj_signed_diff"])
-            canon_cos = float(oe["avg_proj_signed_cosine"])
-        elif loss is not None:
-            canon_sign = float(-np.sign(loss["avg_proj_signed_diff"]))
-            canon_diff = float(-loss["avg_proj_signed_diff"])
-            canon_cos = float(-loss["avg_proj_signed_cosine"])
-        else:
-            canon_sign = 0.0
-            canon_diff = 0.0
-            canon_cos = 0.0
+        # Canonical (sign, diff, cos) over modes (see _canonicalize_modes).
+        canon_sign, canon_diff, canon_cos = _canonicalize_modes(
+            oe, ko, kd, mode_agg=mode_agg)
 
         if canon_sign > 0:
             direction = "pro-senescence"
@@ -1953,6 +2062,146 @@ def _load_de_magnitude(de_path: Path) -> pd.DataFrame:
     }).dropna(subset=["de_log2fc_p4_vs_p16", "de_neglog10_padj"])
     out = out.drop_duplicates(subset="gene", keep="first").set_index("gene")
     return out
+
+
+def _resolve_signed_fanout_paths(args, seed_paths: list[Path]) -> list[Path]:
+    """Résout les tables long-format du readout signé.
+
+    Priorité : ``--signed-fanout`` explicite ; sinon auto-découverte de
+    ``*_signed_fanout.tsv`` à côté des TSV --all dans chaque chemin de seed.
+    """
+    explicit = getattr(args, "signed_fanout", None)
+    if explicit:
+        return [Path(p) for p in explicit if Path(p).exists()]
+    found: list[Path] = []
+    for p in seed_paths or []:
+        if p.is_file():
+            p = p.parent
+        found += sorted(p.glob("*_signed_fanout.tsv"))
+        found += sorted(p.glob("*/*_signed_fanout.tsv"))
+    # Dédup en gardant l'ordre.
+    seen, out = set(), []
+    for f in found:
+        if f not in seen:
+            seen.add(f); out.append(f)
+    return out
+
+
+def _aggregate_signed_fanout(fanout_paths: list[Path]) -> pd.DataFrame:
+    """Concatène + replie par (source, target) les tables long-format du
+    readout signé (``*_signed_fanout.tsv``) sur seeds & modes.
+
+    La direction du readout ne dépend que de role × sign (invariants
+    mode/seed) ; seul ``|proj_target|`` varie par mode (OE > KO/KD) → on
+    moyenne ``|proj|`` et on prend le signe MAJORITAIRE de ``sign_pred`` /
+    ``sign_known`` cross-seed. Une ligne par arête (source, target).
+    """
+    frames = []
+    for p in fanout_paths:
+        try:
+            frames.append(pd.read_csv(p, sep="\t"))
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] signed-fanout illisible {p} : {e}")
+    if not frames:
+        return pd.DataFrame()
+    f = pd.concat(frames, ignore_index=True)
+    f["abs_proj"] = f["proj_target"].abs()
+    agg = f.groupby(["source", "target"], sort=False).agg(
+        abs_proj=("abs_proj", "mean"),
+        sign_pred=("sign_pred", lambda s: float(np.sign(s.mean()))),
+        sign_known=("sign_known", lambda s: float(np.sign(s.mean()))),
+        role_latent=("role_latent_sign", lambda s: float(np.sign(s.mean()))),
+        n_obs=("abs_proj", "size"),
+    ).reset_index()
+    return agg
+
+
+def compute_signed_readout_columns(fanout_agg: pd.DataFrame,
+                                   role_pert_map: dict,
+                                   de_role_map: dict | None = None
+                                   ) -> pd.DataFrame:
+    """Readout signé + cohérence de fan-out par source (gnn_futur §8.A / §9.2).
+
+    Pour chaque source S et chaque cible T de son fan-out signé 1-hop :
+        contrib(T) = |proj_T| · sgn(role_T) · sign_pred_{S→T}
+    readout(S)   = Σ_T contrib(T)   (>0 pro-sén, <0 anti-sén ; degré-chargé)
+    coherence(S) = |Σ_T sgn(role_T)·sign_pred| / N_T  ∈ [0,1]  (degree-free)
+
+    Inhiber-un-pro-sén (−·−) et activer-un-anti-sén (+·+→ via sign) reçoivent
+    le même signe → s'additionnent au lieu de s'annuler (cf. driver_score).
+
+    Trois sources de rôle de la CIBLE, **en colonnes séparées, AUCUNE
+    headline** (décision 2026-06-09 : comparatif n=19 gènes à rôle connu →
+    role_de 16/19, role_latent 15/19, role_pert 10/19 ; aucun uniformément
+    bon, cf. design_log §14bis.6quatervicies). Chaque rôle a un angle mort
+    distinct :
+      * ``role_pert``  = cosine_senescent de T (effet causal) — fiable sur les
+        DRIVERS, **aveugle aux effecteurs** (perturber p16/p21 ne déplace pas
+        l'état car ils sont aval → mauvais signe).
+      * ``role_de``    = signe DE de T — fiable sur effecteurs/marqueurs, **aveugle
+        aux compensatoires** (FHL2 up-en-P16 mais anti-sén → mal étiqueté). =
+        l'objection « marqueur ≠ rôle » §1.4.
+      * ``role_latent``= position au repos latente — biaisée (signe ~uniforme).
+    Le **désaccord role_de↔role_pert** est le signal des cas marqueur/driver
+    (``conflict_frac``). Arbitrage final = validation cross-dataset (§0/§5-2b).
+
+    Returns: DataFrame, colonne ``gene`` = source, readout/coherence × 3 rôles.
+    """
+    if fanout_agg.empty:
+        return pd.DataFrame()
+    a = fanout_agg.copy()
+    a["role_pert"] = a["target"].map(
+        lambda t: float(np.sign(role_pert_map[t]))
+        if role_pert_map.get(t) is not None
+        and np.isfinite(role_pert_map.get(t, np.nan)) else np.nan)
+    if de_role_map is not None:
+        a["role_de"] = a["target"].map(
+            lambda t: float(de_role_map.get(t, np.nan)))
+    else:
+        a["role_de"] = np.nan
+
+    def _score(sub: pd.DataFrame, role_col: str, sign_col: str = "sign_pred"):
+        role = sub[role_col].to_numpy(dtype=float)
+        sp = sub[sign_col].to_numpy(dtype=float)
+        ap = sub["abs_proj"].to_numpy(dtype=float)
+        valid = np.isfinite(role) & (role != 0) & (sp != 0)
+        n = int(valid.sum())
+        if n == 0:
+            return np.nan, np.nan, 0
+        align = np.sign(role[valid]) * sp[valid]
+        return float((ap[valid] * align).sum()), float(abs(align.sum()) / n), n
+
+    rows = []
+    for src, sub in a.groupby("source", sort=False):
+        ro_p, coh_p, n_p = _score(sub, "role_pert")
+        ro_l, coh_l, _ = _score(sub, "role_latent")
+        # Fraction des cibles où role_de et role_pert se contredisent (= cibles
+        # marqueur/driver-ambiguës dans le fan-out de S, type FHL2).
+        rp = sub["role_pert"].to_numpy(dtype=float)
+        rd = sub["role_de"].to_numpy(dtype=float)
+        both = np.isfinite(rp) & np.isfinite(rd) & (rp != 0) & (rd != 0)
+        conflict_frac = (float((np.sign(rp[both]) != np.sign(rd[both])).mean())
+                         if both.any() else np.nan)
+        rec = {
+            "gene": src,
+            "signed_fanout_n": int(len(sub)),
+            # 3 rôles symétriques — AUCUN headline (cf. docstring).
+            "signed_readout_pert": ro_p,
+            "signed_coherence_pert": coh_p,
+            "signed_n_role_pert": n_p,
+            "signed_readout_latent": ro_l,
+            "signed_coherence_latent": coh_l,
+            "signed_fanout_conflict_frac": conflict_frac,
+            "signed_pred_known_agree": float(
+                (sub["sign_pred"] == sub["sign_known"]).mean()),
+        }
+        if de_role_map is not None:
+            ro_d, coh_d, n_d = _score(sub, "role_de")
+            rec["signed_readout_de"] = ro_d
+            rec["signed_coherence_de"] = coh_d
+            rec["signed_n_role_de"] = n_d
+        rows.append(rec)
+    return pd.DataFrame(rows)
 
 
 def _compute_evidence_tier(driver_score: float,
@@ -2224,7 +2473,9 @@ def build_gene_ranking(df: pd.DataFrame,
                         de_top_n: int = 1000,
                         is_tf_series: pd.Series | None = None,
                         gene_to_pathways: dict | None = None,
-                        de_magnitude: pd.DataFrame | None = None) -> pd.DataFrame:
+                        de_magnitude: pd.DataFrame | None = None,
+                        mode_agg: str = "aligned",
+                        coexpr_degree_map: dict | None = None) -> pd.DataFrame:
     """Per-gene cross-mode ranking (genes only).
 
     For each gene, aggregates the up to 3 perturbation modes (KO/KD/OE)
@@ -2285,21 +2536,17 @@ def build_gene_ranking(df: pd.DataFrame,
         else:
             any_low_purity = False
 
-        # Canonical direction = sign of OE (gain-of-function pushes the natural
-        # phenotypic direction the gene supports). If OE is absent, use
-        # −sign(loss) since loss reverses the gene's natural action.
-        if oe is not None:
-            canon_sign = float(np.sign(oe["avg_proj_signed_diff"]))
-            canon_diff = float(oe["avg_proj_signed_diff"])
-            canon_cos = float(oe["avg_proj_signed_cosine"])
-        elif loss is not None:
-            canon_sign = float(-np.sign(loss["avg_proj_signed_diff"]))
-            canon_diff = float(-loss["avg_proj_signed_diff"])
-            canon_cos = float(-loss["avg_proj_signed_cosine"])
-        else:
-            canon_sign = 0.0
-            canon_diff = 0.0
-            canon_cos = 0.0
+        # Canonical (sign, diff, cos) over the available modes. With
+        # mode_agg="oe-only" this is OE-anchored (legacy). With
+        # mode_agg="aligned" (default, §6.2) KO/KD are sign-aligned and
+        # averaged with OE when coherent → driver_score becomes KO+KD+OE.
+        canon_sign, canon_diff, canon_cos = _canonicalize_modes(
+            oe, ko, kd, mode_agg=mode_agg)
+        # Canonical amplitude (hub-corrected directional fraction ∈[−1,1]) —
+        # only for the VISIBLE degree-weighted diagnostic columns below, not
+        # for driver_score. See gnn_futur §7.11.
+        canon_amp = _canon_metric(oe, ko, kd, "avg_proj_signed_amplitude",
+                                  mode_agg=mode_agg)
 
         if canon_sign > 0:
             direction = "pro-senescence"
@@ -2456,6 +2703,7 @@ def build_gene_ranking(df: pd.DataFrame,
             # Canonical metrics (signed by OE if present, else by −loss).
             "canon_diff": round(canon_diff, 1),
             "canon_cosine": round(canon_cos, 3),
+            "canon_amplitude": round(canon_amp, 3),
             "max_abs_diff": round(max_abs_diff, 1),
             "max_abs_cosine": round(max_abs_cos, 3),
             "mean_abs_extent": round(mean_extent, 4),
@@ -2492,6 +2740,35 @@ def build_gene_ranking(df: pd.DataFrame,
         rows.append(rec)
 
     out = pd.DataFrame(rows)
+
+    # --- Degree-weighted DIAGNOSTIC columns (V5.4.1, visible, NON-ranking) ---
+    # Aucune ne pilote le tri (toujours `driver_score`). Elles exposent la
+    # même information sous différentes corrections de degré pour suivre
+    # l'évolution des scores cross-ablation/version (gnn_futur §7.11, §5).
+    # Rappel des conclusions : `diff×cos` aggrave le biais PPI ; `amplitude`
+    # ≈ pureté (perd la force) ; `diff/PPIdeg` laisse le hub coexpr ;
+    # `diff/(PPI+coexpr)` peut sur-corriger. → diagnostic, pas décision.
+    if not out.empty:
+        def _p99norm(x: pd.Series) -> pd.Series:
+            lx = np.log10(x.abs() + 1.0)
+            p = float(np.nanpercentile(lx, 99))
+            return (lx / (p + 1e-9)).clip(0.0, 1.0)
+
+        purity = out["canon_cosine"].abs()
+        ppideg = out["target_ppi_degree"].clip(lower=1)
+        out["coexpr_degree"] = (out["target"].map(coexpr_degree_map).fillna(0.0)
+                                if coexpr_degree_map else np.nan)
+        # force × pureté (degré-biaisé PPI)
+        out["ds_diffcos"] = (_p99norm(out["canon_diff"]) * purity).round(4)
+        # pureté directionnelle seule (≈ cosinus, degree-free total)
+        out["ds_amp"] = out["canon_amplitude"].abs().round(4)
+        # force/degré PPI × pureté (dé-biaise le hub PPI, laisse le hub coexpr)
+        out["ds_ppideg"] = (_p99norm(out["canon_diff"] / ppideg) * purity).round(4)
+        # force/(degré PPI+coexpr) × pureté (si coexpr_degree fourni)
+        if coexpr_degree_map:
+            totdeg = (out["target_ppi_degree"] + out["coexpr_degree"]).clip(lower=1)
+            out["ds_totdeg"] = (_p99norm(out["canon_diff"] / totdeg) * purity).round(4)
+
     # V3.4 : do NOT filter. Quality issues (low robustness/stability,
     # hub-inflated, incoherent, low-PPI) are surfaced in the
     # `interpretation` column as `[unreliable]`, `[hub-inflated]`,
@@ -3218,6 +3495,7 @@ def run_cross_seed(args) -> None:
         df,
         min_robustness=args.gene_ranking_min_robustness,
         min_stability=args.gene_ranking_min_stability,
+        mode_agg=args.driver_canon,
     )
     reactome = _load_reactome_pathways()
     gene_to_pathways = _build_gene_to_strong_pathways(
@@ -3225,6 +3503,21 @@ def run_cross_seed(args) -> None:
     # V3.4 : the per-gene ranking sees ALL rows (df_all), not just the
     # robust ones. Quality is encoded via [unreliable]/[hub-inflated]/
     # [incoherent] prefixes in `interpretation`.
+    # Optional coexpr degree map for the VISIBLE diagnostic columns
+    # (coexpr_degree, ds_totdeg). Built from a coexpr edge TSV (TF, target).
+    coexpr_degree_map = None
+    if getattr(args, "coexpr_degree_file", None) is not None:
+        try:
+            _cx = pd.read_csv(args.coexpr_degree_file, sep="\t",
+                              usecols=["TF", "target"])
+            _deg = pd.concat([_cx["TF"], _cx["target"]]).value_counts()
+            coexpr_degree_map = _deg.to_dict()
+            print(f"[INFO] coexpr_degree from {args.coexpr_degree_file.name} "
+                  f"({len(coexpr_degree_map)} genes) → ds_totdeg enabled.")
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] could not load --coexpr-degree-file "
+                  f"({e}); ds_totdeg/coexpr_degree skipped.")
+
     gene_rank = build_gene_ranking(
         df_all,
         min_robustness=args.gene_ranking_min_robustness,
@@ -3235,7 +3528,53 @@ def run_cross_seed(args) -> None:
         is_tf_series=is_tf_series,
         gene_to_pathways=gene_to_pathways,
         de_magnitude=de_magnitude,
+        mode_agg=args.driver_canon,
+        coexpr_degree_map=coexpr_degree_map,
     )
+
+    # --- Readout signé (gnn_futur §8.A / §9.2) : colonnes NON-rankantes
+    # (tri driver_score inchangé). 3 rôles de cible SANS headline (role_pert
+    # /role_de/role_latent ont chacun un angle mort, cf. §14bis.6quatervicies) ;
+    # arbitrage = cross-dataset. role_de optionnel via --de-magnitude-csv.
+    if not gene_rank.empty:
+        # Rôle DE par gène (signe corrigé : +1 = logFC>0 = up-P16 = pro-sén).
+        de_role_map = None
+        if de_magnitude is not None and not de_magnitude.empty:
+            _ds = int(getattr(args, "signed_de_sign", 1))
+            de_role_map = {
+                str(g): _ds * float(np.sign(v))
+                for g, v in de_magnitude["de_log2fc_p4_vs_p16"].items()
+                if np.isfinite(v) and v != 0}
+
+        # Flag par gène marqueur/driver (FHL2-type) : DE-marqueur vs effet
+        # causal (cosine_senescent) se contredisent. Indépendant du fan-out.
+        if de_role_map is not None and "cosine_senescent" in gene_rank.columns:
+            def _mdc(row):
+                rp = row.get("cosine_senescent")
+                rd = de_role_map.get(str(row["target"]))
+                if rd is None or rp is None or not np.isfinite(rp) or rp == 0:
+                    return False
+                return bool(np.sign(rp) != np.sign(rd))
+            gene_rank["marker_driver_conflict"] = gene_rank.apply(_mdc, axis=1)
+            n_conf = int(gene_rank["marker_driver_conflict"].sum())
+            print(f"[INFO] flag marker_driver_conflict : {n_conf} gènes "
+                  f"(DE-marqueur ≠ effet causal, type FHL2).")
+
+        # Readout signé fan-out (3 rôles) si tables fan-out présentes.
+        fanout_paths = _resolve_signed_fanout_paths(args, kept_paths)
+        if fanout_paths and "cosine_senescent" in gene_rank.columns:
+            fanout_agg = _aggregate_signed_fanout(fanout_paths)
+            if not fanout_agg.empty:
+                role_pert_map = dict(zip(gene_rank["gene"].astype(str),
+                                         gene_rank["cosine_senescent"]))
+                sig_cols = compute_signed_readout_columns(
+                    fanout_agg, role_pert_map, de_role_map)
+                if not sig_cols.empty:
+                    gene_rank = gene_rank.merge(sig_cols, on="gene", how="left")
+                    print(f"[INFO] readout signé : {len(sig_cols)} sources avec "
+                          f"fan-out signé ({len(fanout_paths)} fichier(s)) → "
+                          f"signed_readout_{{pert,de,latent}} + cohérences.")
+
     if not gene_rank.empty:
         # V3.4 : exhaustive ranking — all genes present, quality
         # surfaced via [unreliable]/[hub-inflated]/[incoherent] prefixes
@@ -3329,6 +3668,7 @@ def run_cross_seed(args) -> None:
         df,
         min_robustness=args.gene_ranking_min_robustness,
         min_stability=args.gene_ranking_min_stability,
+        mode_agg=args.driver_canon,
     )
     if not pw_rank.empty:
         pw_rank.to_csv(out_dir / "cross_seed_pathway_ranking.tsv",
@@ -3971,6 +4311,33 @@ def main():
                          "and cross_seed_gene_ranking.tsv from --report-dir "
                          "(or the default cross_seed_report folder) and "
                          "regenerate figures only.")
+    ap.add_argument("--driver-canon", choices=["aligned", "oe-only"],
+                    default="aligned",
+                    help="How driver_score aggregates perturbation modes "
+                         "(gnn_futur §6.2). 'aligned' (default, V5.4.1) : "
+                         "sign-align KO/KD to the OE gain-of-function "
+                         "direction and average the coherent modes → "
+                         "driver_score becomes KO+KD+OE. 'oe-only' (legacy "
+                         "V3.4–V5.4) : anchor on OE alone (KO/KD feed only "
+                         "coverage/coherence). Use 'oe-only' to reproduce "
+                         "pre-V5.4.1 rankings.")
+    ap.add_argument("--coexpr-degree-file", type=Path, default=None,
+                    help="Optionnel (cross-seed) : TSV coexpr (colonnes TF, "
+                         "target — ex. coexpr_diff*.tsv) pour les colonnes "
+                         "diagnostiques VISIBLES `coexpr_degree` + `ds_totdeg` "
+                         "dans cross_seed_gene_ranking.tsv (non-rankantes, "
+                         "gnn_futur §7.11). Absent → ds_totdeg/coexpr_degree omis.")
+    ap.add_argument("--signed-fanout", type=Path, nargs="*", default=None,
+                    help="Optionnel (cross-seed) : tables long-format "
+                         "`*_signed_fanout.tsv` (readout signé §8.A/§9.2). Si "
+                         "omis, auto-découvertes à côté des TSV --all de chaque "
+                         "seed. Produit les colonnes NON-rankantes "
+                         "signed_readout/signed_coherence (role_pert headline) "
+                         "+ variantes _de/_latent dans cross_seed_gene_ranking.tsv.")
+    ap.add_argument("--signed-de-sign", type=int, default=1, choices=[-1, 1],
+                    help="Convention du --de-magnitude-csv pour le rôle DE du "
+                         "readout signé. +1 (DÉFAUT, vérifié : logFC>0 = UP en P16 "
+                         "= pro-sén, CDKN2A +4.3) ; -1 si l'inverse.")
     ap.add_argument("--top-per-side", type=int, default=10,
                     help="For genome-wide / cross-seed bar figures, keep "
                          "the top-N most positive AND top-N most negative "
