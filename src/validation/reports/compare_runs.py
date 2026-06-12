@@ -744,6 +744,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument('--source', default='vgae', choices=sorted(SOURCES.keys()),
                    help='Source de ranking à analyser (défaut: vgae).')
+    p.add_argument('--report-subdir', default=None,
+                   help="(source cross_seed/perturb_*) sous-dossier contenant le "
+                        "cross_seed_gene_ranking.tsv sous <base>/<run>/. Défaut "
+                        "'cross_seed_report' ; passer '' si le TSV est directement "
+                        "dans <base>/<run>/ (layout run_analysis.sh).")
 
     grp = p.add_mutually_exclusive_group()
     grp.add_argument('--auto-discover', action='store_true',
@@ -820,7 +825,13 @@ def main() -> None:
         raise SystemExit(f"❌ Base dir inexistant : {base_dir}")
 
     source_cls = SOURCES[args.source]
-    source = source_cls()  # type: ignore[call-arg]
+    if args.report_subdir is not None:
+        try:
+            source = source_cls(report_subdir=args.report_subdir)  # type: ignore[call-arg]
+        except TypeError:
+            source = source_cls()  # source sans report_subdir (ex. vgae)
+    else:
+        source = source_cls()  # type: ignore[call-arg]
     runs = resolve_runs(args, base_dir, source)
 
     out_dir = Path(args.output_dir) if args.output_dir else base_dir / 'comparison'

@@ -281,6 +281,41 @@ def run_ora(gene_list: set[str],
     return rows
 
 
+def export_for_shinygo(communities: dict, out_dir: Path,
+                       background: set[str] | None = None) -> Path:
+    """Écrit les listes de gènes par communauté + background, prêtes pour
+    **ShinyGO** (http://bioinformatics.sdstate.edu/go/) — cross-check externe
+    indépendant de l'ORA hypergéométrique interne (`run_ora`).
+
+    Args:
+        communities : dict {community_id -> set/iterable de symboles}.
+        out_dir     : dossier de sortie (1 fichier .txt par communauté).
+        background  : univers de gènes (référence ShinyGO). Optionnel.
+
+    Returns: le dossier d'export. Upload manuel : coller chaque
+    `community_<id>.txt` dans ShinyGO, fixer la référence = `background.txt`,
+    puis comparer au `community_summary.tsv` (ORA interne).
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for cid, genes in communities.items():
+        glist = sorted({str(g) for g in genes})
+        (out_dir / f"community_{cid}.txt").write_text("\n".join(glist) + "\n")
+    if background:
+        (out_dir / "background.txt").write_text(
+            "\n".join(sorted(background)) + "\n")
+    (out_dir / "README.txt").write_text(
+        "ShinyGO export — http://bioinformatics.sdstate.edu/go/\n\n"
+        "1 fichier = 1 communauté du latent VGAE (détectées par Louvain).\n"
+        "Procédure : uploader chaque community_<id>.txt ; fixer "
+        "'Background/reference' = background.txt (sinon ShinyGO utilise tout "
+        "le génome → faux positifs). Comparer l'enrichissement ShinyGO au "
+        "community_summary.tsv produit par interpret_embedding.py (ORA "
+        "hypergéométrique interne, mêmes gènes/background). Concordance des "
+        "deux moteurs = robustesse ; divergence = à investiguer.\n")
+    return out_dir
+
+
 def write_tsv(rows: list[OraRow], path: Path) -> None:
     df = pd.DataFrame([
         {"pathway": r.pathway, "k/K": r.k_over_K, "pw_size": r.pw_size,
