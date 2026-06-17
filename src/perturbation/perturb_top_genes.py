@@ -104,7 +104,7 @@ def _find_project_root(start: Path, fallback_levels: int = 1) -> Path:
 
 
 ROOT = _find_project_root(Path(__file__))
-PERTURB_SCRIPT = Path(__file__).resolve().parent / "gnn_perturbation.py"
+PERTURB_SCRIPT = _IMPORT_PATH / "gnn_perturbation.py"   # cf. _IMPORT_PATH : gère nested (src/gnn) + flat (cluster)
 PATHWAY_LIST_DIR = ROOT / "data/pathway_gene_list"
 GMT_PATH = ROOT / "data/databases/c2.cp.reactome.symbols.gmt"
 
@@ -431,7 +431,8 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                   reactome_for_pw: dict | None = None,
                   ko_mode: str = "mask", ko_soft_factor: float = 0.1,
                   kd_factor: float = 0.15, ko_edge_factor: float = 1.0,
-                  legacy: bool = False) -> None:
+                  legacy: bool = False, all_limit: int = 0,
+                  gene_subset: list[str] | None = None) -> None:
     """Perturb every gene in the graph, for each mode, into one TSV per mode.
 
     Output files are `{out_prefix}_{mode}.tsv` (e.g.
@@ -439,9 +440,28 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
     different mode won't overwrite a previous mode's output.
     """
     gene_symbols = ctx["gene_symbols"]
-    n_total = len(gene_symbols) * len(modes)
-    print(f"\n[ALL GENES] {len(gene_symbols)} genes × {len(modes)} modes "
-          f"= {n_total} perturbations.")
+    # Sélection des gènes À PERTURBER (la boucle). N'altère JAMAIS l'indexation ni
+    # l'axe, qui gardent gene_symbols complet :
+    #   * gene_subset : liste choisie (--genes-file/--extra-genes) → test ciblé
+    #     in-process avec l'axe DE (concordance drivers). Filtrée sur le graphe.
+    #   * all_limit   : cap DEBUG préfixe (smoke-test).
+    if gene_subset:
+        in_graph = set(gene_symbols)
+        perturb_genes = [g for g in gene_subset if g in in_graph]
+        missing = [g for g in gene_subset if g not in in_graph]
+        note = f" (SUBSET {len(perturb_genes)}/{len(gene_subset)} dans le graphe)"
+        if missing:
+            print(f"  [subset] {len(missing)} hors-graphe ignorés : "
+                  f"{', '.join(missing[:10])}{'…' if len(missing) > 10 else ''}")
+    elif all_limit and all_limit > 0:
+        perturb_genes = gene_symbols[:all_limit]
+        note = f" (LIMIT {all_limit}/{len(gene_symbols)})"
+    else:
+        perturb_genes = gene_symbols
+        note = ""
+    n_total = len(perturb_genes) * len(modes)
+    print(f"\n[ALL GENES] {len(perturb_genes)} genes × {len(modes)} modes "
+          f"= {n_total} perturbations.{note}")
 
     rows_by_mode: dict[str, list[dict]] = {m: [] for m in modes}
     out_by_mode = {m: out_prefix.with_name(f"{out_prefix.name}_{m}.tsv")
@@ -455,9 +475,13 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
     fanout_cols = ("source", "target", "mode", "sign_known", "sign_pred",
                    "proj_target", "role_latent_sign")
     fanout_rows: dict[str, list] = {c: [] for c in fanout_cols}
-    out_fanout = out_prefix.with_name(f"{out_prefix.name}_signed_fanout.tsv")
+    # Tag mode si on ne lance PAS les 3 modes ensemble (ex. jobs SLURM par mode)
+    # → évite que des runs concurrents écrasent le même _signed_fanout.tsv.
+    _all3 = {"knockout", "knockdown", "overexpress"}
+    _ftag = "" if set(modes) >= _all3 else "_" + "_".join(modes)
+    out_fanout = out_prefix.with_name(f"{out_prefix.name}_signed_fanout{_ftag}.tsv")
     done = 0
-    for gene in gene_symbols:
+    for gene in perturb_genes:
         for mode in modes:
             factor = oe_factor if mode == "overexpress" else None
             summary = _run_perturbation_compat(
@@ -731,6 +755,9 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="Re-run even if summary.json already exists.")
     # --- ALL mode ---
+    ap.add_argument("--all-limit", type=int, default=0,
+                    help="DEBUG : cap le nombre de gènes perturbés en mode "
+                         "--all-genes (0=tous). Smoke-test du chemin axe-DE.")
     ap.add_argument("--all-genes", action="store_true",
                     help="Perturb EVERY gene in the graph (in-process). "
                          "Output: one aggregated TSV, no per-target folder.")
@@ -838,15 +865,19 @@ def main():
                                        de_file=args.de_file, de_sign=args.de_sign,
                                        effector_axis_genes=_eff, device=args.device)
         _suffix = args.out_suffix  # "" si non fourni → comportement V3 inchangé
+        # Subset in-process (--genes-file/--extra-genes) : perturbe une liste
+        # choisie AVEC l'axe DE (test concordance). Sinon None → tous les gènes.
+        _subset = load_extra_genes(args.genes_file, args.extra_genes) or None
         if args.all_genes:
             run_all_genes(ctx, modes, args.oe_factor,
                           args.top_k, args.fdr,
                           out_prefix=run_dir / f"perturbation_all_genes{_suffix}",
+                          gene_subset=_subset,
                           ko_mode=args.ko_mode,
                           ko_soft_factor=args.ko_soft_factor,
                           kd_factor=args.kd_factor,
                           ko_edge_factor=args.ko_edge_factor,
-                          legacy=args.legacy)
+                          legacy=args.legacy, all_limit=args.all_limit)
         if args.all_pathways:
             run_all_pathways(ctx, modes, args.oe_factor,
                              args.top_k, args.fdr,
