@@ -116,6 +116,16 @@
 
 set -euo pipefail
 
+# Shebang bash robuste pour les jobs (GLiCID/Guix : `/usr/bin/env bash` n'est
+# PAS résolu côté nœud, `/bin/bash` absent). Le corps des jobs utilise des
+# tableaux/`[[ ]]` bash → on bake le chemin absolu résolu sur le frontal (FS
+# partagé ⇒ valide sur les nœuds). Override : env BASH_BIN.
+BASH_BIN="${BASH_BIN:-$(command -v bash || true)}"
+# Guix : déréférencer le symlink de profil (node-local) vers le vrai chemin
+# /gnu/store/… partagé sur tous les nœuds (sinon `bad interpreter` côté calcul).
+[[ -n "$BASH_BIN" ]] && BASH_BIN="$(readlink -f "$BASH_BIN" 2>/dev/null || echo "$BASH_BIN")"
+[[ -z "$BASH_BIN" ]] && BASH_BIN="/bin/bash"
+
 # --- Paramètres par défaut --------------------------------------------------
 DEFAULT_SEEDS=(1 2 3)
 VERSION="V5.4"
@@ -717,7 +727,7 @@ fi
 # --- Génération sbatch -----------------------------------------------------
 SBATCH_SCRIPT="$LOG_DIR/sbatch_ablation.sh"
 cat > "$SBATCH_SCRIPT" <<EOF
-#!/usr/bin/env bash
+#!${BASH_BIN}
 #SBATCH --job-name=vgae_${VERSION}_${ABL_SLUG}
 #SBATCH --comment="VGAE ablation ${VERSION} ${ABL_SLUG}"
 #SBATCH --output=$LOG_DIR/%x_%A_%a.out
@@ -732,12 +742,15 @@ cat > "$SBATCH_SCRIPT" <<EOF
 
 set -euo pipefail
 
+# GLiCID/Guix : PATH minimal sur le nœud → bake le PATH du frontal (python3 etc.)
+export PATH="$PATH"
+
 cd "$PROJECT_DIR"
 
-LINE=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$CONFIGS_FILE")
-TAG=\$(echo "\$LINE" | cut -f1)
-SEED=\$(echo "\$LINE" | cut -f2)
-FLAGS=\$(echo "\$LINE" | cut -f3)
+# Lecture ligne + split TSV via builtins bash (pas de sed/cut sur le nœud).
+mapfile -t _CFG_LINES < "$CONFIGS_FILE"
+LINE="\${_CFG_LINES[\$SLURM_ARRAY_TASK_ID]}"
+IFS=\$'\t' read -r TAG SEED FLAGS <<< "\$LINE"
 RUN_TAG="\${TAG}.s\${SEED}"
 
 echo "[\$(date +%T)] task \$SLURM_ARRAY_TASK_ID : tag=\$TAG seed=\$SEED run_tag=\$RUN_TAG"
