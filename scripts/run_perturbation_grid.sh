@@ -5,12 +5,15 @@
 # Découvre les run_dirs entraînés (auto-discovery via glob) et soumet UN job
 # array sbatch — le cluster gère le parallélisme.
 #
-# Nouveauté V4 : --axis {v3,v4,both} pour basculer l'axe de sénescence
-# entre P4-only (V3.x) et P4+P16_cluster_0 (V4 — c0 quiescent-like, cf.
-# §V4 du rapport). Avec --axis both, chaque run est perturbé deux fois
-# avec des fichiers de sortie distincts (--out-suffix) → permet de
-# comparer V3.7 (= baseline + axe V4) à V3.6 (= baseline + axe V3) sur le
-# MÊME modèle entraîné.
+# --axis {v3,v4,both,effector} bascule l'axe de sénescence :
+#   v3       : P4-only (axe V3.x)                       → suffixe vide (legacy)
+#   v4       : P4+P16_cluster_0 (c0 quiescent-like)     → _axisV4
+#   both     : v3 ET v4 (2 perturbations / run, fichiers distincts)
+#   effector : axe effecteur-ancré unit(μ[pro]−μ[anti]) → _axisEffector
+#              (référence causale stable, ne pivote pas avec les hyperparams,
+#               cf. gnn_futur §2.2/§7.8 ; pôles via env EFFECTOR_PRO/ANTI).
+# Avec --axis both, chaque run est perturbé deux fois (--out-suffix distinct)
+# → compare V3.7 (axe V4) à V3.6 (axe V3) sur le MÊME modèle entraîné.
 #
 # Usage typique post-V4 :
 #   bash scripts/run_perturbation_grid.sh \\
@@ -35,6 +38,7 @@
 #
 # Usage générique :
 #   bash scripts/run_perturbation_grid.sh                          # axe V3 (legacy)
+#   bash scripts/run_perturbation_grid.sh --axis effector --pattern '<base>/v5.4.*.s*'
 #   bash scripts/run_perturbation_grid.sh --modes "knockout knockdown overexpress"
 #   bash scripts/run_perturbation_grid.sh --runs "V3.3_Run1 V3.3_Run2"
 #   bash scripts/run_perturbation_grid.sh --pattern '<base>/no-humess.s*'
@@ -49,6 +53,18 @@
 # =============================================================================
 
 set -euo pipefail
+
+# Shebang bash robuste pour les jobs (GLiCID/Guix : `/usr/bin/env bash` n'est
+# PAS résolu côté nœud de calcul, et `/bin/bash` est absent — seul `/bin/sh`
+# existe). Le corps des jobs utilise des tableaux bash → on bake le chemin
+# absolu de bash résolu sur le frontal (FS partagé Guix/scratch ⇒ valide sur
+# les nœuds). Override : env BASH_BIN.
+BASH_BIN="${BASH_BIN:-$(command -v bash || true)}"
+# Guix : déréférencer le symlink de profil (node-local, ex.
+# /run/current-system/profile/bin/bash) vers le vrai chemin /gnu/store/… qui,
+# lui, est partagé sur tous les nœuds (sinon `bad interpreter` côté calcul).
+[[ -n "$BASH_BIN" ]] && BASH_BIN="$(readlink -f "$BASH_BIN" 2>/dev/null || echo "$BASH_BIN")"
+[[ -z "$BASH_BIN" ]] && BASH_BIN="/bin/bash"
 
 # --- Paramètres par défaut --------------------------------------------------
 OUT_DIR_BASE_DEFAULT="/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae"
@@ -104,9 +120,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# --- Résolution de l'axe → quiescent_groups + suffixe -----------------------
-# AXES est un tableau parallèle : pour chaque entrée, on a un suffixe et un
-# argument --quiescent-groups. Avec axis=both, on en a 2 (V3 et V4).
+# --- Résolution de l'axe → quiescent_groups + suffixe (+ flags extra) --------
+# AXIS_SPECS est un tableau parallèle. Format d'une entrée :
+#     "<suffixe>::<quiescent_groups>[::<flags extra perturb_top_genes>]"
+# Le 3e champ (optionnel) est passé tel quel à perturb_top_genes.py — c'est
+# ainsi que l'axe `effector` injecte `--effector-axis` (axis = unit(μ[pro]−
+# μ[anti]), référence causale stable, cf. gnn_futur §2.2/§7.8) là où v3/v4
+# définissent l'axe par le contraste de cell_groups (--quiescent-groups).
+# Avec axis=both, on en a 2 (V3 et V4).
+#
+# Axe effecteur : pôles surchargés via env EFFECTOR_PRO / EFFECTOR_ANTI
+# (sinon défauts de perturb_top_genes : pro=CDKN2A,CDKN1A,CDKN2B,SERPINE1,GLB1
+#  anti=LMNB1,MKI67,CCNB1,CCNA2,PCNA,TOP2A). --quiescent-groups reste passé
+# (sert au baseline cell-group ; l'axe lui-même est remplacé par les effecteurs).
+EFF_FLAGS="--effector-axis"
+[[ -n "${EFFECTOR_PRO:-}"  ]] && EFF_FLAGS+=" --effector-pro ${EFFECTOR_PRO}"
+[[ -n "${EFFECTOR_ANTI:-}" ]] && EFF_FLAGS+=" --effector-anti ${EFFECTOR_ANTI}"
+
 case "$AXIS" in
     v3)
         AXIS_SPECS=("axisV3::P4")
@@ -120,8 +150,11 @@ case "$AXIS" in
             "axisV4::P4,P16_cluster_0"
         )
         ;;
+    effector)
+        AXIS_SPECS=("axisEffector::P4,P16_cluster_0::${EFF_FLAGS}")
+        ;;
     *)
-        echo "Axis inconnu : $AXIS (v3 | v4 | both)"; exit 1 ;;
+        echo "Axis inconnu : $AXIS (v3 | v4 | both | effector)"; exit 1 ;;
 esac
 
 # Pour --axis v3 (legacy), on conserve le comportement historique : pas de
@@ -158,7 +191,7 @@ fi
 # Requiert des runs DÉJÀ perturbés. Groupe par catégorie (tag sans .s<N>) et
 # enchaîne run_analysis.sh (cross-seed report + baselines + interpret [+ décoy]).
 if [[ $ANALYSIS -eq 1 ]]; then
-    [[ "$AXIS" == "v3" ]] && ATAG="" || ATAG="axisV4"
+    case "$AXIS" in v3) ATAG="";; effector) ATAG="axisEffector";; *) ATAG="axisV4";; esac
     EXTRA_FLAGS=""
     [[ $ANALYSIS_DECOY -eq 1 ]] && EXTRA_FLAGS+=" --decoy"
     [[ $ANALYSIS_FIGURES -eq 1 ]] && EXTRA_FLAGS+=" --figures"
@@ -203,21 +236,27 @@ LOG_DIR="$SCRIPT_DIR/logs/perturb_${AXIS}_${TS}"
 mkdir -p "$LOG_DIR"
 CONFIGS_FILE="$LOG_DIR/configs.tsv"
 
-# Une ligne par tâche : run_dir<TAB>mode<TAB>target_flag<TAB>suffixe<TAB>quiescent_groups
+# Une ligne par tâche :
+#   run_dir<TAB>mode<TAB>target_flag<TAB>suffixe<TAB>quiescent_groups<TAB>axis_extra
 > "$CONFIGS_FILE"
 for run_dir in "${VALID_RUNS[@]}"; do
     for mode in "${MODES[@]}"; do
         for spec in "${AXIS_SPECS[@]}"; do
-            sfx="${spec%%::*}"          # "axisV4" ou ""
-            qg="${spec#*::}"            # "P4,P16_cluster_0" ou "P4"
+            sfx="${spec%%::*}"          # "axisV4" / "axisEffector" / ""
+            rest="${spec#*::}"          # "<qg>[::<extra>]"
+            qg="${rest%%::*}"           # "P4,P16_cluster_0" ou "P4"
+            # 3e champ optionnel = flags extra (ex. --effector-axis). Word-split
+            # voulu côté python → écrit non-quoté dans configs.tsv.
+            axis_extra=""
+            [[ "$rest" == *::* ]] && axis_extra="${rest#*::}"
             # Le suffixe d'output prend une underscore prefix si non vide
             out_sfx=""
             [[ -n "$sfx" ]] && out_sfx="_${sfx}"
-            printf '%s\t%s\t%s\t%s\t%s\n' \
-                "$run_dir" "$mode" "--all-genes" "$out_sfx" "$qg" >> "$CONFIGS_FILE"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$run_dir" "$mode" "--all-genes" "$out_sfx" "$qg" "$axis_extra" >> "$CONFIGS_FILE"
             if [[ $ALSO_PATHWAYS -eq 1 ]]; then
-                printf '%s\t%s\t%s\t%s\t%s\n' \
-                    "$run_dir" "$mode" "--all-pathways" "$out_sfx" "$qg" >> "$CONFIGS_FILE"
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    "$run_dir" "$mode" "--all-pathways" "$out_sfx" "$qg" "$axis_extra" >> "$CONFIGS_FILE"
             fi
         done
     done
@@ -260,7 +299,7 @@ fi
 
 SBATCH_SCRIPT="$LOG_DIR/sbatch_perturb.sh"
 cat > "$SBATCH_SCRIPT" <<EOF
-#!/usr/bin/env bash
+#!${BASH_BIN}
 #SBATCH --job-name=vgae_perturb_${AXIS}
 #SBATCH --comment="VGAE perturbation grid (axis=${AXIS})"
 #SBATCH --output=$LOG_DIR/%x_%A_%a.out
@@ -276,14 +315,18 @@ $GPU_DIRECTIVES
 
 set -euo pipefail
 
+# GLiCID/Guix : le PATH du job sur le nœud est minimal (ni sed/cut, ni python3 —
+# le PATH de soumission n'est pas propagé). On bake le PATH du frontal (env
+# conda + profil Guix, sur FS partagé) → fournit python3/mkdir/date.
+export PATH="$PATH"
+
 cd "$PROJECT_DIR"
 
-LINE=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$CONFIGS_FILE")
-RUN_DIR=\$(echo "\$LINE" | cut -f1)
-MODE=\$(echo "\$LINE" | cut -f2)
-TARGET_FLAG=\$(echo "\$LINE" | cut -f3)
-OUT_SUFFIX=\$(echo "\$LINE" | cut -f4)
-QGROUPS=\$(echo "\$LINE" | cut -f5)
+# Lecture de la ligne SLURM_ARRAY_TASK_ID + split TSV via BUILTINS bash
+# (pas de sed/cut, indisponibles dans le PATH minimal du nœud).
+mapfile -t _CFG_LINES < "$CONFIGS_FILE"
+LINE="\${_CFG_LINES[\$SLURM_ARRAY_TASK_ID]}"
+IFS=\$'\t' read -r RUN_DIR MODE TARGET_FLAG OUT_SUFFIX QGROUPS AXIS_EXTRA <<< "\$LINE"
 
 echo "[\$(date +%T)] task \$SLURM_ARRAY_TASK_ID"
 echo "  run_dir       : \$RUN_DIR"
@@ -291,6 +334,7 @@ echo "  mode          : \$MODE"
 echo "  target        : \$TARGET_FLAG"
 echo "  out-suffix    : '\$OUT_SUFFIX'"
 echo "  quiescent     : \$QGROUPS"
+echo "  axis-extra    : '\$AXIS_EXTRA'"
 echo "  node          : \$(hostname)"
 
 EXTRA_ARGS=()
@@ -313,6 +357,7 @@ python3 src/perturb_top_genes.py \\
     "\$TARGET_FLAG" \\
     --modes "\$MODE" \\
     $DEVICE_ARG \\
+    \$AXIS_EXTRA \\
     "\${EXTRA_ARGS[@]}"
 
 # --- Chaînage perturb_report --all après chaque perturbation ----------
@@ -394,7 +439,7 @@ CS_SBATCH_SCRIPT=""
 if [[ $CS_N -gt 0 ]]; then
     CS_SBATCH_SCRIPT="$LOG_DIR/sbatch_cross_seed.sh"
     cat > "$CS_SBATCH_SCRIPT" <<EOF
-#!/usr/bin/env bash
+#!${BASH_BIN}
 #SBATCH --job-name=vgae_cs_${AXIS}
 #SBATCH --comment="VGAE cross-seed report (axis=${AXIS})"
 #SBATCH --output=$LOG_DIR/cs_%x_%A_%a.out
@@ -409,13 +454,15 @@ if [[ $CS_N -gt 0 ]]; then
 
 set -euo pipefail
 
+# GLiCID/Guix : PATH minimal sur le nœud → bake le PATH du frontal (python3 etc.)
+export PATH="$PATH"
+
 cd "$PROJECT_DIR"
 
-LINE=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$CS_CONFIGS_FILE")
-CAT=\$(echo "\$LINE" | cut -f1)
-RUNS=\$(echo "\$LINE" | cut -f2)
-OUT_SUFFIX=\$(echo "\$LINE" | cut -f3)
-AXIS_TAG=\$(echo "\$LINE" | cut -f4)
+# Lecture ligne + split TSV via builtins bash (pas de sed/cut sur le nœud).
+mapfile -t _CS_LINES < "$CS_CONFIGS_FILE"
+LINE="\${_CS_LINES[\$SLURM_ARRAY_TASK_ID]}"
+IFS=\$'\t' read -r CAT RUNS OUT_SUFFIX AXIS_TAG <<< "\$LINE"
 
 # Dossier de sortie : <OUT_DIR_BASE>/cross_seed_<category>[_axisV4]/
 REPORT_DIR="${OUT_DIR_BASE}/cross_seed_\${CAT}\${OUT_SUFFIX}"
