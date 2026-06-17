@@ -19,6 +19,8 @@
 #     --decoy              lance aussi la confidence décoy (top-N, lourd CPU)
 #     --decoy-top-n N      défaut 40
 #     --skip-interpret     saute interpret_embedding
+#     --attention          lance l'analyse de l'attention
+#     --figures            heatmap
 #     --skip-cross-seed    réutilise un cross_seed_gene_ranking.tsv déjà dans --out
 # =============================================================================
 set -euo pipefail
@@ -58,9 +60,15 @@ mkdir -p "$INTERP"
 if [[ "$SKIP_CS" -eq 0 ]]; then
   [[ ${#SEEDS[@]} -lt 1 ]] && { echo "[run_analysis] --seeds requis (≥1)"; exit 1; }
   echo "[run_analysis] (1) cross-seed sur ${#SEEDS[@]} seed(s) → $OUT"
+  # is_de_significant = MAST padj<0.05 & |log2FC|≥0.5 (--de-significance pvalue,
+  # défaut depuis 2026-06-15 — plus reproductible/défendable que magnitude-rank).
+  # --no-signed-fanout : évite d'agréger des *_signed_fanout.tsv d'autres axes
+  # (concordDE/v6smoke) traînant dans un run-dir.
   $PY src/validation/reports/perturb_report.py --cross-seed "${SEEDS[@]}" \
       --report-dir "$OUT" --axis-tag "$AXIS" \
-      --de-magnitude-csv "$DE" --coexpr-degree-file "$COEXPR"
+      --de-magnitude-csv "$DE" --coexpr-degree-file "$COEXPR" \
+      --de-significance pvalue --de-padj-max 0.05 --de-abs-lfc-min 0.5 \
+      --no-signed-fanout
 fi
 [[ -f "$RANK" ]] || { echo "[run_analysis] $RANK manquant"; exit 1; }
 

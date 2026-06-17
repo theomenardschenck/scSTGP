@@ -2471,6 +2471,9 @@ def build_gene_ranking(df: pd.DataFrame,
                         min_ppi_degree: int = 5,
                         vgae_baseline: pd.DataFrame | None = None,
                         de_top_n: int = 1000,
+                        de_sig_mode: str = "magnitude-rank",
+                        de_padj_max: float = 0.05,
+                        de_abs_lfc_min: float = 0.5,
                         is_tf_series: pd.Series | None = None,
                         gene_to_pathways: dict | None = None,
                         de_magnitude: pd.DataFrame | None = None,
@@ -2600,9 +2603,25 @@ def build_gene_ranking(df: pd.DataFrame,
         vgae_importance = vgae_row.get("vgae_importance")
         vgae_rank_v = vgae_row.get("rank_vgae")
         rank_stat_v = vgae_row.get("rank_stat")
+        # is_de_significant — deux modes (cf. --de-significance) :
+        #   'magnitude-rank' (défaut, backward-compat) : rang |ΔExpr P16-P4| ≤ de_top_n
+        #     (rank_stat issu de gene_ranking_vgae.csv ; couvre tous les gènes du graphe).
+        #   'pvalue' : test MAST padj < de_padj_max ET |avg_log2FC| ≥ de_abs_lfc_min.
+        #     (padj seul ne discrimine pas en scRNA → exiger AUSSI |logFC|.) Gène absent
+        #     du MAST → None (inconnu), PAS de fallback rank_stat (comparaison propre).
         is_de_significant: bool | None = None
-        if rank_stat_v is not None and not (isinstance(rank_stat_v, float) and np.isnan(rank_stat_v)):
-            is_de_significant = bool(int(rank_stat_v) <= de_top_n)
+        if de_sig_mode == "pvalue":
+            if de_magnitude is not None and target in de_magnitude.index:
+                _lfc = de_magnitude.at[target, "de_log2fc_p4_vs_p16"]
+                _nlp = de_magnitude.at[target, "de_neglog10_padj"]  # = -log10(padj)
+                if pd.notna(_lfc) and pd.notna(_nlp):
+                    is_de_significant = bool(
+                        float(_nlp) >= -np.log10(de_padj_max)
+                        and abs(float(_lfc)) >= de_abs_lfc_min
+                    )
+        else:  # 'magnitude-rank'
+            if rank_stat_v is not None and not (isinstance(rank_stat_v, float) and np.isnan(rank_stat_v)):
+                is_de_significant = bool(int(rank_stat_v) <= de_top_n)
         n_aging_dbs = sum(int(vgae_row.get(c, 0) or 0) for c in
                            ("in_genage", "in_cellage", "in_msigdb_aging",
                             "in_ageanno", "in_aging_local"))
@@ -3416,10 +3435,12 @@ def run_cross_seed(args) -> None:
         seed_summaries.append(sums)
         kept_paths.append(p)
 
-    # Vérification du quorum (besoin d'au moins 2 seeds pour comparer)
-    if len(seed_summaries) < 2:
-        print(f"Error: Need ≥2 seeds with data; got {len(seed_summaries)}.")
+    # Vérification du quorum
+    if len(seed_summaries) < 1:
+        print(f"Error: Need ≥1 seed with data; got {len(seed_summaries)}.")
         return
+    if len(seed_summaries) < 2:
+        print(f"Warning: Only 1 seed — robustness/stability will be 1.0 (trivial).")
 
     # 2. Définition du répertoire de sortie
     # Par défaut : un dossier 'cross_seed_report' au niveau parent des seeds
@@ -3525,6 +3546,9 @@ def run_cross_seed(args) -> None:
         min_ppi_degree=args.gene_ranking_min_ppi_degree,
         vgae_baseline=vgae_baseline,
         de_top_n=args.gene_ranking_de_top_n,
+        de_sig_mode=args.de_significance,
+        de_padj_max=args.de_padj_max,
+        de_abs_lfc_min=args.de_abs_lfc_min,
         is_tf_series=is_tf_series,
         gene_to_pathways=gene_to_pathways,
         de_magnitude=de_magnitude,
@@ -3561,16 +3585,23 @@ def run_cross_seed(args) -> None:
                   f"(DE-marqueur ≠ effet causal, type FHL2).")
 
         # Readout signé fan-out (3 rôles) si tables fan-out présentes.
-        fanout_paths = _resolve_signed_fanout_paths(args, kept_paths)
+        fanout_paths = ([] if getattr(args, "no_signed_fanout", False)
+                        else _resolve_signed_fanout_paths(args, kept_paths))
         if fanout_paths and "cosine_senescent" in gene_rank.columns:
             fanout_agg = _aggregate_signed_fanout(fanout_paths)
             if not fanout_agg.empty:
-                role_pert_map = dict(zip(gene_rank["gene"].astype(str),
+                role_pert_map = dict(zip(gene_rank["target"].astype(str),
                                          gene_rank["cosine_senescent"]))
                 sig_cols = compute_signed_readout_columns(
                     fanout_agg, role_pert_map, de_role_map)
                 if not sig_cols.empty:
-                    gene_rank = gene_rank.merge(sig_cols, on="gene", how="left")
+                    # sig_cols est clé "gene" (gène source) ; gene_rank est clé
+                    # "target" → merge croisé puis on retire la colonne "gene"
+                    # dupliquée (fix bug 'gene'≠'target', branche fan-out oubliée
+                    # du fix _mdc 2026-06-09).
+                    gene_rank = gene_rank.merge(
+                        sig_cols, left_on="target", right_on="gene", how="left"
+                    ).drop(columns=["gene"])
                     print(f"[INFO] readout signé : {len(sig_cols)} sources avec "
                           f"fan-out signé ({len(fanout_paths)} fichier(s)) → "
                           f"signed_readout_{{pert,de,latent}} + cohérences.")
@@ -4386,7 +4417,25 @@ def main():
     ap.add_argument("--gene-ranking-de-top-n", type=int, default=1000,
                     help="Per-gene ranking TSV: a gene is tagged "
                          "is_de_significant=True if its rank_stat (from "
-                         "gene_ranking_vgae.csv) is ≤ this value (default 1000).")
+                         "gene_ranking_vgae.csv) is ≤ this value (default 1000). "
+                         "Only used in --de-significance magnitude-rank mode.")
+    ap.add_argument("--de-significance", choices=["magnitude-rank", "pvalue"],
+                    default="pvalue",
+                    help="Définition de is_de_significant. **'pvalue' (DÉFAUT depuis "
+                         "2026-06-15, plus reproductible/défendable)** = MAST padj < "
+                         "--de-padj-max ET |avg_log2FC| ≥ --de-abs-lfc-min (gène absent "
+                         "du MAST → None). 'magnitude-rank' (legacy) = rang |ΔExpr "
+                         "P16-P4| ≤ --gene-ranking-de-top-n.")
+    ap.add_argument("--de-padj-max", type=float, default=0.05,
+                    help="Mode pvalue : seuil padj MAST (défaut 0.05).")
+    ap.add_argument("--de-abs-lfc-min", type=float, default=0.5,
+                    help="Mode pvalue : seuil |avg_log2FC| MAST (défaut 0.5). "
+                         "⚠️ padj seul ne discrimine pas en scRNA → |logFC| requis.")
+    ap.add_argument("--no-signed-fanout", action="store_true", default=False,
+                    help="Désactive l'auto-découverte des tables *_signed_fanout.tsv "
+                         "(colonnes signed_readout_*). Recommandé pour le pipeline "
+                         "standard afin d'éviter d'agréger des fan-out d'autres axes/"
+                         "expériences (ex. concordDE/v6smoke) traînant dans un run-dir.")
     ap.add_argument("--de-magnitude-csv", type=Path,
                     default=Path("data/gnn_data/DEGs_P4_vs_P16_MAST.csv"),
                     help="MAST DE table (gene, avg_log2FC, p_val_adj). Used to "
