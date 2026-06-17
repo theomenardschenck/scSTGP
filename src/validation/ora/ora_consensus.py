@@ -80,7 +80,15 @@ def _find_project_root(start: Path, fallback_levels: int = 2) -> Path:
 ROOT = _find_project_root(Path(__file__))
 # Override possible : GNN_PROJECT_ROOT=/LAB-DATA/GLiCID/users/.../gnn/ python ...
 GMT_PATH = ROOT / "data/databases/c2.cp.reactome.symbols.gmt"
-DE_PATH = ROOT / "data/RNAseq/GSE98440_diff_expr_analysis_afterNorm_HUVEC_2reps.txt"
+
+def _resolve_de_path(root: Path) -> Path:
+    """GSE98440 DE — robuste à la réorg data/RNAseq → data/bulkRNAseq."""
+    _f = "GSE98440_diff_expr_analysis_afterNorm_HUVEC_2reps.txt"
+    cands = [root / "data/bulkRNAseq/GSE984440_huvec" / _f,
+             root / "data/RNAseq" / _f]
+    return next((c for c in cands if c.exists()), cands[0])
+
+DE_PATH = _resolve_de_path(ROOT)
 DATA_DIR = ROOT / "data"
 DB_DIR = DATA_DIR / "databases"
 

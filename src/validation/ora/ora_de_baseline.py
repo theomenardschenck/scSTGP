@@ -60,7 +60,11 @@ def _find_project_root(start: Path, fallback_levels: int = 1) -> Path:
 
 
 ROOT = _find_project_root(Path(__file__))
-DE_PATH = ROOT / "data/RNAseq/GSE98440_diff_expr_analysis_afterNorm_HUVEC_2reps.txt"
+# GSE98440 DE — robuste à la réorg data/RNAseq → data/bulkRNAseq
+_DE_F = "GSE98440_diff_expr_analysis_afterNorm_HUVEC_2reps.txt"
+DE_PATH = next((c for c in (ROOT / "data/bulkRNAseq/GSE984440_huvec" / _DE_F,
+                            ROOT / "data/RNAseq" / _DE_F) if c.exists()),
+               ROOT / "data/RNAseq" / _DE_F)
 GMT_PATH = ROOT / "data/databases/c2.cp.reactome.symbols.gmt"
 VGAE_DIR = ROOT / "output/gnn_vgae"
 V3_RUNS = ["V3_Run1", "V3_Run2", "V3_Run3"]
