@@ -206,13 +206,17 @@ def _ensure_outdir(out_dir: Path) -> Path:
     return out_dir
 
 
-def _savefig(fig, base_path: Path, also_svg: bool = True) -> Path:
-    """Sauvegarde PNG + SVG (vectoriel pour publication)."""
+_SVG_ENABLED = False   # SVG opt-in (--svg) ; PNG seul par défaut (cleanup 2026-06-18)
+
+
+def _savefig(fig, base_path: Path, also_svg: bool | None = None) -> Path:
+    """Sauvegarde PNG (+ SVG si --svg / also_svg). PNG seul par défaut."""
+    svg = _SVG_ENABLED if also_svg is None else also_svg
     fig.savefig(base_path.with_suffix(".png"))
-    if also_svg:
+    if svg:
         fig.savefig(base_path.with_suffix(".svg"))
     plt.close(fig)
-    print(f"[save] {base_path}.{{png,svg}}")
+    print(f"[save] {base_path}.png" + ("+svg" if svg else ""))
     return base_path
 
 
@@ -807,9 +811,10 @@ def fig_clustermap_expression(
 
     out_path = out_dir / f"{fname}_{linkage_method}_{distance_metric}"
     g.figure.savefig(out_path.with_suffix(".png"), dpi=200, bbox_inches="tight")
-    g.figure.savefig(out_path.with_suffix(".svg"), bbox_inches="tight")
+    if _SVG_ENABLED:
+        g.figure.savefig(out_path.with_suffix(".svg"), bbox_inches="tight")
     plt.close(g.figure)
-    print(f"[save] {out_path}.{{png,svg}}")
+    print(f"[save] {out_path}.png" + ("+svg" if _SVG_ENABLED else ""))
     return out_path
 
 
@@ -1351,6 +1356,8 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--raw-runs", type=Path, nargs="+", default=None,
                   help="Runs bruts (...s1, ...s2) contenant les "
                        "perturbation_all_genes_*.tsv pour le per-cluster cosine.")
+    p.add_argument("--svg", action="store_true",
+                   help="exporte aussi en SVG (défaut : PNG seul).")
     p.add_argument("--out-dir", type=Path, default=None,
                   help="Dossier de sortie (défaut : <version-dir>/figures_explorer).")
 
@@ -1441,6 +1448,8 @@ def main():
     _add_common_args(p_a)
 
     args = ap.parse_args()
+    global _SVG_ENABLED
+    _SVG_ENABLED = getattr(args, "svg", False)
     out_dir = _ensure_outdir(args.out_dir or args.version_dir / "figures_explorer")
     ranking = load_ranking(args.version_dir)
 
