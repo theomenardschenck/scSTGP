@@ -1,141 +1,78 @@
 # ──────────────────────────────────────────────────────────────────
-# Configuration exemple — pipeline VGAE HUVEC sénescence (V3.6 baseline)
+# Configuration — pipeline VGAE HUVEC sénescence (Snakemake fonctionnel)
 # ──────────────────────────────────────────────────────────────────
-# Cf. gnn_huvec/docs/pipeline_design.md §5 pour le schéma complet.
-# Cette config reproduit le run V3.6 baseline 10 seeds + perturbation.
+# Cf. ../README.md et ../../docs/pipeline_design.md.
+#
+# Ce fichier pilote RÉELLEMENT le Snakefile (plus de stub). Les chemins
+# `paths.*` sont injectés à gnn_vgae.py via les variables d'environnement
+# GNN_DATA_DIR / GNN_OUT_DIR_BASE / GNN_HUMESS_DIR / GNN_SCENIC_DIR
+# (défauts GLiCID préservés si non surchargés).
 #
 # Usage :
+#   snakemake -n --configfile workflow/config/config.yaml         # dry-run
 #   snakemake --use-conda --cores 8 --configfile workflow/config/config.yaml
-#
-# NOTE 2026-05-07 : le Snakefile est une ébauche, certaines rules
-# pointent encore vers les scripts monolithiques actuels.
 
 run:
-  name: "huvec_v36_baseline"
-  description: "VGAE V3.6 — 10 seeds, all-genes perturbation, ablation full"
+  name: "huvec_snakemake"
+  description: "VGAE HUVEC — train × seeds → perturbation → scoring → validation"
 
+# ── Chemins (un clone sur le cluster pointe data_root vers les données stagées)
+paths:
+  data_root: "data"                  # → GNN_DATA_DIR (gnn_data, PPI, databases, pyscenic, omnipath)
+  out_base: "output/snakemake"       # → GNN_OUT_DIR_BASE + racine analyses
+  humess_dir: "data/humess/output_huvec"   # → GNN_HUMESS_DIR
+  scenic_dir: "output/pyscenic"      # → GNN_SCENIC_DIR
+  de_magnitude_csv: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
+  coexpr_file: "data/pyscenic/diff_coexpr/coexpr_diff.tsv"
+
+# ── Calcul
+compute:
+  device: "cpu"            # perturbation : cpu | cuda | auto
+  python: "python"         # interpréteur principal (pandas/scipy)
+  python_torch: "python"   # interpréteur torch+umap (interpret_embedding / decoy)
+
+# ── Stage 1-4 : entrées précalculées (preprocessing R / pySCENIC / HuMess
+#    restent des prérequis externes — non orchestrés ici).
 input:
   rna_type: scrna
-  rna_path: "data/gnn_data/HUVEC_seurat_processed.rds"
-  metadata: "data/gnn_data/HUVEC_metadata.tsv"
   degs_path: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
-  conditions:
-    column: "timepoint"
-    reference: "P4"
-    target: "P16"
-  optional:
-    chip_seq: null
-    atac_seq: null
 
-preprocessing:
-  do_clustering: true
-  clustering:
-    method: "louvain"
-    resolution: 0.8
-    cluster_only_target: true   # P4 monolithique, P16 → 4 clusters
-  qc:
-    min_cells_per_gene: 3
-    min_genes_per_cell: 200
-    max_pct_mt: 20
-
-differential:
-  method: "mast"
-  contrasts:
-    - {ref: "P4", target: "P16"}
-  significance:
-    fdr_threshold: 0.05
-    rank_threshold: 1000
-
-annotations:
-  pyscenic:
-    enabled: true
-    species: "human"
-    auc_threshold: 0.05
-  humess:
-    enabled: true
-    config_path: "humess/config_huvec.json"
-  databases:
-    string:
-      enabled: true
-      version: "12.0"
-      score_threshold: 700
-    reactome:
-      enabled: true
-      version: "2024"
-      max_pathway_size: 200
-    omnipath:
-      signaling: false           # V4 only
-      tf_curated: false          # V4 only
-      cache_dir: "data/omnipath/"
-
-graph:
-  edge_sources:
-    ppi: true
-    reactome: true
-    coexpr: true
-    scenic_regulons: true
-    humess_edges: true
-    cell_group_edges: true
-    omnipath_signaling: false
-    tf_curated: false
-  node_features:
-    exclude: []
-
+# ── Stage 6 : entraînement VGAE
 models:
   vgae:
-    enabled: true
-    n_seeds: 10
-    hidden_dim: 64
-    n_layers: 3
-    n_heads: 8
-    epochs: 500
-    lr: 0.0005
-    kl_weight_max: 0.5
-    free_bits: 0.5
+    enabled: true           # false = réutilise des runs déjà entraînés dans out_base
+    run_tag: "full"         # tag de base ; run par seed = "<run_tag>.s<seed>"
+    seeds: [1, 2, 3]
+    extra_flags: ""         # ex. "--signed-message --signed-decoder" (config V5)
   gnn_lite:
-    enabled: true
-    hidden_dim: 64
-    n_layers: 3
-  baselines:
-    mlp: true
-    stat: true
-    deepwalk: true
+    enabled: false
 
+# ── Stage 7 : perturbation in silico
 perturbation:
   enabled: true
-  modes: [KO, KD, OE]
+  modes: [knockdown, knockout, overexpress]
   scope: all_genes
-  axis:
-    reference_groups: ["P4"]
-    target_groups: null          # auto = tous les autres cell_groups
+  axis_tag: ""              # "" = axe V3 (P4) ; "axisV4" si --axis v4 utilisé
+  out_suffix: ""            # suffixe de fichier (doit refléter l'axe ; "" par défaut)
 
+# ── Stage 8 : agrégation cross-seed (perturb_report)
+scoring:
+  de_significance: "pvalue" # pvalue (MAST padj+|logFC|) | magnitude-rank
+  de_padj_max: 0.05
+  de_abs_lfc_min: 0.5
+
+# ── Stage 8b/9 : validation
 validation:
-  ora:
-    aging_dbs:
-      - "data/dbs/SenMayo.tsv"
-      - "data/dbs/CellAge.tsv"
-      - "data/dbs/GenAge.tsv"
-      - "data/dbs/Fridman.tsv"
-    reactome: true
-    consensus_min_shared: 2
+  ora_top_n: 100
+  decoy:
+    enabled: false          # null-models décoy (lourd, torch)
+    top_n: 40
   cluster_annotation:
     enabled: true
-    signatures: ["SenMayo", "CellAge", "HALLMARK", "REACTOME"]
 
+# ── Stage 10 : cross-method (opt-in, non câblé end-to-end)
 comparison:
   enabled: false
-  internal: true
-  external:
-    decoupler_ulm: false
-    dreamwalk: false
-    sctenifoldknk: false
-    celloracle: false
 
 output:
-  base_dir: "output/run_huvec_v36_baseline"
-  generate_html_report: true
-  figures:
-    - "cross_seed_top_drivers"
-    - "ora_aging_barplot"
-    - "umap_cell_groups"
-    - "evidence_tier_distribution"
+  generate_html_report: false

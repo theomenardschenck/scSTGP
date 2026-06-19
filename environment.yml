@@ -101,6 +101,9 @@ dependencies:
   - numexpr
   - dill
 
+  # Orchestration pipeline
+  - snakemake-minimal=7.32
+
   - pip:
       # PyTorch CPU + PyG (pinned to latest PyPI — not yet on conda channels)
       - --extra-index-url https://download.pytorch.org/whl/cpu

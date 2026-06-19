@@ -1,397 +1,315 @@
 """
-Snakefile — pipeline VGAE HUVEC sénescence (V3.6 baseline)
+Snakefile — pipeline VGAE HUVEC sénescence (fonctionnel).
 
-Ébauche minimale (2026-05-07). Non-fonctionnelle telle quelle :
-suppose que les CLI cibles existent dans `cli/` (cf. Tier 2.5 du TODO
-+ docs/pipeline_design.md). En attendant la modularisation, certaines
-rules pointent vers les scripts monolithiques actuels (`gnn_vgae.py`,
-`perturb_top_genes.py`, `perturb_report.py`) — marqué TODO inline.
+Câblé sur les CLI RÉELLES des scripts (plus de stub `python -m
+gnn_huvec.cli…`). Chemins et paramètres pilotés par config/config.yaml.
 
-Lancement (futur) :
-    snakemake --use-conda --cores 8 --configfile config/config.yaml
+Stages orchestrés :
+  6   — train_vgae       × seed            (src/gnn/gnn_vgae.py)
+  7   — perturb          × seed            (src/perturbation/perturb_top_genes.py)
+  8   — aggregate        cross-seed        (src/validation/reports/perturb_report.py)
+  8b  — driver_baselines + interpret_embedding [+ decoy opt-in]
+  9   — ora_consensus (reactome + aging) [+ cluster_annotation]
+  11  — report (concat des sorties clés)
 
-Mode dry-run :
-    snakemake -n --configfile config/config.yaml
+Prérequis EXTERNES (non orchestrés — restent précalculés en entrée) :
+  1-2 preprocessing scRNA + DE (MAST)   → data/gnn_data/
+  3   pySCENIC (regulons/adjacencies)   → paths.scenic_dir
+  4   HuMess (importance métabolique)   → paths.humess_dir
+  + bases STRING/Reactome/OmniPath      → paths.data_root
 
-Stages couverts (cf. §4 de docs/pipeline_design.md) :
-  3 — pySCENIC                           [TODO — wrapper à écrire]
-  4 — HuMess                             [TODO — wrapper sub-Snakefile]
-  4b — DB downloads                      [TODO]
-  5 — Build hetero graph
-  6 — Train models (vgae, gnn_lite, baselines)
-  7 — Perturbation (× seeds × modes)
-  8 — Aggregation cross-seed scoring
-  9 — Validation ORA
-  10 — Cross-method comparison           [opt-in]
-  11 — Report final                      [TODO]
+gnn_vgae.py code en dur les chemins GLiCID par défaut ; on les surcharge
+par variables d'environnement GNN_DATA_DIR / GNN_OUT_DIR_BASE /
+GNN_HUMESS_DIR / GNN_SCENIC_DIR (cf. rule train_vgae).
 
-Stages 1-2 (preprocessing + DE) supposés précalculés en entrée
-(matrices Seurat + DEGs MAST déjà dans `data/gnn_data/`). À ajouter
-quand les CLI preprocessing existent.
+Lancement :
+    snakemake -n --configfile workflow/config/config.yaml            # dry-run
+    snakemake --use-conda --cores 8 --configfile workflow/config/config.yaml
+    snakemake --executor slurm -j 20 --configfile workflow/config/config.yaml  # cluster
 """
 
+import os
 from pathlib import Path
-
-# ──────────────────────────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────────────────────────
 
 configfile: "config/config.yaml"
 
-RUN_NAME = config["run"]["name"]
-OUT_DIR = Path(config["output"].get("base_dir", f"output/{RUN_NAME}"))
-N_SEEDS = config["models"]["vgae"]["n_seeds"]
-SEEDS = list(range(42, 42 + N_SEEDS))
-PERTURB_MODES = config["perturbation"]["modes"]
+# ──────────────────────────────────────────────────────────────────
+# Résolution config
+# ──────────────────────────────────────────────────────────────────
+P = config["paths"]
+DATA_ROOT  = Path(P["data_root"]).resolve()
+OUT_BASE   = Path(P["out_base"]).resolve()
+HUMESS_DIR = Path(P["humess_dir"]).resolve()
+SCENIC_DIR = Path(P["scenic_dir"]).resolve()
+DE_CSV     = P["de_magnitude_csv"]
+COEXPR     = P["coexpr_file"]
 
-# Inputs précalculés (stages 1-2 non encore wrappés)
-EXPR_RDS = config["input"]["rna_path"]
-DEGS_TSV = config["input"].get("degs_path", "data/gnn_data/DEGs_P4_vs_P16_MAST.csv")
+DEVICE   = config["compute"]["device"]
+PY       = config["compute"]["python"]
+PY_TORCH = config["compute"]["python_torch"]
 
-# Toggles
-RUN_GNN_LITE = config["models"]["gnn_lite"]["enabled"]
-RUN_PERTURB = config["perturbation"]["enabled"]
-RUN_COMPARISON = config["comparison"]["enabled"]
-EXTERNAL_METHODS = [
-    name for name, ok in config["comparison"].get("external", {}).items() if ok
-]
+VGAE        = config["models"]["vgae"]
+RUN_TAG     = VGAE["run_tag"]
+SEEDS       = [str(s) for s in VGAE["seeds"]]
+TRAIN_VGAE  = VGAE["enabled"]
+EXTRA_FLAGS = VGAE.get("extra_flags", "")
+
+MODES      = config["perturbation"]["modes"]
+AXIS_TAG   = config["perturbation"].get("axis_tag", "")
+OUT_SUFFIX = config["perturbation"].get("out_suffix", "")
+
+SCORING        = config["scoring"]
+ORA_TOP_N      = config["validation"]["ora_top_n"]
+DECOY_ON       = config["validation"]["decoy"]["enabled"]
+DECOY_TOP_N    = config["validation"]["decoy"]["top_n"]
+CLUSTER_ANNOT  = config["validation"]["cluster_annotation"]["enabled"]
+
+# Racine des runs entraînés (= GNN_OUT_DIR_BASE pour gnn_vgae) et des analyses.
+RUNS_DIR     = OUT_BASE
+ANALYSIS_DIR = OUT_BASE / "analysis" / RUN_TAG
+
+def run_dir(seed):
+    """Run dir déterministe écrit par gnn_vgae : OUT_DIR_BASE/<tag>.s<seed>."""
+    return RUNS_DIR / f"{RUN_TAG}.s{seed}"
+
+# Préfixe de fichier de perturbation : perturbation_all_genes[_<suffix>]_<mode>.tsv
+_PSEG = f"_{OUT_SUFFIX}" if OUT_SUFFIX else ""
+def perturb_tsv(seed, mode):
+    return run_dir(seed) / f"perturbation_all_genes{_PSEG}_{mode}.tsv"
+
+# Environnement injecté à gnn_vgae (chemins portables).
+GNN_ENV = (
+    f"GNN_DATA_DIR={DATA_ROOT} "
+    f"GNN_OUT_DIR_BASE={RUNS_DIR} "
+    f"GNN_HUMESS_DIR={HUMESS_DIR} "
+    f"GNN_SCENIC_DIR={SCENIC_DIR}"
+)
 
 
 # ──────────────────────────────────────────────────────────────────
 # Cible finale
 # ──────────────────────────────────────────────────────────────────
+def final_targets():
+    t = [
+        ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+        ANALYSIS_DIR / "interpret" / "driver_baselines.tsv",
+        ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_reactome.tsv",
+        ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_aging.tsv",
+        ANALYSIS_DIR / "report" / "SUMMARY.md",
+    ]
+    if DECOY_ON:
+        t.append(ANALYSIS_DIR / "interpret" / "decoy_confidence.tsv")
+    if CLUSTER_ANNOT:
+        t.append(ANALYSIS_DIR / "cluster_annotation" / "cluster_annotation.tsv")
+    return t
 
 rule all:
     input:
-        # Stage 8 — ranking final
-        OUT_DIR / "scoring/ranked_genes.tsv",
-        # Stage 9 — validation ORA
-        OUT_DIR / "validation/ora_results.tsv",
-        OUT_DIR / "validation/cluster_annotation.tsv",
-        # Stage 10 — cross-method (si activé)
-        ([OUT_DIR / "comparison/cross_method_report.tsv"]
-         if RUN_COMPARISON else []),
-        # Stage 11 — report final
-        OUT_DIR / "report/report.html",
+        final_targets()
 
 
 # ──────────────────────────────────────────────────────────────────
-# Stage 3 — pySCENIC  (TODO)
+# Stage 6 — Train VGAE (1 run par seed)
+#   gnn_vgae.py construit le graphe ET entraîne (monolithe). Sorties dans
+#   OUT_DIR_BASE/<run_tag>.s<seed>/. --run-tag fixe le nom (sinon "auto").
 # ──────────────────────────────────────────────────────────────────
-
-# rule run_pyscenic:
-#     input: EXPR_RDS
-#     output: OUT_DIR / "annotations/regulons.tsv"
-#     params: species=config["annotations"]["pyscenic"]["species"]
-#     shell:
-#         "python -m gnn_huvec.cli.run_pyscenic "
-#         "--input {input} --output {output} --species {params.species}"
-
-
-# ──────────────────────────────────────────────────────────────────
-# Stage 5 — Build hetero graph
-# ──────────────────────────────────────────────────────────────────
-
-rule build_graph:
-    """
-    Construit le graphe hétérogène. Pour l'instant, redirige vers
-    le script monolithique qui fait tout (data + graph + train).
-    À splitter en `cli/build_graph.py` (Tier 2.5).
-    """
-    input:
-        expr=EXPR_RDS,
-        degs=DEGS_TSV,
-    output:
-        graph=OUT_DIR / "graph/hetero_graph.pt",
-        run_config=OUT_DIR / "graph/run_config.json",
-    params:
-        out_subdir=lambda wc, output: Path(output.graph).parent,
-    log:
-        OUT_DIR / "logs/build_graph.log",
-    shell:
-        # TODO Tier 2.5 : remplacer par `python -m gnn_huvec.cli.build_graph`
-        # Actuellement gnn_vgae.py construit ET entraîne — split en cours.
-        "echo '[STUB] build_graph — voir TODO Tier 2.5' > {log}"
-
-
-# ──────────────────────────────────────────────────────────────────
-# Stage 6.1 — Train VGAE × N seeds
-# ──────────────────────────────────────────────────────────────────
-
 rule train_vgae:
-    """
-    Entraîne 1 instance VGAE pour 1 seed.
-    """
-    input:
-        graph=OUT_DIR / "graph/hetero_graph.pt",
     output:
-        model=OUT_DIR / "models/vgae/seed{seed}/model.pt",
-        scores=OUT_DIR / "models/vgae/seed{seed}/gene_scores.tsv",
-        embeddings=OUT_DIR / "models/vgae/seed{seed}/embeddings.npz",
-    params:
-        out_subdir=lambda wc: OUT_DIR / f"models/vgae/seed{wc.seed}",
-        hidden=config["models"]["vgae"]["hidden_dim"],
-        epochs=config["models"]["vgae"]["epochs"],
+        model=run_dir("{seed}") / "best_vgae.pt",
+        ranking=run_dir("{seed}") / "gene_ranking_vgae.csv",
+        group_expr=run_dir("{seed}") / "group_expression.tsv",
     log:
-        OUT_DIR / "logs/train_vgae_seed{seed}.log",
+        OUT_BASE / "logs" / "train_vgae_s{seed}.log",
     threads: 4
     resources:
-        mem_mb=16000,
-        gpu=1,
+        mem_mb=32000,
+        runtime=720,    # minutes
+        gpu=1,          # mappé vers --gres=gpu:1 par le profil cluster
     shell:
-        # TODO Tier 2.5 : `python -m gnn_huvec.cli.train_vgae`
-        "python src/gnn/gnn_vgae.py "
-        "--seed {wildcards.seed} "
-        "--out-dir {params.out_subdir} "
-        "&> {log}"
+        "{GNN_ENV} {PY} src/gnn/gnn_vgae.py "
+        "--seed {wildcards.seed} --run-tag {RUN_TAG}.s{wildcards.seed} "
+        "{EXTRA_FLAGS} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────
-# Stage 6.2 — Train GNN_Lite (supervisé)
+# Stage 7 — Perturbation in silico (KO/KD/OE, all-genes), 1 job par seed
 # ──────────────────────────────────────────────────────────────────
-
-rule train_gnn_lite:
+rule perturb:
     input:
-        graph=OUT_DIR / "graph/hetero_graph.pt",
-        degs=DEGS_TSV,
+        model=run_dir("{seed}") / "best_vgae.pt" if TRAIN_VGAE else [],
     output:
-        scores=OUT_DIR / "models/gnn_lite/gene_predictions.tsv",
-    log:
-        OUT_DIR / "logs/train_gnn_lite.log",
-    threads: 4
-    resources:
-        mem_mb=16000,
-        gpu=1,
-    shell:
-        # TODO Tier 2.5 : `python -m gnn_huvec.cli.train_gnn_lite`
-        "python src/gnn/gnn_classification.py "
-        "--out-dir $(dirname {output.scores}) "
-        "&> {log}"
-
-
-# ──────────────────────────────────────────────────────────────────
-# Stage 7 — Perturbation × seeds × modes
-# ──────────────────────────────────────────────────────────────────
-
-rule run_perturbation:
-    """
-    Perturbation in silico pour 1 seed, tous modes en parallèle.
-    """
-    input:
-        model=OUT_DIR / "models/vgae/seed{seed}/model.pt",
-    output:
-        summary=OUT_DIR / "perturbation/seed{seed}/perturbation_summary.tsv",
+        [run_dir("{seed}") / f"perturbation_all_genes{_PSEG}_{m}.tsv" for m in MODES],
     params:
-        run_dir=lambda wc: OUT_DIR / f"models/vgae/seed{wc.seed}",
-        modes=",".join(PERTURB_MODES),
+        rd=lambda wc: run_dir(wc.seed),
+        modes=" ".join(MODES),
+        suffix=(f"--out-suffix {OUT_SUFFIX}" if OUT_SUFFIX else ""),
     log:
-        OUT_DIR / "logs/perturb_seed{seed}.log",
+        OUT_BASE / "logs" / "perturb_s{seed}.log",
     threads: 8
     resources:
         mem_mb=32000,
+        runtime=480,
     shell:
-        "python src/perturbation/perturb_top_genes.py "
-        "--run-dir {params.run_dir} "
-        "--modes {params.modes} "
-        "--all-genes "
-        "&> {log}"
+        "{PY} src/perturbation/perturb_top_genes.py "
+        "--run-dir {params.rd} --all-genes --modes {params.modes} "
+        "--device {DEVICE} {params.suffix} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────
-# Stage 8 — Aggregation cross-seed
+# Stage 8 — Agrégation cross-seed → driver_score (perturb_report)
 # ──────────────────────────────────────────────────────────────────
-
-rule aggregate_scoring:
-    """
-    Cross-seed agrégation : driver/discovery/validation + evidence_tier.
-    """
+rule aggregate_cross_seed:
     input:
-        perturb_summaries=expand(
-            OUT_DIR / "perturbation/seed{seed}/perturbation_summary.tsv",
-            seed=SEEDS,
+        expand(
+            str(run_dir("{seed}") / f"perturbation_all_genes{_PSEG}_{{mode}}.tsv"),
+            seed=SEEDS, mode=MODES,
         ),
-        degs=DEGS_TSV,
     output:
-        ranking=OUT_DIR / "scoring/ranked_genes.tsv",
-        discoveries=OUT_DIR / "scoring/ranked_genes_discoveries.tsv",
-        incoherent=OUT_DIR / "scoring/ranked_genes_incoherent.tsv",
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+    params:
+        runs=[str(run_dir(s)) for s in SEEDS],
+        report_dir=ANALYSIS_DIR,
+        axis=(f"--axis-tag {AXIS_TAG}" if AXIS_TAG else ""),
+        de_sig=SCORING["de_significance"],
+        padj=SCORING["de_padj_max"],
+        lfc=SCORING["de_abs_lfc_min"],
     log:
-        OUT_DIR / "logs/aggregate_scoring.log",
+        OUT_BASE / "logs" / "aggregate_cross_seed.log",
     threads: 4
     shell:
-        # TODO Tier 2.5 : `python -m gnn_huvec.cli.perturb_report`
-        "python src/validation/reports/perturb_report.py "
-        "--cross-seed "
-        "--perturb-dirs {OUT_DIR}/perturbation/seed* "
-        "--de-magnitude-csv {input.degs} "
-        "--out-dir $(dirname {output.ranking}) "
-        "&> {log}"
+        "{PY} src/validation/reports/perturb_report.py --cross-seed {params.runs} "
+        "--report-dir {params.report_dir} {params.axis} "
+        "--de-magnitude-csv {DE_CSV} --coexpr-degree-file {COEXPR} "
+        "--de-significance {params.de_sig} --de-padj-max {params.padj} "
+        "--de-abs-lfc-min {params.lfc} --no-signed-fanout &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────
-# Stage 9 — Validation ORA
+# Stage 8b — Interprétation & validation post-perturbation
 # ──────────────────────────────────────────────────────────────────
-
-AGING_DBS = config["validation"]["ora"]["aging_dbs"]
-
-rule validate_ora:
+rule driver_baselines:
+    """Le driver_score bat-il les baselines triviales (degré-contrôlé) ?"""
     input:
-        ranking=OUT_DIR / "scoring/ranked_genes.tsv",
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
     output:
-        results=OUT_DIR / "validation/ora_results.tsv",
-    params:
-        dbs=" ".join(AGING_DBS),
+        baselines=ANALYSIS_DIR / "interpret" / "driver_baselines.tsv",
     log:
-        OUT_DIR / "logs/validate_ora.log",
+        OUT_BASE / "logs" / "driver_baselines.log",
     shell:
-        "python src/validation/ora/ora_consensus.py "
-        "--db aging "
-        "--ranking {input.ranking} "
-        "--out {output.results} "
-        "&> {log}"
+        "{PY} src/validation/reports/driver_baselines.py "
+        "--ranking {input.ranking} --coexpr-file {COEXPR} "
+        "--out {output.baselines} &> {log}"
+
+
+rule interpret_embedding:
+    """Interprétation non-supervisée axe-libre : Louvain(z) + UMAP + ORA + ShinyGO."""
+    input:
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+        model=run_dir(SEEDS[0]) / "best_vgae.pt" if TRAIN_VGAE else [],
+    output:
+        communities=ANALYSIS_DIR / "interpret" / "communities.tsv",
+    params:
+        rd=run_dir(SEEDS[0]),
+        out_dir=ANALYSIS_DIR / "interpret",
+    log:
+        OUT_BASE / "logs" / "interpret_embedding.log",
+    shell:
+        "{PY_TORCH} src/validation/viz/interpret_embedding.py "
+        "--run-dir {params.rd} --ranking {input.ranking} --shinygo "
+        "--out-dir {params.out_dir} &> {log}"
+
+
+rule perturb_decoy:
+    """Null-models décoy N2/N4 (opt-in, torch) → colonne decoy_confidence."""
+    input:
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+    output:
+        decoy=ANALYSIS_DIR / "interpret" / "decoy_confidence.tsv",
+    params:
+        rd=run_dir(SEEDS[0]),
+        top_n=DECOY_TOP_N,
+    log:
+        OUT_BASE / "logs" / "perturb_decoy.log",
+    shell:
+        "{PY_TORCH} src/validation/explain/perturb_decoy.py confidence "
+        "--run-dir {params.rd} --ranking {input.ranking} "
+        "--top-n {params.top_n} --out {output.decoy} &> {log}"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Stage 9 — Validation ORA (Reactome + aging) + cluster_annotation
+# ──────────────────────────────────────────────────────────────────
+rule ora_top_drivers:
+    input:
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+    output:
+        reactome=ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_reactome.tsv",
+        aging=ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_aging.tsv",
+        genes=ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_drivers.txt",
+    params:
+        top_n=ORA_TOP_N,
+    log:
+        OUT_BASE / "logs" / "ora_top_drivers.log",
+    shell:
+        # top-N drivers (col1=gène, tri par driver_score col2) → ORA hypergéométrique
+        "tail -n +2 {input.ranking} | sort -t$'\\t' -k2,2 -gr | "
+        "head -{params.top_n} | cut -f1 > {output.genes} 2> {log} && "
+        "{PY} src/validation/ora/ora_consensus.py --genes {output.genes} "
+        "--db reactome --out {output.reactome} &>> {log} && "
+        "{PY} src/validation/ora/ora_consensus.py --genes {output.genes} "
+        "--db aging --out {output.aging} &>> {log}"
 
 
 rule cluster_annotation:
+    """Annotation biologique cross-seed des cell_groups (group_expression.tsv)."""
     input:
-        graph=OUT_DIR / "graph/hetero_graph.pt",
+        ge=expand(str(run_dir("{seed}") / "group_expression.tsv"), seed=SEEDS),
     output:
-        annotation=OUT_DIR / "validation/cluster_annotation.tsv",
+        annot=ANALYSIS_DIR / "cluster_annotation" / "cluster_annotation.tsv",
+    params:
+        out_dir=ANALYSIS_DIR / "cluster_annotation",
     log:
-        OUT_DIR / "logs/cluster_annotation.log",
+        OUT_BASE / "logs" / "cluster_annotation.log",
     shell:
-        "python src/validation/cluster/cluster_annotation.py "
-        "--run-dir $(dirname {input.graph}) "
-        "--out {output.annotation} "
-        "&> {log}"
+        "{PY} src/validation/cluster/cluster_annotation.py "
+        "--cross-seed-runs {input.ge} --out-dir {params.out_dir} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────
-# Stage 10 — Cross-method comparison (opt-in)
+# Stage 11 — Report final (synthèse markdown des sorties clés)
 # ──────────────────────────────────────────────────────────────────
-
-# Runners internes (réécriture I/O depuis les outputs existants)
-rule runner_from_perturb_report:
+rule report:
     input:
-        ranking=OUT_DIR / "scoring/ranked_genes.tsv",
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+        baselines=ANALYSIS_DIR / "interpret" / "driver_baselines.tsv",
+        communities=ANALYSIS_DIR / "interpret" / "communities.tsv",
+        reactome=ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_reactome.tsv",
+        aging=ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_aging.tsv",
     output:
-        OUT_DIR / "comparison/method_tsv/vgae_perturb_{score_type}.tsv",
-    wildcard_constraints:
-        score_type="driver|discovery|validation",
-    shell:
-        # TODO Tier 2 Phase 1
-        "python -m gnn_huvec.comparison.runners.from_perturb_report "
-        "--ranking {input.ranking} "
-        "--score-type {wildcards.score_type} "
-        "--out {output}"
-
-
-rule runner_from_gnn_vgae:
-    input:
-        scores=expand(
-            OUT_DIR / "models/vgae/seed{seed}/gene_scores.tsv", seed=SEEDS
-        ),
-    output:
-        vgae_imp=OUT_DIR / "comparison/method_tsv/vgae_importance.tsv",
-        mlp=OUT_DIR / "comparison/method_tsv/mlp_baseline.tsv",
-        deepwalk=OUT_DIR / "comparison/method_tsv/deepwalk.tsv",
-        stat=OUT_DIR / "comparison/method_tsv/stat_de.tsv",
-    shell:
-        # TODO Tier 2 Phase 1
-        "python -m gnn_huvec.comparison.runners.from_gnn_vgae "
-        "--scores {input.scores} "
-        "--out-dir $(dirname {output.vgae_imp})"
-
-
-rule runner_from_gnn_lite:
-    input:
-        predictions=OUT_DIR / "models/gnn_lite/gene_predictions.tsv",
-    output:
-        OUT_DIR / "comparison/method_tsv/gnn_lite_supervised.tsv",
-    shell:
-        # TODO Tier 2 Phase 1
-        "python -m gnn_huvec.comparison.runners.from_gnn_lite "
-        "--predictions {input.predictions} "
-        "--out {output}"
-
-
-# Runners externes (opt-in via config)
-rule runner_decoupler_ulm:
-    input:
-        degs=DEGS_TSV,
-    output:
-        OUT_DIR / "comparison/method_tsv/decoupler_ulm.tsv",
-    shell:
-        "python -m gnn_huvec.comparison.runners.decoupler_ulm "
-        "--degs {input.degs} --out {output}"
-
-
-rule runner_dreamwalk:
-    input:
-        graph=OUT_DIR / "graph/hetero_graph.pt",
-    output:
-        OUT_DIR / "comparison/method_tsv/dreamwalk.tsv",
-    shell:
-        "python -m gnn_huvec.comparison.runners.dreamwalk "
-        "--graph {input.graph} --out {output}"
-
-
-# Liste des TSVs comparator selon config
-def comparison_inputs(wildcards):
-    paths = []
-    if config["comparison"]["internal"]:
-        paths += [
-            OUT_DIR / f"comparison/method_tsv/vgae_perturb_{t}.tsv"
-            for t in ["driver", "discovery", "validation"]
+        summary=ANALYSIS_DIR / "report" / "SUMMARY.md",
+    params:
+        name=config["run"]["name"],
+        seeds=", ".join(SEEDS),
+        modes=", ".join(MODES),
+        axe=(AXIS_TAG or "V3 (P4)"),
+        n_seeds=str(len(SEEDS)),
+    run:
+        # Concaténation simple (pas de f-string : le parseur run-block de
+        # Snakemake 7.x ne supporte pas les f-strings à appels/quotes inline).
+        lines = [
+            "# Pipeline VGAE HUVEC — " + params.name,
+            "",
+            "- run_tag : `" + RUN_TAG + "` (" + params.n_seeds + " seeds : " + params.seeds + ")",
+            "- device perturbation : `" + DEVICE + "`",
+            "- axe : `" + params.axe + "`  |  modes : " + params.modes,
+            "",
+            "## Sorties",
+            "- ranking cross-seed : `" + str(input.ranking) + "`",
+            "- baselines (degré-contrôlé) : `" + str(input.baselines) + "`",
+            "- communautés (axe-libre) : `" + str(input.communities) + "`",
+            "- ORA Reactome top : `" + str(input.reactome) + "`",
+            "- ORA aging top : `" + str(input.aging) + "`",
+            "",
         ]
-        paths += [
-            OUT_DIR / "comparison/method_tsv/vgae_importance.tsv",
-            OUT_DIR / "comparison/method_tsv/mlp_baseline.tsv",
-            OUT_DIR / "comparison/method_tsv/deepwalk.tsv",
-            OUT_DIR / "comparison/method_tsv/stat_de.tsv",
-        ]
-        if RUN_GNN_LITE:
-            paths.append(OUT_DIR / "comparison/method_tsv/gnn_lite_supervised.tsv")
-    for m in EXTERNAL_METHODS:
-        paths.append(OUT_DIR / f"comparison/method_tsv/{m}.tsv")
-    return paths
-
-
-rule cross_method_report:
-    input:
-        comparison_inputs,
-    output:
-        report=OUT_DIR / "comparison/cross_method_report.tsv",
-        unique=OUT_DIR / "comparison/vgae_unique_top100.tsv",
-        figures=directory(OUT_DIR / "comparison/figures"),
-    log:
-        OUT_DIR / "logs/cross_method_report.log",
-    shell:
-        # TODO Tier 2 Phase 4
-        "python -m gnn_huvec.cli.cross_method_report "
-        "--method-tsv-dir $(dirname {input[0]}) "
-        "--out-dir $(dirname {output.report}) "
-        "&> {log}"
-
-
-# ──────────────────────────────────────────────────────────────────
-# Stage 11 — Report final HTML
-# ──────────────────────────────────────────────────────────────────
-
-rule generate_report:
-    input:
-        ranking=OUT_DIR / "scoring/ranked_genes.tsv",
-        ora=OUT_DIR / "validation/ora_results.tsv",
-        cluster=OUT_DIR / "validation/cluster_annotation.tsv",
-        comparison=(
-            [OUT_DIR / "comparison/cross_method_report.tsv"]
-            if RUN_COMPARISON else []
-        ),
-    output:
-        html=OUT_DIR / "report/report.html",
-        final_tsv=OUT_DIR / "report/final_ranked_genes.tsv",
-    log:
-        OUT_DIR / "logs/generate_report.log",
-    shell:
-        # TODO Tier 2.5 : `python -m gnn_huvec.cli.generate_html_report`
-        "echo '[STUB] generate_report — voir TODO Tier 2.5' > {log} && "
-        "touch {output.html} {output.final_tsv}"
+        Path(output.summary).parent.mkdir(parents=True, exist_ok=True)
+        Path(output.summary).write_text("\n".join(lines))
