@@ -513,14 +513,22 @@ print()
 # DATA_DIR : données d'entrée (scRNA-seq, PPI, pySCENIC, bases de données).
 # SCENIC_DIR : sorties de pySCENIC (regulons, adjacencies, TF activity).
 # OUT_DIR : dossier de sortie sur /scratch (écriture rapide, non sauvegardé).
-LAB_DIR = "/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/"
-BASE_DIR = os.path.join(LAB_DIR, "gnn")
-DATA_DIR = os.path.join(BASE_DIR, "data")
-SCENIC_DIR = os.path.join(BASE_DIR, "output", "pyscenic")
+# Chemins surchargeables par variable d'environnement (clone portable /
+# orchestration Snakemake). Les défauts reproduisent le comportement
+# historique sur GLiCID — exporter GNN_LAB_DIR / GNN_DATA_DIR /
+# GNN_OUT_DIR_BASE (cf. workflow/Snakefile) pour pointer ailleurs.
+LAB_DIR = os.environ.get(
+    "GNN_LAB_DIR", "/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/")
+BASE_DIR = os.environ.get("GNN_BASE_DIR", os.path.join(LAB_DIR, "gnn"))
+DATA_DIR = os.environ.get("GNN_DATA_DIR", os.path.join(BASE_DIR, "data"))
+SCENIC_DIR = os.environ.get(
+    "GNN_SCENIC_DIR", os.path.join(BASE_DIR, "output", "pyscenic"))
 # OUT_DIR_BASE : racine de sortie. Le run_dir final = OUT_DIR_BASE / RUN_TAG.
 # Cela évite d'écraser une ablation par la suivante : chaque combinaison de
 # modules désactivés (ou hyperparams modifiés) écrit dans son propre dossier.
-OUT_DIR_BASE = "/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae"
+OUT_DIR_BASE = os.environ.get(
+    "GNN_OUT_DIR_BASE",
+    "/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae")
 OUT_DIR = os.path.join(OUT_DIR_BASE, RUN_TAG)
 
 # --- Chemins locaux (décommentez pour debug sur votre machine) ---
@@ -550,7 +558,8 @@ OMNIPATH_CACHE_DIR = (CLI_ARGS.omnipath_cache_dir
 # au contexte) + Corner Sampling (échantillonnage de l'espace des flux) pour
 # estimer l'importance métabolique de chaque gène dans les conditions P4 et P16.
 # HUMESS_DIR pointe vers les sorties HuMess pour les HUVEC.
-HUMESS_DIR = os.path.join(LAB_DIR, "humess", "output_huvec")
+HUMESS_DIR = os.environ.get(
+    "GNN_HUMESS_DIR", os.path.join(LAB_DIR, "humess", "output_huvec"))
 # Local fallback si la structure diffère :
 # HUMESS_DIR = "/home/USER/M2/S2/Stage/Projet_Colin/humess/output_huvec"
 HUMESS_CONDITIONS = ["P4", "P16"]  # Les deux conditions à comparer
