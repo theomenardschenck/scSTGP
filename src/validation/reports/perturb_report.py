@@ -3782,8 +3782,6 @@ def _render_cross_seed_figures(df: pd.DataFrame,
             fig_transitions_scatter_df(
                 sub_fig, out_dir / f"cross_seed_transitions_{mode}_{suffix}.png",
                 f"Cross-seed transitions — {tag_mode} / {kind}")
-            # Heatmaps cross-seed (diff/cosine) supprimées (cleanup 2026-06-18) :
-            # redondantes avec le ranking + le quadrant ; illisibles à 10k gènes.
             fig_cross_seed_quadrant_diff_cosine(
                 sub_fig, out_dir / f"cross_seed_quadrant_diff_cosine_{mode}_{suffix}.png",
                 f"Quadrant diff × cosine — {tag_mode} / {kind}",
