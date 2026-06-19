@@ -109,7 +109,7 @@ if [[ "$SKIP_PERCFG" -eq 0 ]]; then
 
     # 1b. Figures biologiques (viz_explorer) → cross_seed/<config>/figures/
     fdir="$cdir/figures"; mkdir -p "$fdir"
-    $PY src/validation/figures/viz_explorer.py all \
+    $PY src/validation/viz/viz_explorer.py all \
         --version-dir "$cdir" --raw-runs "${rr[@]}" --out-dir "$fdir" \
         2>&1 | grep -E "écrit|Saved|Error" || true
     echo "  figures → $fdir"
@@ -117,7 +117,7 @@ if [[ "$SKIP_PERCFG" -eq 0 ]]; then
     # 1c. interpret_embedding (UMAP + communautés + ShinyGO) → cross_seed/<config>/embed/
     if [[ "$SKIP_EMBED" -eq 0 ]] && echo " $EMBED_CONFIGS " | grep -q " $cfg "; then
       edir="$cdir/embed"; mkdir -p "$edir"
-      $TOPY src/validation/figures/interpret_embedding.py \
+      $TOPY src/validation/viz/interpret_embedding.py \
           --run-dir "${rr[0]}" --ranking "$cdir/cross_seed_gene_ranking.tsv" --shinygo \
           --out-dir "$edir" 2>&1 | grep -E "wrote|umap|community|Error" | head -8 || true
       echo "  embed → $edir"
@@ -164,7 +164,7 @@ fi
 # 2c. pathway × config heatmap
 PW_OUT="$OUT/pathway_summary"; mkdir -p "$PW_OUT"
 echo "  → plot_pathway_heatmap"
-$PY src/validation/figures/plot_pathway_heatmap.py --reports-dir "$CROSS" --out-dir "$PW_OUT" \
+$PY src/validation/viz/plot_pathway_heatmap.py --reports-dir "$CROSS" --out-dir "$PW_OUT" \
     2>&1 | grep -E "Saved|chargées|Error" | head -12 || true
 
 # ---------------------------------------------------------------------------

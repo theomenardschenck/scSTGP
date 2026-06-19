@@ -80,7 +80,7 @@ $PY src/validation/reports/driver_baselines.py --ranking "$RANK" \
 # --- 3. interprétation non-supervisée (axe-libre) ---------------------------
 if [[ "$SKIP_INTERPRET" -eq 0 ]]; then
   echo "[run_analysis] (3) interpret_embedding (communautés + UMAP + ORA + ShinyGO)"
-  $TPY src/validation/figures/interpret_embedding.py \
+  $TPY src/validation/viz/interpret_embedding.py \
       --run-dir "${SEEDS[0]}" --ranking "$RANK" --shinygo \
       --out-dir "$INTERP" || echo "[run_analysis] interpret a échoué (deps ?)"
 fi
@@ -115,18 +115,25 @@ $PY src/validation/ora/ora_consensus.py --genes "$INTERP/ora/top${ORA_TOPN}_driv
 if [[ "$FIGURES" -eq 1 ]]; then
   echo "[run_analysis] (7) figures → interpret/figures/"
   FIG="$INTERP/figures"; mkdir -p "$FIG"
-  $TPY src/validation/figures/visualize_global.py --out-dir "$FIG" umap \
+  $TPY src/validation/viz/visualize_global.py --out-dir "$FIG" umap \
       --run-dir "${SEEDS[0]}" --version-dir "$OUT" || echo "  visualize_global umap ÉCHEC"
   # ranking-seul (pas besoin des runs bruts)
   for cmd in heatmap-clusters tier-distributions aging-bubbles; do
-    $TPY src/validation/figures/viz_explorer.py "$cmd" \
+    $TPY src/validation/viz/viz_explorer.py "$cmd" \
         --version-dir "$OUT" --out-dir "$FIG" 2>/dev/null || echo "  viz_explorer $cmd skip"
   done
   # nécessitent les runs bruts (cosinus per-cluster agrégé / group_expression)
   for cmd in radar lollipop-clusters quadrant heatmap-expression clustermap; do
-    $TPY src/validation/figures/viz_explorer.py "$cmd" --version-dir "$OUT" \
+    $TPY src/validation/viz/viz_explorer.py "$cmd" --version-dir "$OUT" \
         --raw-runs "${SEEDS[@]}" --out-dir "$FIG" 2>/dev/null || echo "  viz_explorer $cmd skip"
   done
 fi
 
-echo "[run_analysis] DONE → cross-seed report: $OUT ; analyses: $INTERP"
+# --- 8. synthèse lisible : ranking_final.tsv + recap.md (racine $OUT) --------
+echo "[run_analysis] (8) summarize_drivers → ranking_final.tsv + recap.md"
+SUMM_ARGS=(--ranking "$RANK" --out-dir "$OUT")
+[[ -f "$INTERP/decoy_confidence.tsv" ]] && SUMM_ARGS+=(--decoy "$INTERP/decoy_confidence.tsv")
+$PY src/validation/reports/summarize_drivers.py "${SUMM_ARGS[@]}" \
+    || echo "[run_analysis] summarize_drivers a échoué"
+
+echo "[run_analysis] DONE → ranking_final: $OUT/ranking_final.tsv ; recap: $OUT/recap.md ; analyses: $INTERP"

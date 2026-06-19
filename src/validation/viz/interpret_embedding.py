@@ -28,11 +28,11 @@ calculés). Le bloc perturbation s'active seulement si un ranking existe.
 Usage
 -----
     # Embedding seul (axe-libre)
-    python src/validation/figures/interpret_embedding.py \\
+    python src/validation/viz/interpret_embedding.py \\
         --run-dir output/gnn_vgae/V5.4.1/v5.4.baseline.s1 --shinygo
 
     # + croisement post-perturbation
-    python src/validation/figures/interpret_embedding.py \\
+    python src/validation/viz/interpret_embedding.py \\
         --run-dir output/gnn_vgae/V5.4.1/v5.4.baseline.s1 \\
         --ranking output/gnn_vgae/V5.4.1/_TEMP_aggcheck/aligned/cross_seed_gene_ranking.tsv
 """
@@ -513,7 +513,8 @@ def fig_umap_interactive(xy: pd.DataFrame, labels: pd.Series,
                          pw_list_drivers: list[str] | None = None,
                          ranking: pd.DataFrame | None = None,
                          n_annotate: int = 15,
-                         ablations: dict | None = None):
+                         ablations: dict | None = None,
+                         plotly_cdn: bool = False):
     """UMAP interactive (Plotly HTML autonome). Menu déroulant de coloration :
     communautés / pathways (top1 communauté) / pathways top-drivers / cibles /
     driver_score / anti-pro / evidence_tier / direction / Δrang vs ablation(s).
@@ -727,7 +728,8 @@ def fig_umap_interactive(xy: pd.DataFrame, labels: pd.Series,
     # --- assemblage HTML : div Plotly + contrôles + JS custom --------------- #
     import json
     from string import Template
-    div_html = fig.to_html(full_html=False, include_plotlyjs=True,
+    div_html = fig.to_html(full_html=False,
+                           include_plotlyjs=("cdn" if plotly_cdn else True),
                            div_id="umap")
     gene_xy = {str(g): [round(float(x), 3), round(float(y), 3)]
                for g, x, y in zip(df.index, df["umap_x"], df["umap_y"])}
@@ -847,6 +849,13 @@ def main():
                     help="Configs d'ablation à croiser dans l'UMAP interactive "
                          "(noms séparés par virgule, résolus en sibling de "
                          "<cross_seed>/<config>/). Défaut 'no-coexpr'. Vide = aucun.")
+    ap.add_argument("--plotly-cdn", action="store_true",
+                    help="UMAP interactive : charger plotly.js depuis le CDN "
+                         "(HTML ~300 Ko au lieu de ~14 Mo ; nécessite internet "
+                         "à l'ouverture). Recommandé pour un site multi-configs.")
+    ap.add_argument("--umap-only", action="store_true",
+                    help="Génère uniquement l'UMAP interactive (saute ORA, "
+                         "ShinyGO et les PNG statiques) → rapide pour bâtir un site.")
     ap.add_argument("--out-dir", type=Path, default=None)
     args = ap.parse_args()
 
@@ -896,48 +905,56 @@ def main():
         print(f"[interpret] {len(ablations)} ablation(s) dans l'UMAP interactive : "
               f"{', '.join(ablations)}")
 
-    summary = per_community_ora(labels, intra, args.min_community_size, score=score)
-    summary.to_csv(out_dir / "community_summary.tsv", sep="\t", index=False)
-    print(f"[interpret] wrote community_summary.tsv ({len(summary)} communautés ; "
-          f"{int(summary['is_novel'].sum())} sans pathway significatif)")
+    if args.umap_only:
+        summary = None
+        print("[interpret] --umap-only : ORA/ShinyGO/PNG sautés")
+    else:
+        summary = per_community_ora(labels, intra, args.min_community_size, score=score)
+        summary.to_csv(out_dir / "community_summary.tsv", sep="\t", index=False)
+        print(f"[interpret] wrote community_summary.tsv ({len(summary)} communautés ; "
+              f"{int(summary['is_novel'].sum())} sans pathway significatif)")
 
     comm_tbl = pd.DataFrame({"community": labels, "intra_degree": intra.round(3)})
 
     if not args.no_umap:
         xy = run_umap(emb, args.n_neighbors, args.seed)
         comm_tbl = comm_tbl.join(xy)
-        fig_umap_communities(xy, labels, out_dir / "umap_communities.png")
         reactome = ora.load_reactome_gmt()
+        # liste de pathways à colorer (summary si dispo, sinon top-drivers/curé)
         if args.pathways:
             pw_list = [p.strip() for p in args.pathways.split(",") if p.strip()]
-        else:
+        elif summary is not None:
             pw_list = pathways_from_summary(summary, reactome, args.n_pathways)
-        fig_umap_pathways(xy, reactome, out_dir / "umap_pathways.png",
-                          pathways=pw_list)
-        # UMAP coloré par driver_score (continu) — si ranking dispo
-        if score is not None:
-            fig_umap_continuous(
-                xy, score, out_dir / "umap_driver_score.png",
-                title="UMAP latent VGAE — driver_score",
-                cbar_label="driver_score", cmap="viridis")
-            # UMAP des pathways portés par les MEILLEURS drivers + étiquettes
-            drv_pw = pathways_from_top_drivers(
-                score, reactome, args.n_top_drivers, args.n_pathways)
-            top_lbl = score.sort_values(ascending=False).head(args.annotate_drivers)
-            fig_umap_pathways(
-                xy, reactome, out_dir / "umap_pathways_top_drivers.png",
-                pathways=drv_pw, annotate_genes=list(top_lbl.index.astype(str)),
-                title=f"UMAP — pathways des top-{args.n_top_drivers} drivers "
-                      f"(étiquettes = top-{args.annotate_drivers})")
+        elif score is not None:
+            pw_list = pathways_from_top_drivers(score, reactome,
+                                                args.n_top_drivers, args.n_pathways)
         else:
-            drv_pw = None
-        # UMAP anti/pro-sénescence (cosine_senescent signé, divergent)
-        if ranking is not None and "cosine_senescent" in ranking.columns:
-            fig_umap_continuous(
-                xy, ranking["cosine_senescent"].astype(float),
-                out_dir / "umap_senescence_direction.png",
-                title="UMAP latent VGAE — anti (<0) / pro (>0) sénescence",
-                cbar_label="cosine_senescent", cmap="coolwarm", diverging=True)
+            pw_list = [p for p in SENESCENCE_PATHWAYS if p in reactome][:args.n_pathways]
+        drv_pw = (pathways_from_top_drivers(score, reactome, args.n_top_drivers,
+                                            args.n_pathways)
+                  if score is not None else None)
+        # PNG statiques (sautés en --umap-only)
+        if not args.umap_only:
+            fig_umap_communities(xy, labels, out_dir / "umap_communities.png")
+            fig_umap_pathways(xy, reactome, out_dir / "umap_pathways.png",
+                              pathways=pw_list)
+            if score is not None:
+                fig_umap_continuous(
+                    xy, score, out_dir / "umap_driver_score.png",
+                    title="UMAP latent VGAE — driver_score",
+                    cbar_label="driver_score", cmap="viridis")
+                top_lbl = score.sort_values(ascending=False).head(args.annotate_drivers)
+                fig_umap_pathways(
+                    xy, reactome, out_dir / "umap_pathways_top_drivers.png",
+                    pathways=drv_pw, annotate_genes=list(top_lbl.index.astype(str)),
+                    title=f"UMAP — pathways des top-{args.n_top_drivers} drivers "
+                          f"(étiquettes = top-{args.annotate_drivers})")
+            if ranking is not None and "cosine_senescent" in ranking.columns:
+                fig_umap_continuous(
+                    xy, ranking["cosine_senescent"].astype(float),
+                    out_dir / "umap_senescence_direction.png",
+                    title="UMAP latent VGAE — anti (<0) / pro (>0) sénescence",
+                    cbar_label="cosine_senescent", cmap="coolwarm", diverging=True)
         # UMAP INTERACTIVE (Plotly HTML : sélecteur de coloration + hover + zoom)
         if not args.no_interactive:
             signed = (ranking["cosine_senescent"].astype(float)
@@ -947,16 +964,17 @@ def main():
                                  out_dir / "umap_interactive.html",
                                  pw_list_drivers=drv_pw, ranking=ranking,
                                  n_annotate=args.annotate_drivers,
-                                 ablations=ablations or None)
+                                 ablations=ablations or None,
+                                 plotly_cdn=args.plotly_cdn)
 
-    if args.shinygo:
+    if args.shinygo and not args.umap_only:
         comms = {int(c): set(g.index) for c, g in labels.groupby(labels)
                  if len(g) >= args.min_community_size}
         ora.export_for_shinygo(comms, out_dir / "shinygo", background=set(labels.index))
         print(f"[interpret] ShinyGO export → {out_dir/'shinygo'}")
 
     # --- BLOC PERTURBATION (optionnel) ---
-    if ranking is not None and args.score_col in ranking.columns:
+    if not args.umap_only and ranking is not None and args.score_col in ranking.columns:
         drv, gene_tbl = perturbation_cross(labels, intra, ranking, args.score_col, args.top_n)
         drv.to_csv(out_dir / "community_drivers.tsv", sep="\t", index=False)
         comm_tbl = comm_tbl.join(gene_tbl[["driver_score", "target_priority"]])
@@ -971,11 +989,12 @@ def main():
 
     comm_tbl.to_csv(out_dir / "communities.tsv", sep="\t")
     print(f"[interpret] wrote communities.tsv ({len(comm_tbl)} gènes)")
-    print("\nTop communautés (taille × enrichissement) :")
-    cols = ["community", "size", "n_sig_pathways", "top1_pathway", "top_aging_db"]
-    if "driver_max" in summary.columns:
-        cols.append("driver_max")
-    print(summary[cols].head(8).to_string(index=False))
+    if summary is not None:
+        print("\nTop communautés (taille × enrichissement) :")
+        cols = ["community", "size", "n_sig_pathways", "top1_pathway", "top_aging_db"]
+        if "driver_max" in summary.columns:
+            cols.append("driver_max")
+        print(summary[cols].head(8).to_string(index=False))
 
 
 if __name__ == "__main__":
