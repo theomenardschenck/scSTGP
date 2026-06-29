@@ -245,20 +245,30 @@ def pathways_from_summary(summary: pd.DataFrame, reactome: dict,
 
 
 def pathways_from_top_drivers(score: pd.Series, reactome: dict,
-                              n_drivers: int, n_pathways: int) -> list[str]:
-    """Pathways REACTOME auxquels appartiennent les meilleurs drivers. Pour
-    chaque pathway, agrège le driver_score de ses membres présents dans le
-    top-`n_drivers` ; trie par cet agrégat → les programmes portés par les
-    drivers les plus forts. Dédupliqué, cappé à `n_pathways`."""
-    top = score.sort_values(ascending=False).head(n_drivers)
-    top_set = set(top.index.astype(str))
-    weight = {}
+                              n_drivers: int, n_pathways: int,
+                              min_size: int = 5, max_size: int = 250,
+                              min_hits: int = 3) -> list[str]:
+    """Pathways REACTOME **sur-représentés** parmi les meilleurs drivers.
+    Pour éviter le biais de taille (les gros pathways génériques contiennent
+    mécaniquement plus de top-drivers), on classe par **fold-enrichment** =
+    observé / attendu, où attendu = n_drivers · |pathway∩univers| / |univers|.
+    Bornes : pathways de `min_size`–`max_size` gènes (∩ univers), ≥ `min_hits`
+    top-drivers. Univers = gènes scorés. Dédupliqué, cappé à `n_pathways`."""
+    universe = set(score.index.astype(str))
+    n_univ = len(universe)
+    top_set = set(score.sort_values(ascending=False).head(n_drivers).index.astype(str))
+    rows = []
     for pw, members in reactome.items():
-        hit = top_set & members
-        if hit:
-            weight[pw] = float(top.reindex(list(hit)).fillna(0.0).sum())
-    ranked = sorted(weight, key=weight.get, reverse=True)
-    return ranked[:n_pathways]
+        mem = members & universe
+        if not (min_size <= len(mem) <= max_size):
+            continue
+        obs = len(top_set & mem)
+        if obs < min_hits:
+            continue
+        expected = n_drivers * len(mem) / n_univ
+        rows.append((pw, obs / expected if expected else 0.0))
+    rows.sort(key=lambda t: t[1], reverse=True)
+    return [pw for pw, _ in rows[:n_pathways]]
 
 
 def fig_umap_pathways(xy: pd.DataFrame, reactome: dict, out: Path,
@@ -559,10 +569,12 @@ def fig_umap_interactive(xy: pd.DataFrame, labels: pd.Series,
         # ligne de hover formatée par gène
         def _fmt(g, nm=name):
             d, r, dd = df.at[g, f"drv__{nm}"], df.at[g, f"rank__{nm}"], df.at[g, f"drank__{nm}"]
-            if pd.isna(d):
+            if pd.isna(d) or pd.isna(r):
                 return f"{nm}: absent"
-            sign = "+" if dd >= 0 else ""
-            return f"{nm}: drv {d:.3f} · rang {int(r)} (Δ{sign}{int(dd)})"
+            s = f"{nm}: drv {d:.3f} · rang {int(r)}"
+            if pd.isna(dd):              # gène absent du ranking de base → pas de Δ
+                return s
+            return s + f" (Δ{'+' if dd >= 0 else ''}{int(dd)})"
         df[f"hov__{name}"] = [_fmt(g) for g in df.index]
 
     base_cols = ["__gene__", "community", "driver", "cos",
@@ -856,6 +868,9 @@ def main():
     ap.add_argument("--umap-only", action="store_true",
                     help="Génère uniquement l'UMAP interactive (saute ORA, "
                          "ShinyGO et les PNG statiques) → rapide pour bâtir un site.")
+    ap.add_argument("--reuse-umap", action="store_true",
+                    help="Réutilise communities.tsv existant (community + umap_x/y) "
+                         "au lieu de recalculer Louvain+UMAP → build quasi-instantané.")
     ap.add_argument("--out-dir", type=Path, default=None)
     args = ap.parse_args()
 
@@ -868,7 +883,20 @@ def main():
     print(f"[interpret] embeddings : {emb.shape[0]} gènes × {emb.shape[1]} dims")
 
     # --- BLOC EMBEDDING (toujours) ---
-    labels, intra, _G = build_communities(emb, args.n_neighbors, args.resolution, args.seed)
+    precomp_xy = None
+    reuse_path = out_dir / "communities.tsv"
+    if args.reuse_umap and reuse_path.exists():
+        ct = pd.read_csv(reuse_path, sep="\t", index_col=0)
+        if {"community", "umap_x", "umap_y"}.issubset(ct.columns):
+            labels = ct["community"].astype(int); labels.name = "community"
+            intra = (ct["intra_degree"] if "intra_degree" in ct.columns
+                     else pd.Series(0.0, index=ct.index, name="intra_degree"))
+            precomp_xy = ct[["umap_x", "umap_y"]].copy()
+            print(f"[interpret] --reuse-umap : {len(labels)} gènes, "
+                  f"{labels.nunique()} communautés (depuis communities.tsv)")
+    if precomp_xy is None:
+        labels, intra, _G = build_communities(emb, args.n_neighbors,
+                                              args.resolution, args.seed)
 
     # score optionnel pour annoter les communautés (driver_score si dispo)
     ranking_path = args.ranking or autodetect_ranking(run_dir)
@@ -917,7 +945,7 @@ def main():
     comm_tbl = pd.DataFrame({"community": labels, "intra_degree": intra.round(3)})
 
     if not args.no_umap:
-        xy = run_umap(emb, args.n_neighbors, args.seed)
+        xy = precomp_xy if precomp_xy is not None else run_umap(emb, args.n_neighbors, args.seed)
         comm_tbl = comm_tbl.join(xy)
         reactome = ora.load_reactome_gmt()
         # liste de pathways à colorer (summary si dispo, sinon top-drivers/curé)
