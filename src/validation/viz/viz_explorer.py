@@ -81,17 +81,20 @@ CELL_GROUP_LABELS = {
     "P16_cluster_3":  "c3\n(SASP-inflam)",
 }
 
-# Aging DBs canoniques (alignées sur ora_consensus.py / cross_seed_gene_ranking)
-AGING_DBS = ["in_senmayo", "in_cellage", "in_genage",
+# Aging DBs canoniques — alignées sur les colonnes réellement produites par
+# gnn_vgae.py (in_genage/in_cellage/in_msigdb_aging/in_ageanno/in_aging_local).
+# NB labels : in_msigdb_aging = MSigDB Hallmarks filtrés par mots-clés aging
+# (= proxy Fridman/OIS) ; in_aging_local = human_age_related_gene.csv (= proxy
+# SenMayo). Il n'existe PAS de colonne in_senmayo distincte.
+AGING_DBS = ["in_cellage", "in_genage",
              "in_msigdb_aging", "in_ageanno", "in_aging_local"]
 # Variantes nommage possibles (fallback)
 AGING_DB_FALLBACKS = {
-    "in_senmayo": "SenMayo",
     "in_cellage": "CellAge",
     "in_genage": "GenAge",
-    "in_msigdb_aging": "MSigDB aging",
+    "in_msigdb_aging": "Fridman/MSigDB-aging",
     "in_ageanno": "AgeAnno",
-    "in_aging_local": "Fridman",
+    "in_aging_local": "SenMayo",
 }
 
 
