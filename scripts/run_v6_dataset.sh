@@ -31,7 +31,7 @@ cd "$(dirname "$0")/.."
 
 NAME="dataset"; MATRIX=""; DE_FILE=""; LABEL="sen_vs_pro"
 GENE_COL=""; DATA_TYPE="auto"; METADATA=""; YOUNG_MAX=""; SENE_MIN=""
-RUN_BASE=""; SEEDS="s1 s2 s3"; OUT_SUFFIX=""; ANALYSIS=0; DRY=0
+RUN_BASE=""; SEEDS="s1 s2 s3"; OUT_SUFFIX=""; ANALYSIS=0; DECOY=0; DRY=0
 PASS=()   # args passés tels quels à run_v6_de_axis.sh (après `--`)
 
 while [[ $# -gt 0 ]]; do case "$1" in
@@ -48,6 +48,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --seeds) SEEDS="$2"; shift 2;;
   --out-suffix) OUT_SUFFIX="$2"; shift 2;;
   --analysis) ANALYSIS=1; shift;;
+  --decoy) DECOY=1; shift;;
   --dry-run) DRY=1; shift;;
   --) shift; PASS=("$@"); break;;
   -h|--help) sed -n '2,40p' "$0"; exit 0;;
@@ -88,7 +89,8 @@ if [[ $ANALYSIS -eq 1 ]]; then
   OUT_PARENT="$(dirname "$RUN_BASE")"
   echo ""
   echo "=== [2] quand les jobs SLURM sont finis (squeue --me vide), lance : ==="
-  echo "bash scripts/run_analysis.sh --out $OUT_PARENT --seeds $SEEDS \\"
-  echo "    --axis-tag $OUT_SUFFIX --skip-interpret"
+  SEED_DIRS=""; for s in $SEEDS; do SEED_DIRS+=" $RUN_BASE.$s"; done
+  echo "bash scripts/run_analysis.sh --out $OUT_PARENT --seeds$SEED_DIRS \\"
+  echo "    --axis-tag $OUT_SUFFIX --skip-interpret$([[ $DECOY -eq 1 ]] && echo ' --decoy')"
 fi
 echo "=== [V6 dataset: $NAME] soumission terminée ==="
