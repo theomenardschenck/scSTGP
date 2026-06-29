@@ -90,6 +90,81 @@ META_COLS = ("passage", "cluster_P16", "cell_state")
 # ---------------------------------------------------------------------------
 # Étape 1 — extract-matrices
 # ---------------------------------------------------------------------------
+def cmd_prep_matrices(args: argparse.Namespace) -> None:
+    """V6 — adaptateur dataset quelconque → expr_<groupe>.csv (échantillons ×
+    gènes), format attendu par grnboost2-local. Lit une matrice (counts/FPKM,
+    genes×samples OU samples×genes, sniff sép.) + un metadata (sample→groupe),
+    transpose si besoin, et écrit une matrice par groupe.
+
+    metadata : TSV/CSV, 1re col = échantillon (= colonnes/lignes de la matrice),
+    2e col = groupe (ou un titre type 'HUVEC_C1_d5' → on garde tel quel ; le
+    découpage en états fin reste au readout, ici on groupe par la valeur brute).
+    """
+    mp = Path(args.matrix)
+    with open(mp) as fh:
+        first = fh.readline()
+    sep = "\t" if first.count("\t") >= first.count(",") else ","
+    df = pd.read_csv(mp, sep=sep)
+    md = pd.read_csv(args.metadata, sep="\t" if str(args.metadata).endswith(".tsv") else ",")
+    skey, sval = md.columns[0], md.columns[args.group_col]
+    grp = dict(zip(md[skey].astype(str), md[sval].astype(str)))
+    samples_md = set(grp)
+
+    # Colonne gène : --gene-col, sinon 1re colonne reconnue, sinon col[0].
+    gene_cands = ["Tracking_id", "hgnc_symbol", "gene_symbol", "gene_name",
+                  "symbol", "gene", "GeneName"]
+    gcol = (args.gene_col or next((c for c in gene_cands if c in df.columns),
+                                  df.columns[0]))
+    # Oriente en samples × genes, piloté par les échantillons du metadata.
+    cols_are_samples = len(samples_md & set(df.columns.astype(str)))
+    if cols_are_samples >= 2:                      # genes × samples → transpose
+        gi = df.set_index(gcol)
+        gi = gi[~gi.index.astype(str).duplicated()]     # dédup gènes
+        keep = [c for c in gi.columns.astype(str) if c in samples_md]
+        df = gi[keep].apply(pd.to_numeric, errors="coerce").T   # samples × genes
+    else:                                          # samples × genes déjà
+        m = df.set_index(df.columns[0]).apply(pd.to_numeric, errors="coerce")
+        df = m.loc[[i for i in m.index.astype(str) if i in samples_md]]
+    print(f"[prep] {df.shape[0]} échantillons × {df.shape[1]} gènes "
+          f"(gène='{gcol}', orient={args.orient})")
+    out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for g in sorted(set(grp.values())):
+        samples = [s for s in df.index.astype(str) if grp.get(s) == g]
+        if not samples:
+            continue
+        sub = df.loc[samples].dropna(axis=1, how="any")
+        out = out_dir / f"expr_{g}.csv"
+        sub.to_csv(out)
+        written.append((g, len(samples), sub.shape[1], out))
+        print(f"[prep] groupe {g}: {len(samples)} échantillons × {sub.shape[1]} gènes → {out}")
+    if not written:
+        sys.exit("[prep] aucun groupe apparié entre matrice et metadata "
+                 "(vérifier que les noms d'échantillons correspondent).")
+    # matrice POOLÉE (tous les échantillons appariés) — fallback non-différentiel
+    # quand un groupe est trop petit pour GRNBoost2 (GBM crash à n<3).
+    pooled = df.loc[[s for s in df.index.astype(str) if s in grp]].dropna(axis=1, how="any")
+    pooled.to_csv(out_dir / "expr_all.csv")
+    print(f"[prep] poolé : {pooled.shape[0]} échantillons × {pooled.shape[1]} gènes → {out_dir/'expr_all.csv'}")
+    # Entrées HuMess (abundance_table genes×samples + samplesheet) — HuMess
+    # construit un modèle métabolique par présence de gènes (robuste petit-n,
+    # ≠ régression coexpr). cf. scripts/make_humess_config.py.
+    if getattr(args, "emit_humess", False):
+        ab = pooled.T  # genes × samples
+        ab.index.name = ""
+        ab.to_csv(out_dir / "abundance_table.tsv", sep="\t")
+        with open(out_dir / "samplesheet.tsv", "w") as fh:
+            for s in pooled.index.astype(str):
+                fh.write(f"{s}\t{grp[s]}\n")
+        print(f"[prep] HuMess : abundance_table.tsv ({ab.shape[0]}×{ab.shape[1]}) "
+              f"+ samplesheet.tsv → {out_dir}")
+    n_min = min(w[1] for w in written)
+    if n_min < 20:
+        print(f"[prep] ⚠️ min {n_min} échantillons/groupe : GRNBoost2/coexpr "
+              f"peu fiable (p≫n) ; <3 = crash GBM → utiliser expr_all.csv (poolé). "
+              f"HuMess (présence de gènes) reste viable.")
+
+
 def cmd_extract_matrices(args: argparse.Namespace) -> None:
     merged_path = Path(args.merged)
     out_dir = Path(args.out_dir)
@@ -249,6 +324,10 @@ def _fit_one_target(target, tf_names, X_tf, y, seed):
     import numpy as np
     from sklearn.ensemble import GradientBoostingRegressor
 
+    # Garde-fou : cible constante ou trop peu d'échantillons → le GBM dégénère
+    # ("Weights sum to zero"). On skip plutôt que de crasher tout le job.
+    if len(y) < 3 or float(np.std(y)) < 1e-12:
+        return []
     # Masque : retirer le gène cible des features s'il est lui-même un TF
     keep = [i for i, tf in enumerate(tf_names) if tf != target]
     if not keep:
@@ -256,13 +335,11 @@ def _fit_one_target(target, tf_names, X_tf, y, seed):
     X = X_tf[:, keep]
     feats = [tf_names[i] for i in keep]
 
-    reg = GradientBoostingRegressor(
-        random_state=seed,
-        n_iter_no_change=_EARLY_STOP_WINDOW,
-        validation_fraction=0.1,
-        tol=1e-4,
-        **_SGBM_KWARGS,
-    )
+    # Early-stopping (split de validation 10%) nécessite assez d'échantillons ;
+    # en-dessous de ~20 on le désactive (sinon 0 sample de validation).
+    es = (dict(n_iter_no_change=_EARLY_STOP_WINDOW, validation_fraction=0.1, tol=1e-4)
+          if len(y) >= 20 else {})
+    reg = GradientBoostingRegressor(random_state=seed, **es, **_SGBM_KWARGS)
     reg.fit(X, y)
     imp = reg.feature_importances_
     out = []
@@ -650,6 +727,25 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    pp = sub.add_parser("prep-matrices",
+                        help="V6 : matrice quelconque (+ metadata sample→groupe) "
+                             "→ expr_<groupe>.csv (échantillons × gènes)")
+    pp.add_argument("--matrix", required=True,
+                    help="counts/FPKM, genes×samples ou samples×genes (sniff)")
+    pp.add_argument("--metadata", required=True,
+                    help="TSV/CSV : col1=échantillon, col-group=groupe/état")
+    pp.add_argument("--group-col", type=int, default=1,
+                    help="index (0-based) de la colonne groupe du metadata (déf. 1)")
+    pp.add_argument("--gene-col", default=None,
+                    help="colonne gène de la matrice (déf. auto : Tracking_id/"
+                         "hgnc_symbol/… sinon 1re colonne)")
+    pp.add_argument("--orient", choices=["auto", "genes-rows", "samples-rows"],
+                    default="auto", help="orientation de la matrice (déf. auto)")
+    pp.add_argument("--emit-humess", action="store_true",
+                    help="émet aussi abundance_table.tsv + samplesheet.tsv (entrées HuMess)")
+    pp.add_argument("--out-dir", default="data/pyscenic/diff_coexpr")
+    pp.set_defaults(func=cmd_prep_matrices)
 
     pe = sub.add_parser("extract-matrices",
                         help="merged → expr_matrix_P4/P16 (jeu de gènes "
