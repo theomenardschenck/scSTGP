@@ -77,6 +77,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # Make gnn_perturbation importable under both layouts:
@@ -426,18 +427,71 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
     }
 
 
+def _axis_headline_scores(dz_mean: np.ndarray, axes: np.ndarray) -> np.ndarray:
+    """Statistique headline = max-|.| signed-cosine entre dz_mean (n_groups, latent)
+    et chaque axe de `axes` (n_axes, latent). Renvoie (n_axes,) — la valeur SIGNÉE
+    au groupe de plus grand |cos| (analogue de max_proj_signed_cosine restreint à
+    l'axe global, cf. ARCH §10.4.7). Vectorisé sur les axes."""
+    dz_norm = np.linalg.norm(dz_mean, axis=1, keepdims=True) + 1e-8   # (n_groups,1)
+    cos = (dz_mean @ axes.T) / dz_norm                               # (n_groups, n_axes)
+    idx = np.argmax(np.abs(cos), axis=0)                             # (n_axes,)
+    return cos[idx, np.arange(cos.shape[1])]
+
+
+def _random_unit_axes(n: int, dim: int, seed: int) -> np.ndarray:
+    """N vecteurs unitaires i.i.d. dans ℝ^dim (nulle directionnelle)."""
+    rng = np.random.default_rng(seed)
+    v = rng.standard_normal((n, dim)).astype(np.float32)
+    return v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-8)
+
+
+def _write_random_axis_null(out_path: Path, genes: list, modes: list,
+                            dz_stack: np.ndarray, axis_global: np.ndarray,
+                            n_axes: int, seed: int) -> None:
+    """Test de spécificité d'axe : compare l'alignement réel (axe sénescence) à une
+    nulle de N axes aléatoires, par gène × mode. Un vrai driver de sénescence a
+    real ≫ nulle ; un mover générique a real ≈ nulle (E[|cos|]≈1/√latent)."""
+    axes = _random_unit_axes(n_axes, dz_stack.shape[2], seed)
+    ag = np.asarray(axis_global, dtype=np.float32)
+    rows = []
+    for i, (g, m) in enumerate(zip(genes, modes)):
+        dz = dz_stack[i]
+        real = float(_axis_headline_scores(dz, ag[None, :])[0])
+        nulls = _axis_headline_scores(dz, axes)
+        anull = np.abs(nulls)
+        rows.append({
+            "target": g, "mode": m,
+            "real_max_cosine": real, "real_abs": abs(real),
+            "null_mean_abs": float(anull.mean()),
+            "null_std": float(nulls.std()),
+            "null_p95_abs": float(np.percentile(anull, 95)),
+            "z_score": float((abs(real) - anull.mean()) / (anull.std() + 1e-8)),
+            "emp_p": float((1 + int((anull >= abs(real)).sum())) / (n_axes + 1)),
+        })
+    pd.DataFrame(rows).sort_values("z_score", ascending=False).to_csv(
+        out_path, sep="\t", index=False)
+    print(f"Wrote {out_path}  ({len(rows)} rows, N={n_axes} random axes)")
+
+
 def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                   top_k: int, fdr: float, out_prefix: Path,
                   reactome_for_pw: dict | None = None,
                   ko_mode: str = "mask", ko_soft_factor: float = 0.1,
                   kd_factor: float = 0.15, ko_edge_factor: float = 1.0,
                   legacy: bool = False, all_limit: int = 0,
-                  gene_subset: list[str] | None = None) -> None:
+                  gene_subset: list[str] | None = None,
+                  cache_dz: bool = False, random_axis_n: int = 0,
+                  random_axis_seed: int = 0) -> None:
     """Perturb every gene in the graph, for each mode, into one TSV per mode.
 
     Output files are `{out_prefix}_{mode}.tsv` (e.g.
     `perturbation_all_genes_knockout.tsv`). Running the script again with a
     different mode won't overwrite a previous mode's output.
+
+    cache_dz / random_axis_n : test de spécificité d'axe (ARCH §10.4.7). Si l'un
+    est demandé, on active le cache Δz (`data._cache_dz`) et on accumule `dz_mean`
+    (axis-indépendant) par gène × mode → `{prefix}_dz_cache.npz` (cache_dz) et/ou
+    une nulle aléatoire `{prefix}_random_axis_{mode}.tsv` (random_axis_n vecteurs).
     """
     gene_symbols = ctx["gene_symbols"]
     # Sélection des gènes À PERTURBER (la boucle). N'altère JAMAIS l'indexation ni
@@ -472,6 +526,17 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
     has_axis = ctx.get("axis_global") is not None
     if has_axis:
         ctx["data"]._collect_signed_fanout = True
+    # Cache Δz / test d'axe (ARCH §10.4.7) : dz_mean est axis-indépendant.
+    collect_dz = bool((cache_dz or random_axis_n > 0) and has_axis)
+    if collect_dz:
+        ctx["data"]._cache_dz = True
+        dz_genes: list[str] = []
+        dz_modes: list[str] = []
+        dz_arrs: list[np.ndarray] = []
+        dz_group_names: list[str] | None = None
+    if (cache_dz or random_axis_n > 0) and not has_axis:
+        print("[warn] --cache-delta-z/--random-axis ignoré : pas d'axe sénescence "
+              "(axis_global=None).")
     fanout_cols = ("source", "target", "mode", "sign_known", "sign_pred",
                    "proj_target", "role_latent_sign")
     fanout_rows: dict[str, list] = {c: [] for c in fanout_cols}
@@ -499,6 +564,15 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                 kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy)
             if summary is None:
                 continue
+            if collect_dz:
+                _dz = summary.pop("_dz_mean_global", None)
+                if _dz is not None:
+                    dz_genes.append(str(gene))
+                    dz_modes.append(mode)
+                    dz_arrs.append(_dz)
+                    if dz_group_names is None:
+                        dz_group_names = summary.get("_dz_group_names")
+                summary.pop("_dz_group_names", None)
             fo = summary.pop("_signed_fanout_rows", None)
             if fo:
                 k = len(fo["source"])
@@ -526,6 +600,30 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
     if has_axis and fanout_rows["source"]:
         pd.DataFrame(fanout_rows).to_csv(out_fanout, sep="\t", index=False)
         print(f"Wrote {out_fanout}  ({len(fanout_rows['source'])} edge rows)")
+
+    # --- Cache Δz + test de spécificité d'axe (ARCH §10.4.7) ---
+    if collect_dz and dz_arrs:
+        dz_stack = np.stack(dz_arrs).astype(np.float32)   # (N, n_groups, latent)
+        gnames = dz_group_names or [f"g{i}" for i in range(dz_stack.shape[1])]
+        axis_g = np.asarray(ctx["axis_global"], dtype=np.float32)
+        if cache_dz:
+            npz = out_prefix.with_name(f"{out_prefix.name}_dz_cache.npz")
+            np.savez_compressed(
+                npz, genes=np.array(dz_genes), modes=np.array(dz_modes),
+                dz_mean=dz_stack, group_names=np.array(gnames), axis_global=axis_g)
+            print(f"Wrote {npz}  (dz_mean {dz_stack.shape}, "
+                  f"re-projetable sur tout axe)")
+        if random_axis_n > 0:
+            for m in modes:
+                idx = [i for i, mm in enumerate(dz_modes) if mm == m]
+                if not idx:
+                    continue
+                out_rand = out_prefix.with_name(
+                    f"{out_prefix.name}_random_axis_{m}.tsv")
+                _write_random_axis_null(
+                    out_rand, [dz_genes[i] for i in idx],
+                    [dz_modes[i] for i in idx], dz_stack[idx],
+                    axis_g, random_axis_n, random_axis_seed)
 
 
 def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
@@ -831,6 +929,19 @@ def main():
                          "robuste ; fallback log_fc).")
     ap.add_argument("--de-axis-padj", type=float, default=0.1,
                     help="seuil padj des ancres (défaut 0.1 ; NaN gardés).")
+    # Cache Δz + test de spécificité d'axe (ARCH §10.4.7 / LOG axis-test).
+    ap.add_argument("--cache-delta-z", action="store_true",
+                    help="persiste dz_mean (gène×mode×cell_group×latent, "
+                         "AXIS-INDÉPENDANT) dans {prefix}_dz_cache.npz → re-projection "
+                         "sur tout axe (effecteur/DE/étranger/aléatoire) SANS "
+                         "ré-encoder. all-genes uniquement.")
+    ap.add_argument("--random-axis", type=int, default=0, metavar="N",
+                    help="test de spécificité : re-projette sur N axes aléatoires "
+                         "unitaires ℝ^latent → nulle par gène×mode "
+                         "({prefix}_random_axis_{mode}.tsv : real vs z_score/emp_p). "
+                         "0 = off ; 200-1000 recommandé. Active le cache Δz.")
+    ap.add_argument("--random-axis-seed", type=int, default=0,
+                    help="graine des axes aléatoires (--random-axis).")
     ap.add_argument("--out-suffix", default="",
                     help="suffixe ajouté au préfixe d'output (avant '_<mode>.tsv'). "
                          "Évite d'écraser les TSV V3 quand on relance la même "
@@ -877,7 +988,10 @@ def main():
                           ko_soft_factor=args.ko_soft_factor,
                           kd_factor=args.kd_factor,
                           ko_edge_factor=args.ko_edge_factor,
-                          legacy=args.legacy, all_limit=args.all_limit)
+                          legacy=args.legacy, all_limit=args.all_limit,
+                          cache_dz=args.cache_delta_z,
+                          random_axis_n=args.random_axis,
+                          random_axis_seed=args.random_axis_seed)
         if args.all_pathways:
             run_all_pathways(ctx, modes, args.oe_factor,
                              args.top_k, args.fdr,
