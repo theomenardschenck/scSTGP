@@ -821,7 +821,8 @@ def cell_group_shift_projected(mu_base: np.ndarray,
                                 axes_cluster: dict,
                                 group_names=CELL_GROUPS,
                                 target_degree: int | None = None,
-                                extent_threshold: float = 1e-3) -> pd.DataFrame:
+                                extent_threshold: float = 1e-3,
+                                collect_dz_mean: bool = False) -> pd.DataFrame:
     """Shift SIGNÉ : projection de Δzᵢ sur les axes sénescence P4 -> P16.
 
     Δzᵢ = μ_pert[i] − μ_base[i].
@@ -860,6 +861,11 @@ def cell_group_shift_projected(mu_base: np.ndarray,
             métrique proj_signed_degree vaudra proj_signed_diff (division par 1).
         extent_threshold : seuil absolu sur |Δzᵢ · u| pour qu'un gène soit
             compté comme "affecté" (défaut 1e-3).
+        collect_dz_mean : si True, stocke dans `df.attrs["dz_mean_global"]`
+            le vecteur `dz_mean_c` (effet moyen pondéré par w_diff, AXIS-INDÉPENDANT)
+            pour chaque cell_group de l'axe global → permet de **re-projeter sur
+            n'importe quel axe** (`cos(dz_mean_c, u)`) sans ré-encoder (cache Δz,
+            test de spécificité d'axe, cf. ARCH §10.4.7).
     """
     assert mu_base.shape == mu_pert.shape, (mu_base.shape, mu_pert.shape)
     delta_z_vec = (mu_pert - mu_base).astype(np.float32)   # (n_genes, latent)
@@ -881,6 +887,7 @@ def cell_group_shift_projected(mu_base: np.ndarray,
 
     deg = max(int(target_degree) if target_degree is not None else 1, 1)
     rows = []
+    dz_mean_store: dict[str, np.ndarray] = {}   # cache Δz (axis-indépendant)
 
     def _row(grp: str, axis_type: str, axis_u: np.ndarray, c_idx: int):
         w = expr[:, c_idx]
@@ -903,6 +910,10 @@ def cell_group_shift_projected(mu_base: np.ndarray,
         dz_mean = (w_diff_nt[:, None] * dz_nt).sum(axis=0) / (total_w_diff + 1e-8)
         dz_mean_norm = float(np.linalg.norm(dz_mean))
         proj_cosine = float(np.dot(dz_mean, axis_u) / (dz_mean_norm + 1e-8))
+        # Cache Δz : dz_mean est AXIS-INDÉPENDANT (ne dépend que de w_diff et Δz)
+        # → on le stocke une fois (axe global) pour re-projeter sur tout axe u.
+        if collect_dz_mean and axis_type == "global":
+            dz_mean_store[grp] = dz_mean.astype(np.float32)
         row = {
             "group": grp,
             "axis_type": axis_type,
@@ -934,7 +945,11 @@ def cell_group_shift_projected(mu_base: np.ndarray,
         c_idx = group_names.index(cluster_name)
         rows.append(_row(cluster_name, "cluster", axis_k, c_idx))
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if collect_dz_mean:
+        df.attrs["dz_mean_global"] = dz_mean_store      # {group: (latent,) f32}
+        df.attrs["dz_group_names"] = list(group_names)
+    return df
 
 
 # --------------------------------------------------------------------------- #
@@ -1437,7 +1452,8 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
         shift_proj_df = cell_group_shift_projected(
             mu_base, mu_pert, group_expr, gene_symbols, target_idx,
             axis_global, axes_cluster,
-            target_degree=target_degree)
+            target_degree=target_degree,
+            collect_dz_mean=bool(getattr(data, "_cache_dz", False)))
 
     # --- Readout SIGNÉ (Solution A signée, §8.A / §9.2) : pondère chaque
     # cible du fan-out signé de S par rôle_cible × signe_S→T → ne s'annule
@@ -1532,6 +1548,11 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
     if shift_proj_df is not None:
         _proj_global = shift_proj_df[shift_proj_df["axis_type"] == "global"]
         _proj_cluster = shift_proj_df[shift_proj_df["axis_type"] == "cluster"]
+        # Le cache Δz vit dans shift_proj_df.attrs (dict d'arrays) ; les slices en
+        # héritent et casseraient pd.concat (comparaison `==` des attrs). On vide
+        # les attrs des slices — le parent shift_proj_df garde l'info (extraite plus bas).
+        _proj_global.attrs = {}
+        _proj_cluster.attrs = {}
 
         _metric_keys = (
             "proj_signed", "proj_signed_diff", "proj_signed_norm",
@@ -1548,6 +1569,15 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
         summary["cell_group_shift_projected_global"] = _pack(_proj_global)
         if len(_proj_cluster) > 0:
             summary["cell_group_shift_projected_cluster"] = _pack(_proj_cluster)
+
+        # Cache Δz (axis-indépendant) : remonté pour re-projection multi-axe
+        # (test de spécificité d'axe, cf. ARCH §10.4.7). Empilé en (n_groups, latent).
+        _dz_store = shift_proj_df.attrs.get("dz_mean_global")
+        if _dz_store:
+            _gn = shift_proj_df.attrs.get("dz_group_names", list(_dz_store.keys()))
+            summary["_dz_mean_global"] = np.stack(
+                [_dz_store[g] for g in _gn]).astype(np.float32)
+            summary["_dz_group_names"] = list(_gn)
 
         # Degré PPI et n_affected médian — utiles pour interpréter la métrique
         # proj_signed_degree et la relation hub/étendue cross-gene.
