@@ -5,6 +5,7 @@ Câblé sur les CLI RÉELLES des scripts (plus de stub `python -m
 gnn_huvec.cli…`). Chemins et paramètres pilotés par config/config.yaml.
 
 Stages orchestrés :
+  0   — build_features   (optionnel)       (scripts/run_v6_build.sh : prep+coexpr+HuMess)
   6   — train_vgae       × seed            (src/gnn/gnn_vgae.py)
   7   — perturb          × seed            (src/perturbation/perturb_top_genes.py)
   8   — aggregate        cross-seed        (src/validation/reports/perturb_report.py)
@@ -85,6 +86,42 @@ GNN_ENV = (
     f"GNN_SCENIC_DIR={SCENIC_DIR}"
 )
 
+# ──────────────────────────────────────────────────────────────────
+# Stage 0 — build features data-dérivées (coexpr + HuMess) — OPTIONNEL
+#   build.enabled=true → orchestre prep/coexpr/HuMess depuis une matrice via
+#   run_v6_build.sh (lui-même cache-aware). Sinon (HUVEC, précalculé) : les
+#   fichiers coexpr/HuMess sont des entrées externes, build_features inactif.
+#   « Démarrer à l'assemblage » = natif : si coexpr_diff.tsv + cs_gene_to_
+#   importance existent déjà, Snakemake saute build_features.
+# ──────────────────────────────────────────────────────────────────
+BUILD        = config.get("build", {})
+BUILD_ON     = BUILD.get("enabled", False)
+HUMESS_CONDS = BUILD.get("conditions", ["pro", "sen"])
+
+def humess_importance_files():
+    return [str(HUMESS_DIR / "models" / c / "cs" / f"cs_gene_to_importance_{c}.tsv")
+            for c in HUMESS_CONDS]
+
+def build_inputs():
+    """Entrées amont (coexpr + HuMess) pour train, seulement si build activé.
+    Si les fichiers existent → build_features sauté (start-from-assembly)."""
+    return ([COEXPR] + humess_importance_files()) if BUILD_ON else []
+
+# Mode BULK (généralisation V6) : injecte l'env dataset-agnostique à gnn_vgae
+# (conditions + matrice/group-meta = sorties prep dans dirname(coexpr_file)) et
+# force la coexpr différentielle. Sans build.enabled → chemin HUVEC inchangé.
+TRAIN_COEXPR_FLAGS = ""
+if BUILD_ON:
+    _coex_dir = str(Path(COEXPR).parent)
+    _conds = ",".join(HUMESS_CONDS)
+    GNN_ENV += (
+        f" GNN_CELL_GROUPS={_conds}"
+        f" GNN_HUMESS_CONDITIONS={_conds}"
+        f" GNN_EXPR_MATRIX={_coex_dir}/expr_all.csv"
+        f" GNN_GROUP_META={_coex_dir}/samplesheet.tsv"
+    )
+    TRAIN_COEXPR_FLAGS = f"--coexpr-mode differential --diff-coexpr-file {COEXPR}"
+
 
 # ──────────────────────────────────────────────────────────────────
 # Cible finale
@@ -109,11 +146,47 @@ rule all:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Stage 0 — build_features : prep → coexpr → HuMess (wrappe run_v6_build.sh)
+# ──────────────────────────────────────────────────────────────────
+rule build_features:
+    output:
+        coexpr=COEXPR,
+        humess=humess_importance_files(),
+    params:
+        matrix=BUILD.get("matrix", ""),
+        metadata=BUILD.get("metadata", ""),
+        gene_col=BUILD.get("gene_col", "Tracking_id"),
+        group_col=BUILD.get("group_col", 2),
+        young=BUILD.get("young_group", "pro"),
+        sen=BUILD.get("sen_group", "sen"),
+        out_dir=str(Path(COEXPR).parent),
+        humess_out=str(HUMESS_DIR),
+        repo=BUILD.get("humess_repo", "../humess"),
+        cs=BUILD.get("humess_cs_nsamples", 1000),
+    log:
+        OUT_BASE / "logs" / "build_features.log",
+    threads: 8
+    resources:
+        mem_mb=16000,
+        runtime=1440,
+    shell:
+        "V6_PY={PY} HUMESS_REPO={params.repo} V6_HUMESS_CS={params.cs} "
+        "bash scripts/run_v6_build.sh --matrix {params.matrix} "
+        "--gene-col {params.gene_col} --group-col {params.group_col} "
+        "--metadata {params.metadata} --young-group {params.young} "
+        "--sen-group {params.sen} --out-dir {params.out_dir} "
+        "--humess-out {params.humess_out} &> {log}"
+
+
+# ──────────────────────────────────────────────────────────────────
 # Stage 6 — Train VGAE (1 run par seed)
 #   gnn_vgae.py construit le graphe ET entraîne (monolithe). Sorties dans
 #   OUT_DIR_BASE/<run_tag>.s<seed>/. --run-tag fixe le nom (sinon "auto").
+#   input build = coexpr+HuMess si build activé (sinon entrées externes).
 # ──────────────────────────────────────────────────────────────────
 rule train_vgae:
+    input:
+        build=build_inputs(),
     output:
         model=run_dir("{seed}") / "best_vgae.pt",
         ranking=run_dir("{seed}") / "gene_ranking_vgae.csv",
@@ -128,7 +201,7 @@ rule train_vgae:
     shell:
         "{GNN_ENV} {PY} src/gnn/gnn_vgae.py "
         "--seed {wildcards.seed} --run-tag {RUN_TAG}.s{wildcards.seed} "
-        "{EXTRA_FLAGS} &> {log}"
+        "{EXTRA_FLAGS} {TRAIN_COEXPR_FLAGS} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────

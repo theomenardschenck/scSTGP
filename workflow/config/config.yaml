@@ -37,6 +37,25 @@ input:
   rna_type: scrna
   degs_path: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
 
+# ── Stage 0 : build features data-dérivées (coexpr + HuMess) depuis une matrice
+#    enabled=false (défaut) → coexpr/HuMess = entrées EXTERNES (HUVEC précalculé).
+#    enabled=true → orchestre prep→coexpr→HuMess via run_v6_build.sh.
+#    « Démarrer à l'assemblage » : laisser enabled=true ; si coexpr_diff.tsv +
+#    cs_gene_to_importance existent, Snakemake saute build_features.
+#    ⚠️ HuMess exige cplex (local) → lancer ce stage en LOCAL, pas sur le cluster.
+build:
+  enabled: false
+  matrix: "data/bulkRNAseq/GSE163251_huvec/GSE163251_fpkm_all.txt"
+  metadata: "data/bulkRNAseq/GSE163251_huvec/GSE163251_metadata.tsv"
+  gene_col: "Tracking_id"
+  group_col: 2
+  young_group: "pro"
+  sen_group: "sen"
+  conditions: ["pro", "sen"]    # conditions HuMess attendues (= cell_groups)
+  humess_repo: "../humess"
+  humess_cs_nsamples: 1000
+  # coexpr écrit dans dirname(paths.coexpr_file) ; HuMess dans paths.humess_dir.
+
 # ── Stage 6 : entraînement VGAE
 models:
   vgae:
