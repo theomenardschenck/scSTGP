@@ -1,0 +1,74 @@
+# ──────────────────────────────────────────────────────────────────
+# config.smoke.yaml — SMOKE TEST du pipeline (fonctionnel, pas scientifique).
+# But : vérifier que TOUT le DAG s'enchaîne sans erreur, vite.
+# Réductions vs config.yaml : 1 seed, peu d'epochs, graphe minimal (pas d'OmniPath
+# /ReactomeFI), 1 seul mode de perturbation, ora_top_n réduit, decoy off.
+#
+#   # dry-run (vérifie le DAG) :
+#   bash workflow/run.sh --dry-run --configfile workflow/config/config.smoke.yaml
+#   # run local (CPU — la perturbation all-genes est lente sur CPU) :
+#   bash workflow/run.sh --backend local --configfile workflow/config/config.smoke.yaml
+#   # run cluster (GPU — recommandé) :
+#   bash workflow/run.sh --backend cluster --configfile workflow/config/config.smoke.yaml
+# ──────────────────────────────────────────────────────────────────
+run:
+  name: "smoke"
+  description: "Smoke test — vérification fonctionnelle du pipeline complet"
+
+paths:
+  data_root: "data"
+  out_base: "output/smoke"                 # runs + analysis ici (cluster : override GNN_OUT_DIR_BASE)
+  humess_dir: "data/humess/output_huvec"
+  scenic_dir: "output/pyscenic"
+  de_magnitude_csv: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
+  coexpr_file: "data/pyscenic/diff_coexpr/coexpr_diff.tsv"
+
+compute:
+  device: "cpu"            # cluster : "auto" (utilise le GPU si dispo → perturbation rapide)
+  python: "python"         # cluster : "python3"
+  python_torch: "python"
+  backend: "local"         # cluster : "cluster"
+
+input:
+  rna_type: scrna
+  degs_path: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
+
+build:
+  enabled: false            # coexpr/HuMess = entrées externes précalculées (HUVEC)
+
+# ── Entraînement RÉDUIT : 1 seed, peu d'epochs, graphe minimal (build + train rapides)
+models:
+  vgae:
+    enabled: true
+    run_tag: "smoke"
+    seeds: [1]
+    extra_flags: "--n-epochs 20 --patience 20"   # court ; graphe = sources par défaut
+  gnn_lite:
+    enabled: false
+
+# ── Perturbation RÉDUITE : 1 mode (au lieu de 3)
+perturbation:
+  enabled: true
+  modes: [knockout]
+  scope: all_genes
+  axis_tag: ""
+  out_suffix: ""
+
+scoring:
+  de_significance: "pvalue"
+  de_padj_max: 0.05
+  de_abs_lfc_min: 0.5
+
+validation:
+  ora_top_n: 50
+  decoy:
+    enabled: false
+    top_n: 40
+  cluster_annotation:
+    enabled: true
+
+comparison:
+  enabled: false
+
+output:
+  generate_html_report: false
