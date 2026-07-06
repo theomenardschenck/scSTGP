@@ -622,6 +622,11 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # ou env GNN_DATA_ROOT.
 # Précédence : --data-root > env GNN_DATA_ROOT > défaut (= gnn_vgae.py:381)
 DATA_ROOT="${DATA_ROOT_CLI:-${GNN_DATA_ROOT:-/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data}}"
+# OUT_DIR_BASE des jobs : /scratch (écriture rapide + WRITABLE). Le code est
+# déployé à plat (src/gnn_vgae.py) → _REPO_ROOT=dirname³ de gnn_vgae remonte un
+# cran trop haut (/scratch/nautilus/users, non writable) → PermissionError l.651.
+# On force donc GNN_OUT_DIR_BASE + GNN_DATA_DIR dans le sbatch (cf. heredoc).
+OUT_BASE_JOB="${GNN_OUT_DIR_BASE:-/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae}"
 TS="$(date +%Y%m%d_%H%M%S)"
 # Slug court pour identifier le run dans le LOG_DIR
 ABL_SLUG="${ABLATIONS//,/_}"
@@ -747,6 +752,16 @@ export PATH="$PATH"
 
 cd "$PROJECT_DIR"
 
+# --- Chemins portables : le code est déployé À PLAT (src/gnn_vgae.py) sur
+# scratch → _REPO_ROOT=dirname³ de gnn_vgae.py est FAUX (remonte à
+# /scratch/nautilus/users, non writable). On force donc les chemins : données
+# d'entrée sur LAB-DATA (DATA_ROOT), sorties sur scratch (writable).
+export GNN_DATA_DIR="$DATA_ROOT"
+export GNN_BASE_DIR="$(dirname "$DATA_ROOT")"
+export GNN_SCENIC_DIR="$(dirname "$DATA_ROOT")/output/pyscenic"
+export GNN_HUMESS_DIR="$(dirname "$(dirname "$DATA_ROOT")")/humess/output_huvec"
+export GNN_OUT_DIR_BASE="$OUT_BASE_JOB"
+
 # Lecture ligne + split TSV via builtins bash (pas de sed/cut sur le nœud).
 mapfile -t _CFG_LINES < "$CONFIGS_FILE"
 LINE="\${_CFG_LINES[\$SLURM_ARRAY_TASK_ID]}"
@@ -763,6 +778,8 @@ echo "[\$(date +%T)] node : \$(hostname)"
 python3 src/gnn_vgae.py \\
     --run-tag "\$RUN_TAG" \\
     --seed "\$SEED" \\
+    --reuse-graph \\
+    --graph-cache "\$GNN_OUT_DIR_BASE/_graph_cache_\${TAG}.pkl" \\
     \$FLAGS
 
 echo "[\$(date +%T)] task \$SLURM_ARRAY_TASK_ID terminée."
