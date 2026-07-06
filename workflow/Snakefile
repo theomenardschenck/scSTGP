@@ -269,7 +269,10 @@ rule perturb:
 rule aggregate_cross_seed:
     input:
         expand(
-            str(run_dir("{seed}") / f"perturbation_all_genes{_PSEG}_{{mode}}.tsv"),
+            # NB : pas de f-string à double-accolade ({{mode}}) — fragile selon la
+            # version de Snakemake (parsing des wildcards). Concaténation simple :
+            # {seed} vient de run_dir, {mode} est un wildcard littéral pour expand.
+            str(run_dir("{seed}")) + "/perturbation_all_genes" + _PSEG + "_{mode}.tsv",
             seed=SEEDS, mode=MODES,
         ),
     output:
