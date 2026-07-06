@@ -71,20 +71,20 @@ ANALYSIS_DIR = OUT_BASE / "analysis" / RUN_TAG
 
 def run_dir(seed):
     """Run dir déterministe écrit par gnn_vgae : OUT_DIR_BASE/<tag>.s<seed>."""
-    return RUNS_DIR / f"{RUN_TAG}.s{seed}"
+    return RUNS_DIR / (str(RUN_TAG) + ".s" + str(seed))
 
 # Préfixe de fichier de perturbation : perturbation_all_genes[_<suffix>]_<mode>.tsv
-_PSEG = f"_{OUT_SUFFIX}" if OUT_SUFFIX else ""
+_PSEG = ("_" + str(OUT_SUFFIX)) if OUT_SUFFIX else ""
 def perturb_tsv(seed, mode):
-    return run_dir(seed) / f"perturbation_all_genes{_PSEG}_{mode}.tsv"
+    return run_dir(seed) / ("perturbation_all_genes" + _PSEG + "_" + str(mode) + ".tsv")
 
 # Environnement injecté à gnn_vgae (chemins portables).
-GNN_ENV = (
-    f"GNN_DATA_DIR={DATA_ROOT} "
-    f"GNN_OUT_DIR_BASE={RUNS_DIR} "
-    f"GNN_HUMESS_DIR={HUMESS_DIR} "
-    f"GNN_SCENIC_DIR={SCENIC_DIR}"
-)
+GNN_ENV = " ".join([
+    "GNN_DATA_DIR=" + str(DATA_ROOT),
+    "GNN_OUT_DIR_BASE=" + str(RUNS_DIR),
+    "GNN_HUMESS_DIR=" + str(HUMESS_DIR),
+    "GNN_SCENIC_DIR=" + str(SCENIC_DIR),
+])
 
 # ──────────────────────────────────────────────────────────────────
 # Stage 0 — build features data-dérivées (coexpr + HuMess) — OPTIONNEL
@@ -99,7 +99,7 @@ BUILD_ON     = BUILD.get("enabled", False)
 HUMESS_CONDS = BUILD.get("conditions", ["pro", "sen"])
 
 def humess_importance_files():
-    return [str(HUMESS_DIR / "models" / c / "cs" / f"cs_gene_to_importance_{c}.tsv")
+    return [str(HUMESS_DIR / "models" / c / "cs" / ("cs_gene_to_importance_" + str(c) + ".tsv"))
             for c in HUMESS_CONDS]
 
 def build_inputs():
@@ -114,13 +114,13 @@ TRAIN_COEXPR_FLAGS = ""
 if BUILD_ON:
     _coex_dir = str(Path(COEXPR).parent)
     _conds = ",".join(HUMESS_CONDS)
-    GNN_ENV += (
-        f" GNN_CELL_GROUPS={_conds}"
-        f" GNN_HUMESS_CONDITIONS={_conds}"
-        f" GNN_EXPR_MATRIX={_coex_dir}/expr_all.csv"
-        f" GNN_GROUP_META={_coex_dir}/samplesheet.tsv"
-    )
-    TRAIN_COEXPR_FLAGS = f"--coexpr-mode differential --diff-coexpr-file {COEXPR}"
+    GNN_ENV += " " + " ".join([
+        "GNN_CELL_GROUPS=" + _conds,
+        "GNN_HUMESS_CONDITIONS=" + _conds,
+        "GNN_EXPR_MATRIX=" + _coex_dir + "/expr_all.csv",
+        "GNN_GROUP_META=" + _coex_dir + "/samplesheet.tsv",
+    ])
+    TRAIN_COEXPR_FLAGS = "--coexpr-mode differential --diff-coexpr-file " + str(COEXPR)
 
 # ──────────────────────────────────────────────────────────────────
 # Split build ↔ train (depuis le refactor modulaire de gnn_vgae) :
@@ -129,8 +129,8 @@ if BUILD_ON:
 #   signature de cache diffère et le graphe est reconstruit. --seed/--run-tag sont
 #   dans _TRAIN_ONLY (exclus de la signature) → un seul cache sert tous les seeds.
 #   GRAPH_CACHE : un cache par run_tag (seed-indépendant), bâti 1× puis réutilisé.
-GRAPH_FLAGS = f"{EXTRA_FLAGS} {TRAIN_COEXPR_FLAGS}".strip()
-GRAPH_CACHE = RUNS_DIR / f"_graph_cache_{RUN_TAG}.pkl"
+GRAPH_FLAGS = (str(EXTRA_FLAGS) + " " + str(TRAIN_COEXPR_FLAGS)).strip()
+GRAPH_CACHE = RUNS_DIR / ("_graph_cache_" + str(RUN_TAG) + ".pkl")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -140,8 +140,8 @@ def final_targets():
     t = [
         ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
         ANALYSIS_DIR / "interpret" / "driver_baselines.tsv",
-        ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_reactome.tsv",
-        ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_aging.tsv",
+        ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_reactome.tsv"),
+        ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_aging.tsv"),
         ANALYSIS_DIR / "report" / "SUMMARY.md",
     ]
     if DECOY_ON:
@@ -246,11 +246,11 @@ rule perturb:
     input:
         model=run_dir("{seed}") / "best_vgae.pt" if TRAIN_VGAE else [],
     output:
-        [run_dir("{seed}") / f"perturbation_all_genes{_PSEG}_{m}.tsv" for m in MODES],
+        [run_dir("{seed}") / ("perturbation_all_genes" + _PSEG + "_" + str(m) + ".tsv") for m in MODES],
     params:
         rd=lambda wc: run_dir(wc.seed),
         modes=" ".join(MODES),
-        suffix=(f"--out-suffix {OUT_SUFFIX}" if OUT_SUFFIX else ""),
+        suffix=(("--out-suffix " + str(OUT_SUFFIX)) if OUT_SUFFIX else ""),
     log:
         OUT_BASE / "logs" / "perturb_s{seed}.log",
     threads: 8
@@ -280,7 +280,7 @@ rule aggregate_cross_seed:
     params:
         runs=[str(run_dir(s)) for s in SEEDS],
         report_dir=ANALYSIS_DIR,
-        axis=(f"--axis-tag {AXIS_TAG}" if AXIS_TAG else ""),
+        axis=(("--axis-tag " + str(AXIS_TAG)) if AXIS_TAG else ""),
         de_sig=SCORING["de_significance"],
         padj=SCORING["de_padj_max"],
         lfc=SCORING["de_abs_lfc_min"],
@@ -354,9 +354,9 @@ rule ora_top_drivers:
     input:
         ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
     output:
-        reactome=ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_reactome.tsv",
-        aging=ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_aging.tsv",
-        genes=ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_drivers.txt",
+        reactome=ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_reactome.tsv"),
+        aging=ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_aging.tsv"),
+        genes=ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_drivers.txt"),
     params:
         top_n=ORA_TOP_N,
     log:
@@ -394,8 +394,8 @@ rule report:
         ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
         baselines=ANALYSIS_DIR / "interpret" / "driver_baselines.tsv",
         communities=ANALYSIS_DIR / "interpret" / "communities.tsv",
-        reactome=ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_reactome.tsv",
-        aging=ANALYSIS_DIR / "interpret" / "ora" / f"top{ORA_TOP_N}_aging.tsv",
+        reactome=ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_reactome.tsv"),
+        aging=ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_aging.tsv"),
     output:
         summary=ANALYSIS_DIR / "report" / "SUMMARY.md",
     params:
