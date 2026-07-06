@@ -30,6 +30,8 @@ compute:
   device: "cpu"            # perturbation : cpu | cuda | auto
   python: "python"         # interpréteur principal (pandas/scipy)
   python_torch: "python"   # interpréteur torch+umap (interpret_embedding / decoy)
+  backend: "local"         # défaut du wrapper workflow/run.sh : local | cluster
+                           # (local = warning + --cores ; cluster = --executor slurm)
 
 # ── Stage 1-4 : entrées précalculées (preprocessing R / pySCENIC / HuMess
 #    restent des prérequis externes — non orchestrés ici).

@@ -122,6 +122,16 @@ if BUILD_ON:
     )
     TRAIN_COEXPR_FLAGS = f"--coexpr-mode differential --diff-coexpr-file {COEXPR}"
 
+# ──────────────────────────────────────────────────────────────────
+# Split build ↔ train (depuis le refactor modulaire de gnn_vgae) :
+#   GRAPH_FLAGS = flags qui AFFECTENT le graphe (§1-7) → DOIVENT être identiques
+#   entre `build_graph` (--build-only) et `train_vgae` (--reuse-graph), sinon la
+#   signature de cache diffère et le graphe est reconstruit. --seed/--run-tag sont
+#   dans _TRAIN_ONLY (exclus de la signature) → un seul cache sert tous les seeds.
+#   GRAPH_CACHE : un cache par run_tag (seed-indépendant), bâti 1× puis réutilisé.
+GRAPH_FLAGS = f"{EXTRA_FLAGS} {TRAIN_COEXPR_FLAGS}".strip()
+GRAPH_CACHE = RUNS_DIR / f"_graph_cache_{RUN_TAG}.pkl"
+
 
 # ──────────────────────────────────────────────────────────────────
 # Cible finale
@@ -184,8 +194,32 @@ rule build_features:
 #   OUT_DIR_BASE/<run_tag>.s<seed>/. --run-tag fixe le nom (sinon "auto").
 #   input build = coexpr+HuMess si build activé (sinon entrées externes).
 # ──────────────────────────────────────────────────────────────────
-rule train_vgae:
+rule build_graph:
+    """Stage 6a — Construit le graphe hétérogène §1-7 UNE fois (seed-indépendant)
+    et écrit le cache, via gnn_vgae --build-only. Tous les seeds le réutilisent
+    (--reuse-graph) → §1-7 (~40 min) n'est plus refait 3×. Mêmes GRAPH_FLAGS que
+    train_vgae ⇒ signature de cache compatible."""
     input:
+        build=build_inputs(),
+    output:
+        cache=GRAPH_CACHE,
+    log:
+        OUT_BASE / "logs" / "build_graph.log",
+    threads: 4
+    resources:
+        mem_mb=32000,
+        runtime=120,
+    shell:
+        "{GNN_ENV} {PY} src/gnn/gnn_vgae.py --build-only "
+        "--run-tag {RUN_TAG}.build --graph-cache {output.cache} "
+        "{GRAPH_FLAGS} &> {log}"
+
+
+rule train_vgae:
+    """Stage 6b — Entraîne 1 run par seed en RÉUTILISANT le cache de build_graph
+    (--reuse-graph). Les mêmes GRAPH_FLAGS garantissent que le cache est validé."""
+    input:
+        cache=GRAPH_CACHE,
         build=build_inputs(),
     output:
         model=run_dir("{seed}") / "best_vgae.pt",
@@ -201,7 +235,8 @@ rule train_vgae:
     shell:
         "{GNN_ENV} {PY} src/gnn/gnn_vgae.py "
         "--seed {wildcards.seed} --run-tag {RUN_TAG}.s{wildcards.seed} "
-        "{EXTRA_FLAGS} {TRAIN_COEXPR_FLAGS} &> {log}"
+        "--reuse-graph --graph-cache {input.cache} "
+        "{GRAPH_FLAGS} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────
