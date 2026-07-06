@@ -50,7 +50,14 @@ PY
 )"
 fi
 
-command -v snakemake >/dev/null || { echo "[run] snakemake introuvable dans le PATH."; exit 1; }
+command -v snakemake >/dev/null || {
+  echo "[run] snakemake introuvable dans le PATH."
+  echo "      Active l'environnement conda du projet (défini dans environment.yml,"
+  echo "      nom 'gnn', contient snakemake-minimal 7.32) :"
+  echo "          conda activate gnn      # ou : micromamba activate gnn"
+  echo "      S'il n'existe pas encore :  conda env create -f environment.yml"
+  exit 1
+}
 
 COMMON=(-s "$SNAKEFILE" --configfile "$CONFIGFILE")
 [[ $DRY -eq 1 ]] && COMMON+=(-n)
@@ -64,9 +71,12 @@ case "$BACKEND" in
     snakemake "${COMMON[@]}" --cores "$CORES" "${PASS[@]}"
     ;;
   cluster)
-    echo "[run] BACKEND=cluster — soumission SLURM via le profil $PROFILE (jobs=$JOBS)."
+    # Snakemake 7.x (environment.yml : snakemake-minimal=7.32) : la soumission
+    # SLURM passe par le profil (clé `cluster:` = sbatch), PAS par `--executor slurm`
+    # (syntaxe v8). Le profil fixe déjà jobs:20 ; --jobs le surcharge.
+    echo "[run] BACKEND=cluster — soumission SLURM via le profil $PROFILE (Snakemake 7.x)."
     set -x
-    snakemake "${COMMON[@]}" --executor slurm --profile "$PROFILE" --jobs "$JOBS" "${PASS[@]}"
+    snakemake "${COMMON[@]}" --profile "$PROFILE" --jobs "$JOBS" "${PASS[@]}"
     ;;
   *)
     echo "[run] backend inconnu : '$BACKEND' (attendu : local | cluster)"; exit 1 ;;
