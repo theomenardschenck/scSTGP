@@ -1,8 +1,11 @@
 # ── Outputs et données (jamais versionnés) ──────────────────────────
 output/
 data/
-figures/
-docs/
+# `figures/` ancré à la racine : sinon il ignore aussi le code source
+# src/validation/figures/ (les figures de sortie vivent sous output/).
+/figures/
+docs/technical
+to_ignore/
 # ── Python ──────────────────────────────────────────────────────────
 __pycache__/
 __init__.py
@@ -56,5 +59,16 @@ scripts/logs/
 
 # ── Other ──────────────────────────
 CLAUDE.md
-TODO
-*.md
+.gitignore
+
+# ── OmniPath full-graph sub-project (standalone, NOT wired — kept out of
+#    git for now, 2026-06-29) ──────────────────────────────────────────
+src/gnn/omnipath_graph.py
+src/gnn/hgnc_alias.py
+scripts/build_omnipath_graph.py
+scripts/*omnipath_graph*.py
+scripts/*omnipath_graph*.sh
+# generated artifacts (large, recalculable)
+data/omnipath/graph/
+data/omnipath/graph_raw/
+data/omnipath/hgnc_alias_map.tsv.gz
