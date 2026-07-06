@@ -2,6 +2,7 @@ name: gnn
 
 channels:
   - conda-forge
+  - bioconda          # requis pour snakemake-minimal
   - pytorch
   - pyg
 
