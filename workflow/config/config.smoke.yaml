@@ -46,13 +46,16 @@ models:
   gnn_lite:
     enabled: false
 
-# ── Perturbation RÉDUITE : 1 mode (au lieu de 3)
+# ── Perturbation RÉDUITE : 1 mode + restreinte à nos cibles (rapide)
 perturbation:
   enabled: true
   modes: [knockout]
   scope: all_genes
   axis_tag: ""
   out_suffix: ""
+  # Restreint la perturbation à un sous-ensemble (nos cibles) → smoke rapide.
+  # "" = tous les gènes du graphe (~11 k, lent en CPU).
+  genes_file: "data/gene_sets/priority_drivers_targets.txt"
 
 scoring:
   de_significance: "pvalue"

@@ -39,7 +39,9 @@ configfile: "config/config.yaml"
 # ──────────────────────────────────────────────────────────────────
 P = config["paths"]
 DATA_ROOT  = Path(P["data_root"]).resolve()
-OUT_BASE   = Path(P["out_base"]).resolve()
+# OUT_BASE : l'env GNN_OUT_DIR_BASE (ex. scratch) PRIME sur paths.out_base du config
+# (le Snakefile réinjecte ensuite cette valeur dans GNN_ENV → cohérent). Sinon config.
+OUT_BASE   = Path(os.environ.get("GNN_OUT_DIR_BASE") or P["out_base"]).resolve()
 HUMESS_DIR = Path(P["humess_dir"]).resolve()
 SCENIC_DIR = Path(P["scenic_dir"]).resolve()
 DE_CSV     = P["de_magnitude_csv"]
@@ -58,6 +60,10 @@ EXTRA_FLAGS = VGAE.get("extra_flags", "")
 MODES      = config["perturbation"]["modes"]
 AXIS_TAG   = config["perturbation"].get("axis_tag", "")
 OUT_SUFFIX = config["perturbation"].get("out_suffix", "")
+# genes_file : restreint la perturbation à un sous-ensemble (nos cibles) via
+# --genes-file. Reste en mode --all-genes → MÊME nom de sortie
+# (perturbation_all_genes_<mode>.tsv), donc l'aval est inchangé. "" = tous les gènes.
+GENES_FILE = config["perturbation"].get("genes_file", "")
 
 SCORING        = config["scoring"]
 ORA_TOP_N      = config["validation"]["ora_top_n"]
@@ -251,6 +257,7 @@ rule perturb:
         rd=lambda wc: run_dir(wc.seed),
         modes=" ".join(MODES),
         suffix=(("--out-suffix " + str(OUT_SUFFIX)) if OUT_SUFFIX else ""),
+        genes=(("--genes-file " + str(GENES_FILE)) if GENES_FILE else ""),
     log:
         OUT_BASE / "logs" / "perturb_s{seed}.log",
     threads: 8
@@ -260,7 +267,7 @@ rule perturb:
     shell:
         "{PY} src/perturbation/perturb_top_genes.py "
         "--run-dir {params.rd} --all-genes --modes {params.modes} "
-        "--device {DEVICE} {params.suffix} &> {log}"
+        "--device {DEVICE} {params.suffix} {params.genes} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────
