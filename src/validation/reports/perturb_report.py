@@ -99,6 +99,12 @@ Outputs
                                          signed_readout / signed_coherence
                                          (role_pert=cosine_senescent headline)
                                          + variantes _de / _latent (diagnostic)
+                                         + (2026-07) driver_score_<axis> par axe
+                                         P4→cluster / transition si présents
+    cross_seed_gene_ranking__<axis>.tsv — un ranking trié par axe P4→cluster
+                                         et par transition inter-cluster
+    cross_seed_per_axis_drivers_long.tsv — long-format (gene, axis, driver_score,
+                                         canon_diff, canon_cos)
     cross_seed_pathway_ranking.tsv    — pathway-level analogue
     cross_seed_*.png                  — robustness, sign stability,
                                          tier distribution, driver figures
@@ -266,6 +272,18 @@ def _row_to_summary(row: pd.Series) -> dict:
         summary["cell_group_shift_projected_global"] = proj_global
     if proj_cluster:
         summary["cell_group_shift_projected_cluster"] = proj_cluster
+    # Axes de transition inter-cluster : labels "src->dst" découverts depuis
+    # les colonnes proj_signed_diff_trans_<label> de la ligne aplatie.
+    proj_transition = {}
+    _pref = "proj_signed_diff_trans_"
+    trans_labels = [c[len(_pref):] for c in row.index
+                    if isinstance(c, str) and c.startswith(_pref)]
+    for label in trans_labels:
+        tdict = {k: g(f"{k}_trans_{label}") for k in _metric_keys}
+        if tdict["proj_signed_diff"] is not None:
+            proj_transition[label] = {k: float(v or 0) for k, v in tdict.items()}
+    if proj_transition:
+        summary["cell_group_shift_projected_transition"] = proj_transition
     return summary
 
 
@@ -1261,6 +1279,130 @@ def _canon_metric(oe, ko, kd, col: str, mode_agg: str = "aligned") -> float:
                 continue
             vals.append(-g(m))
     return float(np.mean(vals)) if vals else 0.0
+
+
+def _canon_axis(oe, ko, kd, diff_col: str, cos_col: str,
+                mode_agg: str = "aligned") -> tuple[float, float, float, bool | None]:
+    """Comme ``_canonicalize_modes`` mais sur des colonnes (diff, cos)
+    ARBITRAIRES — utilisé pour les axes P4->cluster et transition. Renvoie
+    ``(sign, diff, cos, sign_cons)`` où sign_cons = OE et loss s'opposent sur
+    CET axe (None si indéterminable). NaN traités comme absents."""
+    def _get(m, col):
+        if m is None:
+            return None
+        v = m.get(col)
+        return None if v is None or pd.isna(v) else float(v)
+
+    oe_d, ko_d, kd_d = _get(oe, diff_col), _get(ko, diff_col), _get(kd, diff_col)
+    loss_d = ko_d if ko_d is not None else kd_d
+    sign_cons = None
+    if oe_d is not None and loss_d is not None:
+        sign_cons = bool(np.sign(oe_d) == -np.sign(loss_d))
+
+    if mode_agg == "oe-only":
+        if oe_d is not None:
+            return float(np.sign(oe_d)), oe_d, (_get(oe, cos_col) or 0.0), sign_cons
+        if loss_d is not None:
+            lc = _get(ko, cos_col) if ko_d is not None else _get(kd, cos_col)
+            return float(-np.sign(loss_d)), -loss_d, -(lc or 0.0), sign_cons
+        return 0.0, 0.0, 0.0, sign_cons
+
+    diffs, coss = [], []
+    if oe_d is not None and oe_d != 0.0:
+        anchor = np.sign(oe_d)
+        diffs.append(oe_d); coss.append(_get(oe, cos_col) or 0.0)
+        for m, md in ((ko, ko_d), (kd, kd_d)):
+            if md is not None and np.sign(md) == -anchor:
+                diffs.append(-md); coss.append(-(_get(m, cos_col) or 0.0))
+    else:
+        for m, md in ((ko, ko_d), (kd, kd_d)):
+            if md is not None:
+                diffs.append(-md); coss.append(-(_get(m, cos_col) or 0.0))
+    if not diffs:
+        return 0.0, 0.0, 0.0, sign_cons
+    cd, cc = float(np.mean(diffs)), float(np.mean(coss))
+    return float(np.sign(cd)), cd, cc, sign_cons
+
+
+def _discover_axes(columns) -> tuple[list[str], list[str]]:
+    """Depuis les colonnes agrégées, liste les axes P4->cluster (caxis_*) et
+    transition (taxis_*) disponibles. Renvoie (cluster_groups, transition_labels)."""
+    cl = sorted({c[len("caxis_"):-len("_diff")] for c in columns
+                 if c.startswith("caxis_") and c.endswith("_diff")})
+    tr = sorted({c[len("taxis_"):-len("_diff")] for c in columns
+                 if c.startswith("taxis_") and c.endswith("_diff")})
+    return cl, tr
+
+
+def _per_axis_driver_scores(oe, ko, kd, cluster_groups, transition_labels,
+                            hub: bool, vgae_rank, total_genes: int,
+                            mode_agg: str) -> dict:
+    """driver_score par axe P4->cluster et par transition, réutilisant
+    ``_compute_driver_score`` (mêmes poids que le score global). Renvoie un
+    dict de colonnes : driver_score_<axis>, canon_diff_<axis>, canon_cos_<axis>.
+    n_modes = couverture globale (identique) ; sign_cons = par axe."""
+    out: dict[str, float] = {}
+    n_modes = sum(1 for m in (oe, ko, kd) if m is not None)
+
+    def _one(axis_key, diff_col, cos_col):
+        sign, cd, cc, sc = _canon_axis(oe, ko, kd, diff_col, cos_col, mode_agg)
+        ds = _compute_driver_score(cd, cc, n_modes, sc, hub,
+                                   vgae_rank=vgae_rank, total_genes=total_genes)
+        out[f"driver_score_{axis_key}"] = round(ds, 3)
+        out[f"canon_diff_{axis_key}"] = round(cd, 3)
+        out[f"canon_cos_{axis_key}"] = round(cc, 3)
+
+    for grp in cluster_groups:
+        _one(grp, f"caxis_{grp}_diff", f"caxis_{grp}_cosine")
+    for label in transition_labels:
+        # Colonne sûre : "src->dst" garde l'arrow (pas de tab), lisible.
+        _one(f"trans_{label}", f"taxis_{label}_diff", f"taxis_{label}_cosine")
+    return out
+
+
+def _sanitize_axis(axis: str) -> str:
+    """Nom d'axe -> suffixe de fichier sûr (P16_cluster_1 -> c1 ;
+    trans_P4->P16_cluster_2 -> trans_P4_to_c2)."""
+    s = axis.replace("P16_cluster_", "c").replace("->", "_to_")
+    return re.sub(r"[^A-Za-z0-9_]+", "_", s)
+
+
+def write_per_axis_rankings(gene_rank: pd.DataFrame, out_dir: Path) -> list[str]:
+    """Émet, pour chaque axe P4->cluster et transition, un TSV trié
+    ``cross_seed_gene_ranking__<axis>.tsv`` + un TSV long-format
+    ``cross_seed_per_axis_drivers_long.tsv`` (gene, axis, driver_score,
+    canon_diff, canon_cos). Le headline ``cross_seed_gene_ranking.tsv`` (tri
+    global) reste inchangé. Renvoie la liste des axes écrits."""
+    axes = [c[len("driver_score_"):] for c in gene_rank.columns
+            if c.startswith("driver_score_")]
+    if not axes:
+        return []
+    id_cols = [c for c in ("target", "is_tf", "n_modes_present",
+                           "target_ppi_degree", "evidence_tier", "interpretation")
+               if c in gene_rank.columns]
+    long_rows = []
+    for axis in axes:
+        ds, cd, cc = (f"driver_score_{axis}", f"canon_diff_{axis}",
+                      f"canon_cos_{axis}")
+        keep = id_cols + [c for c in (ds, cd, cc) if c in gene_rank.columns]
+        view = (gene_rank[keep]
+                .rename(columns={ds: "driver_score", cd: "canon_diff",
+                                 cc: "canon_cos"})
+                .sort_values("driver_score", ascending=False)
+                .reset_index(drop=True))
+        fn = out_dir / f"cross_seed_gene_ranking__{_sanitize_axis(axis)}.tsv"
+        view.to_csv(fn, sep="\t", index=False)
+        lr = view[["target", "driver_score", "canon_diff", "canon_cos"]].copy()
+        lr.insert(1, "axis", axis)
+        long_rows.append(lr)
+    if long_rows:
+        long = pd.concat(long_rows, ignore_index=True)
+        long.to_csv(out_dir / "cross_seed_per_axis_drivers_long.tsv",
+                    sep="\t", index=False)
+    print(f"Wrote {len(axes)} per-axis ranking(s) + "
+          f"cross_seed_per_axis_drivers_long.tsv "
+          f"(axes: {', '.join(_sanitize_axis(a) for a in axes)})")
+    return axes
 
 
 def _compute_driver_score(canon_diff: float, canon_cos: float, n_modes: int,
@@ -2505,6 +2647,12 @@ def build_gene_ranking(df: pd.DataFrame,
         for _, r in vgae_baseline.iterrows():
             vgae_lookup[str(r["gene"])] = r.to_dict()
 
+    # Axes P4->cluster + transition disponibles (colonnes caxis_*/taxis_*).
+    _cluster_axes, _transition_axes = _discover_axes(g.columns)
+    if _cluster_axes or _transition_axes:
+        print(f"  [per-axis] {len(_cluster_axes)} axe(s) P4->cluster + "
+              f"{len(_transition_axes)} transition(s) → driver_score par axe.")
+
     rows = []
     for target, sub in g.groupby("target"):
         modes = {r["mode"]: r for _, r in sub.iterrows()}
@@ -2666,6 +2814,12 @@ def build_gene_ranking(df: pd.DataFrame,
         driver_score = _compute_driver_score(
             canon_diff, canon_cos, n_modes, sign_cons, any_hub,
             vgae_rank=vgae_rank_int)
+        # driver_score par axe P4->cluster et par transition (mêmes poids ;
+        # non-rankant pour le headline global — colonnes additionnelles).
+        per_axis = _per_axis_driver_scores(
+            oe, ko, kd, _cluster_axes, _transition_axes,
+            hub=any_hub, vgae_rank=vgae_rank_int, total_genes=10500,
+            mode_agg=mode_agg) if (_cluster_axes or _transition_axes) else {}
         discovery_score = _compute_discovery_score(
             canon_diff, canon_cos, n_modes,
             is_de_significant, n_aging_dbs, any_hub,
@@ -2756,6 +2910,7 @@ def build_gene_ranking(df: pd.DataFrame,
             # better at the end for readability of the TSV).
             "member_of_strong_pathways": ";".join(member_of) if member_of else "",
         }
+        rec.update(per_axis)   # driver_score_<axis> + canon_{diff,cos}_<axis>
         rows.append(rec)
 
     out = pd.DataFrame(rows)
@@ -2867,6 +3022,14 @@ def aggregate_cross_seed(perturb_dirs: list[Path] | None = None,
         cluster_vals = {grp: [] for grp in target_groups}
         cluster_vals_cosine = {grp: [] for grp in target_groups}
 
+        # Axes P4->cluster (axes_cluster) + transitions inter-cluster
+        # (axes_transition) : (diff, cos) par axe → driver_score per-cluster/
+        # per-transition. Clés découvertes dynamiquement (grp / "src->dst").
+        caxis_diff: dict[str, list] = {}
+        caxis_cos: dict[str, list] = {}
+        taxis_diff: dict[str, list] = {}
+        taxis_cos: dict[str, list] = {}
+
         for e in entries:
             # On cherche dans le dictionnaire global du summary.json
             g_data = e.get("cell_group_shift_projected_global", {})
@@ -2877,6 +3040,20 @@ def aggregate_cross_seed(perturb_dirs: list[Path] | None = None,
                 val_c = g_data.get(grp, {}).get("proj_signed_cosine")
                 if val_c is not None:
                     cluster_vals_cosine[grp].append(float(val_c))
+            # Vrais axes P4->cluster (u_k = quiescent -> ck).
+            c_data = e.get("cell_group_shift_projected_cluster", {}) or {}
+            for grp, md in c_data.items():
+                if md.get("proj_signed_diff") is not None:
+                    caxis_diff.setdefault(grp, []).append(float(md["proj_signed_diff"]))
+                if md.get("proj_signed_cosine") is not None:
+                    caxis_cos.setdefault(grp, []).append(float(md["proj_signed_cosine"]))
+            # Axes de transition (u = ck -> cl).
+            t_data = e.get("cell_group_shift_projected_transition", {}) or {}
+            for label, md in t_data.items():
+                if md.get("proj_signed_diff") is not None:
+                    taxis_diff.setdefault(label, []).append(float(md["proj_signed_diff"]))
+                if md.get("proj_signed_cosine") is not None:
+                    taxis_cos.setdefault(label, []).append(float(md["proj_signed_cosine"]))
 
         # Calcul de la stabilité du signe (basé sur proj_signed_diff, métrique de référence).
         signs = [np.sign(p) for p in projs if p != 0]
@@ -2929,6 +3106,16 @@ def aggregate_cross_seed(perturb_dirs: list[Path] | None = None,
             res[grp] = float(np.mean(vals)) if vals else np.nan
         for grp, vals in cluster_vals_cosine.items():
             res[f"{grp}_cosine"] = float(np.mean(vals)) if vals else np.nan
+        # Axes P4->cluster + transitions : (diff, cos) moyennés cross-seed.
+        # Consommés par _per_axis_driver_scores (build_gene_ranking).
+        for grp, vals in caxis_diff.items():
+            res[f"caxis_{grp}_diff"] = float(np.mean(vals)) if vals else np.nan
+        for grp, vals in caxis_cos.items():
+            res[f"caxis_{grp}_cosine"] = float(np.mean(vals)) if vals else np.nan
+        for label, vals in taxis_diff.items():
+            res[f"taxis_{label}_diff"] = float(np.mean(vals)) if vals else np.nan
+        for label, vals in taxis_cos.items():
+            res[f"taxis_{label}_cosine"] = float(np.mean(vals)) if vals else np.nan
 
         # Consensus de la direction (pour le texte du TSV)
         if avg_proj > 0:
@@ -3614,6 +3801,9 @@ def run_cross_seed(args) -> None:
         # `target_ppi_degree` if they prefer the V3.3 strict view.
         gene_rank.to_csv(out_dir / "cross_seed_gene_ranking.tsv",
                          sep="\t", index=False)
+        # Multi-axe : rankings par cluster P4->ck + par transition inter-cluster
+        # (colonnes driver_score_<axis>). Headline global inchangé ci-dessus.
+        write_per_axis_rankings(gene_rank, out_dir)
         n_unreliable = gene_rank["interpretation"].astype(str).str.contains(
             r"\[unreliable", regex=True).sum()
         n_hub = int(gene_rank["is_hub_inflated"].sum())

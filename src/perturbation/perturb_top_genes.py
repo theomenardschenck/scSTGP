@@ -67,6 +67,12 @@ Outputs
                   (long-format par arête S→T ; V5.5, gnn_futur §8.A/§9.2 ;
                    --de-file pour le rôle DE ; DE-free sinon)
       <run-dir>/perturbation_all_pathways_{mode}.tsv            — flat TSV
+
+Multi-axe (2026-07) : --cluster-anchor-mode {none,de-markers,manual} redéfinit
+les centroïdes de cluster (marqueurs DE ou ancres Ahn) et --transition-axes
+{none,default,all-pairs} ajoute les axes P4→cluster + transitions inter-cluster.
+Le TSV aplati gagne les colonnes {metric}_trans_{src}->{dst} ; driver_score par
+axe côté perturb_report.py.
 """
 
 from __future__ import annotations
@@ -105,6 +111,19 @@ def _find_project_root(start: Path, fallback_levels: int = 1) -> Path:
 
 
 ROOT = _find_project_root(Path(__file__))
+
+
+def _find_gnn_data_dir(start: Path) -> Path:
+    """Localise data/gnn_data (marqueur des inputs GNN : DEGs par cluster,
+    ancres). Indépendant de ROOT — _find_project_root peut s'arrêter à src/
+    quand src/data/databases existe."""
+    for p in [start.resolve()] + list(start.resolve().parents):
+        if (p / "data" / "gnn_data").is_dir():
+            return p / "data" / "gnn_data"
+    return ROOT / "data" / "gnn_data"
+
+
+GNN_DATA_DIR = _find_gnn_data_dir(Path(__file__))
 PERTURB_SCRIPT = _IMPORT_PATH / "gnn_perturbation.py"   # cf. _IMPORT_PATH : gère nested (src/gnn) + flat (cluster)
 PATHWAY_LIST_DIR = ROOT / "data/pathway_gene_list"
 GMT_PATH = ROOT / "data/databases/c2.cp.reactome.symbols.gmt"
@@ -127,7 +146,8 @@ def _run_perturbation_compat(model, data, gene_symbols, gene_to_idx,
                             axis_global=None, axes_cluster=None,
                             out_dir=None, include_details=False,
                             ko_mode="mask", ko_soft_factor=0.1,
-                            kd_factor=0.15, ko_edge_factor=1.0, legacy=False):
+                            kd_factor=0.15, ko_edge_factor=1.0, legacy=False,
+                            axes_transition=None):
     """Wrapper to run_perturbation_once that handles rétro-compatibility.
 
     Tries to pass include_details + ko_mode (+ V5.5 kd_factor/ko_edge_factor/
@@ -154,8 +174,22 @@ def _run_perturbation_compat(model, data, gene_symbols, gene_to_idx,
             axis_global, axes_cluster, out_dir,
             write_full=True, include_details=include_details,
             ko_mode=ko_mode, ko_soft_factor=ko_soft_factor,
-            kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy)
+            kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy,
+            axes_transition=axes_transition)
     except TypeError as e:
+        if "axes_transition" in str(e):
+            # gnn_perturbation antérieur au multi-axe transition → retry sans.
+            print("[compat] gnn_perturbation sans axes_transition ; retry sans "
+                  "axes de transition (per-cluster/global conservés).")
+            return run_perturbation_once(
+                model, data, gene_symbols, gene_to_idx,
+                spec, base_imp, base_rank, z_cg_base, mu_base,
+                targets, mode, factor, top_k, fdr,
+                reactome, background, group_expr,
+                axis_global, axes_cluster, out_dir,
+                write_full=True, include_details=include_details,
+                ko_mode=ko_mode, ko_soft_factor=ko_soft_factor,
+                kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy)
         # V5.5 kd_factor/ko_edge_factor/legacy pas supportés → retry sans eux
         if "kd_factor" in str(e) or "ko_edge_factor" in str(e) or "legacy" in str(e):
             print("[compat] gnn_perturbation sans params V5.5 (kd_factor/"
@@ -206,6 +240,7 @@ def flatten_summary(target_type: str, target: str,
     shift_gw_direct = summary.get("cell_group_shift_gene_direct_target", {}) or {}
     proj_global = summary.get("cell_group_shift_projected_global", {}) or {}
     proj_cluster = summary.get("cell_group_shift_projected_cluster", {}) or {}
+    proj_transition = summary.get("cell_group_shift_projected_transition", {}) or {}
     row = {
         "target_type": target_type,
         "target": target,
@@ -281,6 +316,15 @@ def flatten_summary(target_type: str, target: str,
             proj_data = proj_cluster[grp]
             for k in _metric_keys:
                 row[f"{k}_cluster_{grp}"] = proj_data.get(k)
+
+    # Projections de transition (src->dst) : clés hors CELL_GROUPS → boucle
+    # dédiée. Colonnes `{metric}_trans_{src}->{dst}` (consommées report-side).
+    _metric_keys = ("proj_signed", "proj_signed_diff", "proj_signed_norm",
+                    "proj_signed_amplitude", "proj_signed_extent",
+                    "proj_signed_degree", "proj_signed_cosine")
+    for label, proj_data in proj_transition.items():
+        for k in _metric_keys:
+            row[f"{k}_trans_{label}"] = proj_data.get(k)
 
     # --- Details block (populated when run_perturbation_once was called with
     # include_details=True). Joined with ';' so a single TSV row carries enough
@@ -376,11 +420,102 @@ def _load_de_axis_anchors(de_file: Path, label: str, top_n: int,
     return (up, down)
 
 
+def _norm_group(name: str) -> str:
+    """Alias court -> nom canonique de cell_group (c0..c3 -> P16_cluster_k)."""
+    name = name.strip()
+    if re.fullmatch(r"c[0-3]", name):
+        return f"P16_cluster_{name[1]}"
+    return name
+
+
+def _load_manual_anchors(path: Path) -> dict:
+    """Ancres manuelles depuis un TSV (group, gene, weight[, ...]). Lignes '#'
+    et l'en-tête ignorées. Renvoie dict[group -> {gene: weight}]."""
+    anchors: dict[str, dict] = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 2 or parts[0].strip().lower() == "group":
+                continue
+            grp = _norm_group(parts[0])
+            gene = parts[1].strip()
+            w = float(parts[2]) if len(parts) > 2 and parts[2].strip() else 1.0
+            anchors.setdefault(grp, {})[gene] = w
+    n = sum(len(v) for v in anchors.values())
+    print(f"[anchors] manual : {n} gène(s) sur {len(anchors)} groupe(s) "
+          f"depuis {Path(path).name}")
+    return anchors
+
+
+def _load_de_marker_anchors(de_dir: Path, top_n: int, weight: str) -> dict:
+    """Ancres DE spécifiques par cluster depuis DEGs_P16_cluster_{k}.csv
+    (cols gene, avg_log2FC, [significant]). Top-N up-marqueurs par cluster.
+    weight='logfc' -> centroïde pondéré par avg_log2FC (>=0) ; 'equal' -> liste.
+    Renvoie dict[P16_cluster_k -> {gene: weight} | list]."""
+    anchors: dict[str, object] = {}
+    for k in range(4):
+        f = Path(de_dir) / f"DEGs_P16_cluster_{k}.csv"
+        if not f.exists():
+            continue
+        df = pd.read_csv(f)
+        if "significant" in df.columns:
+            df = df[df["significant"].astype(str).str.lower().isin(["true", "1"])]
+        lfc_col = "avg_log2FC" if "avg_log2FC" in df.columns else None
+        if lfc_col is None:
+            print(f"[anchors] {f.name} sans avg_log2FC — sauté.")
+            continue
+        df = df[df[lfc_col] > 0].sort_values(lfc_col, ascending=False).head(top_n)
+        grp = f"P16_cluster_{k}"
+        if weight == "logfc":
+            anchors[grp] = {str(r.gene): float(getattr(r, lfc_col))
+                            for r in df.itertuples()}
+        else:
+            anchors[grp] = [str(g) for g in df["gene"].astype(str)]
+    tot = sum(len(v) for v in anchors.values())
+    print(f"[anchors] de-markers : {tot} marqueur(s) sur {len(anchors)} cluster(s) "
+          f"(top-{top_n} up, weight={weight})")
+    return anchors
+
+
+def _build_transition_pairs(mode: str, custom: str | None,
+                            p16_groups=None) -> list | None:
+    """Construit la liste de paires (src, dst) pour les axes de transition.
+
+    custom (prioritaire) : 'src>dst,src>dst' (alias c0..c3 acceptés).
+    Sinon mode : 'none' -> None ; 'default' -> P4->chaque cluster + chemin
+    trajectoire c0->c1->c2->c3 ; 'all-pairs' -> toutes paires ordonnées."""
+    if custom:
+        pairs = []
+        for tok in custom.split(","):
+            tok = tok.strip()
+            if ">" not in tok:
+                continue
+            s, d = tok.split(">", 1)
+            pairs.append((_norm_group(s), _norm_group(d)))
+        return pairs or None
+    if mode == "none":
+        return None
+    p16 = list(p16_groups) if p16_groups else [
+        "P16_cluster_0", "P16_cluster_1", "P16_cluster_2", "P16_cluster_3"]
+    if mode == "all-pairs":
+        groups = ["P4"] + p16
+        return [(a, b) for a in groups for b in groups if a != b]
+    # 'default' : P4 -> chaque cluster + chemin de trajectoire (Ahn/Monocle3).
+    pairs = [("P4", c) for c in p16]
+    path = [g for g in ("P16_cluster_0", "P16_cluster_1",
+                        "P16_cluster_2", "P16_cluster_3") if g in p16]
+    pairs += list(zip(path, path[1:]))
+    return pairs
+
+
 def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
                              n_layers: int, n_heads: int,
                              quiescent_groups=None, p16_groups=None,
                              de_file: Path | None = None, de_sign: int = 1,
-                             effector_axis_genes=None, device: str = "cpu"):
+                             effector_axis_genes=None, device: str = "cpu",
+                             cluster_anchors=None, transition_pairs=None):
     """Load the VGAE run + compute the shared baseline once.
 
     Imports gnn_perturbation lazily so the subprocess TOP-N mode doesn't
@@ -407,15 +542,18 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
         _de = _load_de_role_sign(de_file, gene_symbols, de_sign=de_sign)
         if _de is not None:
             data._de_role_sign = _de
-    spec, base_imp, base_rank, z_cg_base, mu_base, axis_global, axes_cluster = prepare_baseline(
+    (spec, base_imp, base_rank, z_cg_base, mu_base,
+     axis_global, axes_cluster, axes_transition) = prepare_baseline(
         model, data, baseline, gene_symbols, group_expr,
         quiescent_groups=quiescent_groups, p16_groups=p16_groups,
-        effector_axis_genes=effector_axis_genes)
+        effector_axis_genes=effector_axis_genes,
+        cluster_anchors=cluster_anchors, transition_pairs=transition_pairs)
     reactome = _load_gmt()
     background = _load_bg()
     print(f"Loaded run ({len(gene_symbols)} genes); baseline computed; "
           f"group_expression={'OK' if group_expr is not None else 'absent'}; "
-          f"axes={'OK' if axis_global is not None else 'absent'}.")
+          f"axes={'OK' if axis_global is not None else 'absent'}; "
+          f"transition_axes={len(axes_transition or {})}.")
     return {
         "data": data, "model": model,
         "gene_symbols": gene_symbols, "gene_to_idx": gene_to_idx,
@@ -423,6 +561,7 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
         "base_rank": base_rank, "z_cg_base": z_cg_base,
         "mu_base": mu_base, "group_expr": group_expr,
         "axis_global": axis_global, "axes_cluster": axes_cluster,
+        "axes_transition": axes_transition,
         "reactome": reactome, "background": background,
     }
 
@@ -559,6 +698,7 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                 reactome=ctx["reactome"], background=ctx["background"],
                 group_expr=ctx["group_expr"],
                 axis_global=ctx["axis_global"], axes_cluster=ctx["axes_cluster"],
+                axes_transition=ctx.get("axes_transition"),
                 out_dir=None, include_details=True,
                 ko_mode=ko_mode, ko_soft_factor=ko_soft_factor,
                 kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy)
@@ -666,6 +806,7 @@ def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
                 reactome=ctx["reactome"], background=ctx["background"],
                 group_expr=ctx["group_expr"],
                 axis_global=ctx["axis_global"], axes_cluster=ctx["axes_cluster"],
+                axes_transition=ctx.get("axes_transition"),
                 out_dir=None, include_details=True,
                 ko_mode=ko_mode, ko_soft_factor=ko_soft_factor,
                 kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy)
@@ -929,6 +1070,36 @@ def main():
                          "robuste ; fallback log_fc).")
     ap.add_argument("--de-axis-padj", type=float, default=0.1,
                     help="seuil padj des ancres (défaut 0.1 ; NaN gardés).")
+    # Multi-axe P4->cluster + transitions inter-cluster (ancrage centroïdes).
+    ap.add_argument("--cluster-anchor-mode",
+                    choices=["none", "de-markers", "manual"], default="none",
+                    help="redéfinit les CENTROÏDES de cluster (donc axis_global, "
+                         "axes_cluster ET axes_transition) : 'none' = pondération "
+                         "expression (défaut historique) ; 'de-markers' = marqueurs "
+                         "DE spécifiques par cluster (--de-cluster-dir) ; 'manual' = "
+                         "ancres bibliographiques (--cluster-anchors-file, Ahn 2025).")
+    ap.add_argument("--cluster-anchors-file", type=Path,
+                    default=GNN_DATA_DIR / "ahn_cluster_anchors.tsv",
+                    help="TSV (group, gene, weight) pour --cluster-anchor-mode manual. "
+                         "Défaut = ancres Ahn et al. 2025 (mapping empirique).")
+    ap.add_argument("--de-cluster-dir", type=Path,
+                    default=GNN_DATA_DIR,
+                    help="dossier des DEGs_P16_cluster_{k}.csv pour "
+                         "--cluster-anchor-mode de-markers.")
+    ap.add_argument("--de-cluster-top-n", type=int, default=50,
+                    help="nb de marqueurs DE up par cluster (mode de-markers).")
+    ap.add_argument("--de-cluster-weight", choices=["equal", "logfc"],
+                    default="logfc",
+                    help="pondération des ancres DE (équipondéré vs par avg_log2FC).")
+    ap.add_argument("--transition-axes",
+                    choices=["none", "default", "all-pairs"], default="none",
+                    help="axes de transition inter-cluster : 'none' (défaut) ; "
+                         "'default' = P4->chaque cluster + chemin trajectoire "
+                         "c0->c1->c2->c3 ; 'all-pairs' = toutes paires ordonnées.")
+    ap.add_argument("--transition-pairs", default=None,
+                    help="liste explicite de paires 'src>dst' séparées par des "
+                         "virgules (ex. 'P4>c0,c0>c1,c1>c2'). Accepte les alias "
+                         "courts c0..c3. Écrase --transition-axes si fourni.")
     # Cache Δz + test de spécificité d'axe (ARCH §10.4.7 / LOG axis-test).
     ap.add_argument("--cache-delta-z", action="store_true",
                     help="persiste dz_mean (gène×mode×cell_group×latent, "
@@ -970,11 +1141,23 @@ def main():
         elif args.effector_axis:
             _eff = (tuple(s.strip() for s in args.effector_pro.split(",") if s.strip()),
                     tuple(s.strip() for s in args.effector_anti.split(",") if s.strip()))
+        # Ancrage des centroïdes de cluster (DE-markers ou manuel/Ahn).
+        _anchors = None
+        if args.cluster_anchor_mode == "manual":
+            _anchors = _load_manual_anchors(args.cluster_anchors_file)
+        elif args.cluster_anchor_mode == "de-markers":
+            _anchors = _load_de_marker_anchors(
+                args.de_cluster_dir, args.de_cluster_top_n, args.de_cluster_weight)
+        # Axes de transition inter-cluster (P4->ck + chemin trajectoire, etc.).
+        _trans = _build_transition_pairs(args.transition_axes,
+                                         args.transition_pairs, p16_groups=_p)
         ctx = _load_model_and_baseline(run_dir, args.hidden, args.latent,
                                        args.n_layers, args.n_heads,
                                        quiescent_groups=_q, p16_groups=_p,
                                        de_file=args.de_file, de_sign=args.de_sign,
-                                       effector_axis_genes=_eff, device=args.device)
+                                       effector_axis_genes=_eff, device=args.device,
+                                       cluster_anchors=_anchors,
+                                       transition_pairs=_trans)
         _suffix = args.out_suffix  # "" si non fourni → comportement V3 inchangé
         # Subset in-process (--genes-file/--extra-genes) : perturbe une liste
         # choisie AVEC l'axe DE (test concordance). Sinon None → tous les gènes.

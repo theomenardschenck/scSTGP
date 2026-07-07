@@ -12,6 +12,13 @@
 #   effector : axe effecteur-ancré unit(μ[pro]−μ[anti]) → _axisEffector
 #              (référence causale stable, ne pivote pas avec les hyperparams,
 #               cf. gnn_futur §2.2/§7.8 ; pôles via env EFFECTOR_PRO/ANTI).
+#   multi    : axe global V4 (P4+c0) + axes P4→chaque cluster + transitions
+#              inter-cluster c0→c1→c2→c3 (LOG #log-multiaxis) → _axisMULTI.
+#              driver_score PAR AXE côté cross-seed (cross_seed_gene_ranking__
+#              <axis>.tsv + long-format). Réglages via env :
+#                MULTI_TRANSITIONS  (default|all-pairs ; défaut default)
+#                MULTI_ANCHOR_MODE  (none|de-markers|manual ; défaut none —
+#                  'manual' requiert data/gnn_data/ahn_cluster_anchors.tsv).
 # Avec --axis both, chaque run est perturbé deux fois (--out-suffix distinct)
 # → compare V3.7 (axe V4) à V3.6 (axe V3) sur le MÊME modèle entraîné.
 #
@@ -137,6 +144,13 @@ EFF_FLAGS="--effector-axis"
 [[ -n "${EFFECTOR_PRO:-}"  ]] && EFF_FLAGS+=" --effector-pro ${EFFECTOR_PRO}"
 [[ -n "${EFFECTOR_ANTI:-}" ]] && EFF_FLAGS+=" --effector-anti ${EFFECTOR_ANTI}"
 
+# Axe multi-état : global V4 + P4→cluster + transitions. Le mode d'ancrage des
+# centroïdes (none/de-markers/manual) et le jeu de transitions sont pilotés par
+# env pour ne pas multiplier les cas. Défaut = none (axe global V4 INCHANGÉ, on
+# ne fait qu'AJOUTER les sous-axes → comparaison propre).
+MULTI_FLAGS="--transition-axes ${MULTI_TRANSITIONS:-default}"
+[[ -n "${MULTI_ANCHOR_MODE:-}" ]] && MULTI_FLAGS+=" --cluster-anchor-mode ${MULTI_ANCHOR_MODE}"
+
 case "$AXIS" in
     v3)
         AXIS_SPECS=("axisV3::P4")
@@ -153,8 +167,11 @@ case "$AXIS" in
     effector)
         AXIS_SPECS=("axisEffector::P4,P16_cluster_0::${EFF_FLAGS}")
         ;;
+    multi|multiaxis)
+        AXIS_SPECS=("axisMULTI::P4,P16_cluster_0::${MULTI_FLAGS}")
+        ;;
     *)
-        echo "Axis inconnu : $AXIS (v3 | v4 | both | effector)"; exit 1 ;;
+        echo "Axis inconnu : $AXIS (v3 | v4 | both | effector | multi)"; exit 1 ;;
 esac
 
 # Pour --axis v3 (legacy), on conserve le comportement historique : pas de
@@ -191,7 +208,7 @@ fi
 # Requiert des runs DÉJÀ perturbés. Groupe par catégorie (tag sans .s<N>) et
 # enchaîne run_analysis.sh (cross-seed report + baselines + interpret [+ décoy]).
 if [[ $ANALYSIS -eq 1 ]]; then
-    case "$AXIS" in v3) ATAG="";; effector) ATAG="axisEffector";; *) ATAG="axisV4";; esac
+    case "$AXIS" in v3) ATAG="";; effector) ATAG="axisEffector";; multi|multiaxis) ATAG="axisMULTI";; *) ATAG="axisV4";; esac
     EXTRA_FLAGS=""
     [[ $ANALYSIS_DECOY -eq 1 ]] && EXTRA_FLAGS+=" --decoy"
     [[ $ANALYSIS_FIGURES -eq 1 ]] && EXTRA_FLAGS+=" --figures"

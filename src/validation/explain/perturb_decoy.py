@@ -67,8 +67,8 @@ def _encode_mu(model, d):
 
 def _base_axis(model, d, group_expr, gene_symbols):
     mu = _encode_mu(model, d)
-    ag, ac, _ = compute_senescence_axes(mu, group_expr, gene_symbols,
-                                        p16_groups=P16, quiescent_groups=QUI)
+    ag, ac, _at, _ = compute_senescence_axes(mu, group_expr, gene_symbols,
+                                             p16_groups=P16, quiescent_groups=QUI)
     return mu, ag, ac
 
 

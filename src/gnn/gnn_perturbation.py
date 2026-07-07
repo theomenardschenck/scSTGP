@@ -9,7 +9,11 @@ a full REACTOME pathway. Runs a forward pass through the FROZEN encoder
 
   * delta_ranking.csv       — per-gene baseline vs perturbed rank & importance
   * delta_ora_top_up_reactome.tsv — REACTOME ORA on the top rising genes
-  * summary.json            — top movers, stats, signature delta-pathways
+  * summary.json            — top movers, stats, signature delta-pathways ;
+                              projections signées sur l'axe global, les axes
+                              P4→cluster ET les axes de transition inter-cluster
+                              (2026-07 ; centroïdes ancrables DE/Ahn, cf.
+                              compute_senescence_axes)
   * signed_fanout.tsv       — readout signé 1-hop (V5.5, gnn_futur §8.A/§9.2) :
                               par cible T du fan-out signé de S, le signe
                               prédit (bilinéaire) / curé de S→T + la réponse
@@ -708,7 +712,9 @@ def compute_senescence_axes(mu_base: np.ndarray,
                              p16_groups=("P16_cluster_0", "P16_cluster_1",
                                          "P16_cluster_2", "P16_cluster_3"),
                              quiescent_groups=None,
-                             effector_axis_genes=None):
+                             effector_axis_genes=None,
+                             cluster_anchors=None,
+                             transition_pairs=None):
     """Axes quiescent -> sénescent dans l'espace latent des gènes.
 
     effector_axis_genes : optionnel (pro_list, anti_list) de symboles. Si
@@ -718,6 +724,24 @@ def compute_senescence_axes(mu_base: np.ndarray,
         (endpoints canoniques) plutôt que corrélationnelle → ne pivote pas
         avec les hyperparamètres (cf. ASNS §7.8, gnn_futur §2.2/§4b). Les
         axes_cluster restent expression-based (le headline = axis_global).
+
+    cluster_anchors : optionnel dict[group_name -> anchor_spec]. Redéfinit le
+        CENTROÏDE d'un ou plusieurs groupes à partir d'une liste de gènes au
+        lieu de la pondération par expression sur tous les gènes. anchor_spec =
+        liste de symboles (équipondéré) OU dict {symbole: poids}. Le centroïde
+        ancré = Σ wᵢ μᵢ / Σ wᵢ sur les gènes trouvés. Sources typiques :
+          - marqueurs DE spécifiques au cluster (DEGs_P16_cluster_k.csv) ;
+          - ancrage manuel bibliographique (Ahn et al. 2025 — voir
+            data/gnn_data/ahn_cluster_anchors.tsv).
+        Seuls les groupes présents dans le dict sont ré-ancrés ; les autres
+        gardent leur centroïde expression-based. axis_global, axes_cluster ET
+        axes_transition héritent tous des centroïdes ré-ancrés.
+
+    transition_pairs : optionnel liste de tuples (src, dst) de noms de groupes.
+        Pour chaque paire, un axe de TRANSITION inter-cluster est calculé :
+            axes_transition[(src, dst)] = unit( centers[dst] − centers[src] )
+        Permet P4->ck (src=P4), le chemin de trajectoire (Ahn/Monocle3
+        c1->c2->c3) ou toute paire ordonnée. None => aucun axe de transition.
 
     Centroïdes pondérés par l'expression (par groupe) :
         c_g = Σᵢ expr_g[i] · μ_base[i]  /  Σᵢ expr_g[i]
@@ -753,6 +777,8 @@ def compute_senescence_axes(mu_base: np.ndarray,
         axes_cluster  : dict[cluster_name -> (latent_dim,) unit vector]
             La clé est le NOM DU CLUSTER P16 ; l'axe pointe quiescent → ce
             cluster spécifiquement.
+        axes_transition : dict[(src, dst) -> (latent_dim,) unit vector]
+            Axes de transition inter-cluster (vide si transition_pairs=None).
         centers       : dict[group_name -> (latent_dim,)] + clé spéciale
             "_quiescent" = centroïde quiescent agrégé.
     """
@@ -765,11 +791,35 @@ def compute_senescence_axes(mu_base: np.ndarray,
     p16_list = list(p16_groups)
 
     expr_by_gene = group_expr.set_index("gene").reindex(gene_symbols).fillna(0.0)
+    s2i = {g: i for i, g in enumerate(gene_symbols)}
+
+    def _anchor_centroid(spec, name):
+        """Centroïde ancré sur une liste de gènes. spec = liste de symboles
+        (poids 1) ou dict {symbole: poids}. Renvoie None si aucun gène trouvé."""
+        items = list(spec.items()) if isinstance(spec, dict) else [(g, 1.0) for g in spec]
+        idx, w = [], []
+        for g, wg in items:
+            if g in s2i:
+                idx.append(s2i[g]); w.append(float(wg))
+        if not idx:
+            print(f"[warn] cluster_anchors['{name}'] : 0/{len(items)} gène(s) "
+                  "trouvé(s) — fallback centroïde expression.")
+            return None
+        w = np.asarray(w, dtype=np.float32)
+        if len(idx) < len(items):
+            print(f"  [axes] anchor '{name}' : {len(idx)}/{len(items)} gènes trouvés.")
+        return (w[:, None] * mu_base[idx]).sum(axis=0) / (w.sum() + 1e-8)
+
+    cluster_anchors = cluster_anchors or {}
     centers: dict[str, np.ndarray] = {}
     for g in set(quiescent_list + p16_list):
-        w = expr_by_gene[f"mean_{g}"].to_numpy().astype(np.float32)
-        w_sum = float(w.sum()) + 1e-8
-        centers[g] = (w[:, None] * mu_base).sum(axis=0) / w_sum
+        anchored = _anchor_centroid(cluster_anchors[g], g) if g in cluster_anchors else None
+        if anchored is not None:
+            centers[g] = anchored.astype(np.float32)
+        else:
+            w = expr_by_gene[f"mean_{g}"].to_numpy().astype(np.float32)
+            w_sum = float(w.sum()) + 1e-8
+            centers[g] = (w[:, None] * mu_base).sum(axis=0) / w_sum
 
     # Centroïde quiescent agrégé (équipondéré sur les groupes listés)
     quiescent_center = np.mean(np.stack([centers[g] for g in quiescent_list]),
@@ -809,7 +859,30 @@ def compute_senescence_axes(mu_base: np.ndarray,
         else:
             print(f"[warn] effector axis : pro={len(pro_i)} anti={len(anti_i)} "
                   "gènes trouvés — fallback axe expression.")
-    return axis_global, axes_cluster, centers
+
+    # Axes de transition inter-cluster (src -> dst). On complète `centers` pour
+    # tout groupe référencé par une paire mais absent des listes quiescent/p16.
+    axes_transition: dict[tuple, np.ndarray] = {}
+    if transition_pairs:
+        for src, dst in transition_pairs:
+            for g in (src, dst):
+                if g not in centers:
+                    anchored = (_anchor_centroid(cluster_anchors[g], g)
+                                if g in cluster_anchors else None)
+                    if anchored is not None:
+                        centers[g] = anchored.astype(np.float32)
+                    elif f"mean_{g}" in expr_by_gene.columns:
+                        w = expr_by_gene[f"mean_{g}"].to_numpy().astype(np.float32)
+                        centers[g] = (w[:, None] * mu_base).sum(axis=0) / (float(w.sum()) + 1e-8)
+                    else:
+                        print(f"[warn] transition group '{g}' absent du "
+                              "group_expression — paire ignorée.")
+            if src in centers and dst in centers:
+                axes_transition[(src, dst)] = unit(centers[dst] - centers[src],
+                                                   f"{src}->{dst}")
+        print(f"  [axes] {len(axes_transition)} axe(s) de transition : "
+              f"{[f'{s}->{d}' for s, d in axes_transition]}")
+    return axis_global, axes_cluster, axes_transition, centers
 
 
 def cell_group_shift_projected(mu_base: np.ndarray,
@@ -822,7 +895,8 @@ def cell_group_shift_projected(mu_base: np.ndarray,
                                 group_names=CELL_GROUPS,
                                 target_degree: int | None = None,
                                 extent_threshold: float = 1e-3,
-                                collect_dz_mean: bool = False) -> pd.DataFrame:
+                                collect_dz_mean: bool = False,
+                                axes_transition: dict | None = None) -> pd.DataFrame:
     """Shift SIGNÉ : projection de Δzᵢ sur les axes sénescence P4 -> P16.
 
     Δzᵢ = μ_pert[i] − μ_base[i].
@@ -944,6 +1018,15 @@ def cell_group_shift_projected(mu_base: np.ndarray,
             continue
         c_idx = group_names.index(cluster_name)
         rows.append(_row(cluster_name, "cluster", axis_k, c_idx))
+
+    # --- Axe de transition src -> dst : pondération par l'expression du groupe
+    # DESTINATION (les gènes caractérisant l'état d'arrivée). Le label de groupe
+    # encode la paire ; proj_signed_cosine reste la métrique sans-poids clé.
+    for (src, dst), axis_u in (axes_transition or {}).items():
+        if dst not in group_names:
+            continue
+        rows.append(_row(f"{src}->{dst}", "transition", axis_u,
+                         group_names.index(dst)))
 
     df = pd.DataFrame(rows)
     if collect_dz_mean:
@@ -1310,7 +1393,8 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads, device="cpu"):
 # --------------------------------------------------------------------------- #
 def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None,
                      quiescent_groups=None, p16_groups=None,
-                     effector_axis_genes=None):
+                     effector_axis_genes=None, cluster_anchors=None,
+                     transition_pairs=None):
     """Compute the baseline once; reused across many perturbations.
 
     Args:
@@ -1330,6 +1414,13 @@ def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None,
         mu_base      : (n_genes, latent) embedding baseline — shift gene-weighted.
         axis_global  : (latent,) axe quiescent -> mean(sénescent). None si group_expr absent.
         axes_cluster : dict[P16_cluster_k -> (latent,)] axes par cluster. None idem.
+        axes_transition : dict[(src, dst) -> (latent,)] axes inter-cluster ({} / None).
+
+    Args (suite):
+        cluster_anchors : optionnel dict[group -> gene-spec] (voir
+            compute_senescence_axes) : ré-ancre les centroïdes de groupe sur des
+            marqueurs DE ou des ancres manuelles au lieu de l'expression.
+        transition_pairs : optionnel liste de (src, dst) → axes de transition.
     """
     spec_map = dict(zip(baseline_df["gene"].astype(str),
                         baseline_df["vgae_specificity"].astype(float)))
@@ -1355,18 +1446,21 @@ def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None,
                               if g not in set(quiescent_groups)]
             else:
                 p16_groups = default_p16
-        axis_global, axes_cluster, _centers = compute_senescence_axes(
+        axis_global, axes_cluster, axes_transition, _centers = compute_senescence_axes(
             mu_base, group_expr, gene_symbols,
             p16_groups=tuple(p16_groups),
             quiescent_groups=(tuple(quiescent_groups)
                               if quiescent_groups is not None else None),
-            effector_axis_genes=effector_axis_genes)
+            effector_axis_genes=effector_axis_genes,
+            cluster_anchors=cluster_anchors,
+            transition_pairs=transition_pairs)
         print(f"  axis_global ‖·‖ pre-unit = {np.linalg.norm(axis_global):.4f} "
               f"(1.0 attendu post-normalisation)")
     else:
-        axis_global, axes_cluster = None, None
+        axis_global, axes_cluster, axes_transition = None, None, {}
 
-    return spec, base_imp, base_rank, z_cg_base, mu_base, axis_global, axes_cluster
+    return (spec, base_imp, base_rank, z_cg_base, mu_base,
+            axis_global, axes_cluster, axes_transition)
 
 
 def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
@@ -1377,7 +1471,8 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
                           out_dir=None, write_full=True,
                           include_details=False,
                           ko_mode="mask", ko_soft_factor=0.1,
-                          kd_factor=0.15, ko_edge_factor=1.0, legacy=False):
+                          kd_factor=0.15, ko_edge_factor=1.0, legacy=False,
+                          axes_transition=None):
     """Run a single perturbation and return its summary dict.
 
     Args:
@@ -1453,7 +1548,8 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
             mu_base, mu_pert, group_expr, gene_symbols, target_idx,
             axis_global, axes_cluster,
             target_degree=target_degree,
-            collect_dz_mean=bool(getattr(data, "_cache_dz", False)))
+            collect_dz_mean=bool(getattr(data, "_cache_dz", False)),
+            axes_transition=axes_transition)
 
     # --- Readout SIGNÉ (Solution A signée, §8.A / §9.2) : pondère chaque
     # cible du fan-out signé de S par rôle_cible × signe_S→T → ne s'annule
@@ -1548,11 +1644,13 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
     if shift_proj_df is not None:
         _proj_global = shift_proj_df[shift_proj_df["axis_type"] == "global"]
         _proj_cluster = shift_proj_df[shift_proj_df["axis_type"] == "cluster"]
+        _proj_transition = shift_proj_df[shift_proj_df["axis_type"] == "transition"]
         # Le cache Δz vit dans shift_proj_df.attrs (dict d'arrays) ; les slices en
         # héritent et casseraient pd.concat (comparaison `==` des attrs). On vide
         # les attrs des slices — le parent shift_proj_df garde l'info (extraite plus bas).
         _proj_global.attrs = {}
         _proj_cluster.attrs = {}
+        _proj_transition.attrs = {}
 
         _metric_keys = (
             "proj_signed", "proj_signed_diff", "proj_signed_norm",
@@ -1569,6 +1667,9 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
         summary["cell_group_shift_projected_global"] = _pack(_proj_global)
         if len(_proj_cluster) > 0:
             summary["cell_group_shift_projected_cluster"] = _pack(_proj_cluster)
+        if len(_proj_transition) > 0:
+            # Clés = "src->dst" (label de groupe du _row de transition).
+            summary["cell_group_shift_projected_transition"] = _pack(_proj_transition)
 
         # Cache Δz (axis-indépendant) : remonté pour re-projection multi-axe
         # (test de spécificité d'axe, cf. ARCH §10.4.7). Empilé en (n_groups, latent).
@@ -1774,7 +1875,8 @@ def main():
     print(f"Mode={args.mode} | targets in graph={len(hit)} | "
           f"tag={tag} | out={out_dir}")
 
-    spec, base_imp, base_rank, z_cg_base, mu_base, axis_global, axes_cluster = prepare_baseline(
+    (spec, base_imp, base_rank, z_cg_base, mu_base,
+     axis_global, axes_cluster, axes_transition) = prepare_baseline(
         model, data, baseline, gene_symbols, group_expr,
         quiescent_groups=_q, p16_groups=_p)
 
@@ -1790,6 +1892,7 @@ def main():
         reactome=reactome, background=background,
         group_expr=group_expr,
         axis_global=axis_global, axes_cluster=axes_cluster,
+        axes_transition=axes_transition,
         out_dir=out_dir, write_full=not args.summary_only,
         ko_mode=args.ko_mode, ko_soft_factor=args.ko_soft_factor,
         kd_factor=args.kd_factor, ko_edge_factor=args.ko_edge_factor,
