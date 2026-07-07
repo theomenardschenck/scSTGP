@@ -39,6 +39,19 @@ GRAPH_FLAGS = {
                 "--kl-beta-max 0.0001"),
 }
 
+# Ablations : source à DÉSACTIVER → flag(s) --no-*. Ajoutés APRÈS les flags graphe
+# (argparse : le dernier gagne) → désactivent même une source activée par 'signed'.
+ABLATIONS = {
+    "ppi":         "--no-ppi",
+    "reactome":    "--no-reactome",
+    "coexpr":      "--no-coexpr",
+    "scenic":      "--no-scenic-regulons",
+    "humess":      "--no-humess",
+    "cell-groups": "--no-cell-group-edges",
+    "omnipath":    "--no-omnipath-signaling --no-omnipath-tf-curated",
+    "reactome-fi": "--no-reactome-fi",
+}
+
 
 # ── Helpers de saisie ───────────────────────────────────────────────────────
 def ask(prompt, default=None, choices=None):
@@ -178,6 +191,20 @@ def main():
     epochs = ask_int("Epochs d'entraînement", default=P["epochs"])
     patience = P["patience"]
 
+    # 8b. Ablations (optionnel) : désactiver des sources pour ce run -------
+    print("\n— Ablations (optionnel) — sources du graphe à DÉSACTIVER —")
+    print("    Choix : " + "  ".join(ABLATIONS))
+    print("    (ex. 'humess coexpr' pour un run sans HuMess ni co-expression)")
+    abl_ans = ask("Ablations (séparées par espaces, vide = aucune)", default="")
+    ablations = [a for a in abl_ans.split() if a]
+    _bad = [a for a in ablations if a not in ABLATIONS]
+    if _bad:
+        print(f"    ⚠️  ignorées (inconnues) : {', '.join(_bad)}")
+    ablations = [a for a in ablations if a in ABLATIONS]
+    if ablations:
+        print(f"    → désactivé : {', '.join(ablations)}  "
+              "(pense à nommer le run en conséquence, ex. <nom>-no-humess)")
+
     # 9. Validation --------------------------------------------------------
     ora_top_n = ask_int("ORA : top-N drivers", default=P["ora_top_n"])
     cluster_annotation = P["cluster_annotation"] and n_seeds >= 2  # cross-seed → ≥2 seeds
@@ -186,6 +213,9 @@ def main():
     extra_flags = f"--n-epochs {epochs} --patience {patience}"
     if GRAPH_FLAGS[graph]:
         extra_flags += " " + GRAPH_FLAGS[graph]
+    # Ablations APRÈS les flags graphe → --no-* prime sur --use-* (argparse last-wins).
+    for a in ablations:
+        extra_flags += " " + ABLATIONS[a]
     out_base = ask("\n— Sortie —\n  Dossier de sortie (out_base ; env GNN_OUT_DIR_BASE prime)",
                    default=f"output/{name}")
 
