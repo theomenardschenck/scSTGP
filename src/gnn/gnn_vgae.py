@@ -489,6 +489,12 @@ if not _REUSE_OK:
         except OSError:
             pass
 
+# Sauvegarde du graphe dans le run dir COURANT (perturbation le recharge via
+# load_run → run_dir/hetero_graph_vgae.pt). Le save du bloc build (§7) n'écrit
+# que sur un build frais ; en --reuse-graph (cas de train_vgae après build_graph)
+# ce save est sauté → on le refait ici pour que CHAQUE run dir ait son graphe.
+torch.save(data, os.path.join(OUT_DIR, "hetero_graph_vgae.pt"))
+
 # --- Arrêt build-only : graphe prêt (construit + mis en cache OU rechargé) →
 # on s'arrête AVANT l'entraînement. Sert la règle Snakemake `build_graph`
 # (graphe bâti 1× puis réutilisé par tous les seeds via --reuse-graph) et le

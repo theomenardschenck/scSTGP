@@ -65,7 +65,7 @@ validation:
     enabled: false
     top_n: 40
   cluster_annotation:
-    enabled: true
+    enabled: false   # smoke = 1 seed ; cluster_annotation exige ≥2 seeds (cross-seed)
 
 comparison:
   enabled: false
