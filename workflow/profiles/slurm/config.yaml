@@ -25,11 +25,16 @@ default-resources:
   - "mem_mb=8000"
   - "runtime=120"
   - "slurm_partition='standard'"
+  # QOS : la QOS par défaut 'normal' plafonne à 5 min (QOSMaxWallDurationPerJobLimit).
+  # 'short' = 24 h → couvre tous les runtime de prod (train jusqu'à 12 h). Adapter
+  # selon `sacctmgr show qos format=Name,MaxWall` (short/medium/long/quick…).
+  - "slurm_qos='short'"
 
 cluster: >-
   mkdir -p logs/slurm &&
   sbatch --parsable
   --partition={resources.slurm_partition}
+  --qos={resources.slurm_qos}
   --cpus-per-task={threads}
   --mem={resources.mem_mb}
   --time={resources.runtime}
