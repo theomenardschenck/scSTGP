@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+init.py — Assistant interactif de configuration du pipeline VGAE.
+
+Pose quelques questions (type de données, groupes A/B, chemins, backend,
+seeds, perturbation…) et génère un fichier `workflow/config/config.<nom>.yaml`
+prêt à l'emploi pour `workflow/run.sh`.
+
+    python workflow/init.py                 # interactif
+    python workflow/init.py --preset quick  # démarre sur le préréglage 'quick'
+
+Ce script n'a AUCUNE dépendance (stdlib pure) : il peut tourner avant même
+d'avoir activé l'environnement conda.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+# ── Préréglages : valeurs par défaut selon l'intention ──────────────────────
+PRESETS = {
+    # test fonctionnel rapide (câblage) : 1 seed, peu d'epochs, cibles, graphe minimal
+    "quick": dict(seeds=1, epochs=20, patience=20, modes=["knockout"],
+                  perturb="targeted", graph="minimal", ora_top_n=50,
+                  cluster_annotation=False),
+    # run scientifique complet : 3 seeds, entraînement long, tous modes, tous gènes
+    "full":  dict(seeds=3, epochs=1200, patience=150,
+                  modes=["knockout", "knockdown", "overexpress"],
+                  perturb="total", graph="signed", ora_top_n=100,
+                  cluster_annotation=True),
+}
+
+GRAPH_FLAGS = {
+    "minimal": "",  # PPI + Reactome + coexpr + SCENIC + HuMess (sources par défaut)
+    "signed":  ("--use-omnipath-signaling --use-omnipath-tf-curated "
+                "--include-omnipath-genes --use-reactome-fi "
+                "--signed-message --signed-decoder --decoder-split "
+                "--kl-beta-max 0.0001"),
+}
+
+
+# ── Helpers de saisie ───────────────────────────────────────────────────────
+def ask(prompt, default=None, choices=None):
+    """Question texte avec défaut et choix optionnels."""
+    suffix = ""
+    if choices:
+        suffix += f" [{'/'.join(choices)}]"
+    if default is not None and default != "":
+        suffix += f" (défaut: {default})"
+    while True:
+        ans = input(f"  {prompt}{suffix} : ").strip()
+        if not ans:
+            ans = "" if default is None else str(default)
+        if choices and ans not in choices:
+            print(f"    → réponds parmi : {', '.join(choices)}")
+            continue
+        return ans
+
+
+def ask_yesno(prompt, default=True):
+    d = "o" if default else "n"
+    ans = ask(prompt, default=d, choices=["o", "n"])
+    return ans == "o"
+
+
+def ask_int(prompt, default):
+    while True:
+        ans = ask(prompt, default=default)
+        try:
+            return int(ans)
+        except ValueError:
+            print("    → entier attendu")
+
+
+def ask_path(prompt, default=None, must_exist=False, repo=None):
+    """Chemin ; avertit (sans bloquer) si absent. Résolu relativement au repo."""
+    ans = ask(prompt, default=default)
+    if ans and must_exist:
+        check = ans if os.path.isabs(ans) else os.path.join(repo or ".", ans)
+        if not os.path.exists(check):
+            print(f"    ⚠️  introuvable pour l'instant : {check} "
+                  "(ok si tu le stages plus tard / sur le cluster)")
+    return ans
+
+
+def yaml_list(items):
+    return "[" + ", ".join(str(i) for i in items) + "]"
+
+
+# ── Corps du wizard ─────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser(description="Assistant de config du pipeline VGAE.")
+    ap.add_argument("--preset", choices=list(PRESETS), default=None,
+                    help="démarre sur un préréglage (quick|full)")
+    args = ap.parse_args()
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # racine du dépôt
+
+    print("\n" + "=" * 64)
+    print("  Assistant de configuration — pipeline VGAE (priorisation gènes)")
+    print("=" * 64)
+    print("  Entrée vide = valeur par défaut entre parenthèses.\n")
+
+    # 0. Préréglage --------------------------------------------------------
+    preset_name = args.preset or ask(
+        "Préréglage de départ", default="quick", choices=["quick", "full", "custom"])
+    P = dict(PRESETS.get(preset_name, PRESETS["full"]))  # 'custom' part de 'full'
+
+    # 1. Identité du run ---------------------------------------------------
+    name = ask("Nom du run (sert au run_tag et au dossier de sortie)", default="myrun")
+
+    # 2. Type de données ---------------------------------------------------
+    print("\n— Données —")
+    print("    'sc'   = scRNA façon HUVEC (matrice + metadata cellules) ;")
+    print("    'bulk' = RNA-seq bulk (matrice gènes × échantillons + samplesheet).")
+    rna = ask("Type de données", default="bulk", choices=["bulk", "sc"])
+
+    # 3. Groupes A / B (à la discrétion de l'utilisateur) ------------------
+    print("\n— Contraste A vs B (référence vs condition) —")
+    grpA = ask("Groupe A / référence (ex. pro, sain, control, WT)", default="pro")
+    grpB = ask("Groupe B / condition  (ex. sen, malade, patient, mutant)", default="sen")
+
+    # 4. Chemins -----------------------------------------------------------
+    print("\n— Chemins (relatifs au dépôt ou absolus) —")
+    data_root  = ask_path("Racine des données (data_root)", default="data",
+                          must_exist=True, repo=repo)
+    scenic_dir = ask_path("Sorties pySCENIC (regulons/adjacencies)",
+                          default="output/pyscenic", repo=repo)
+    humess_dir = ask_path("Sorties HuMess (importance métabolique)",
+                          default=f"{data_root}/humess/{name}", repo=repo)
+    de_csv     = ask_path("CSV de DE (logFC/pvalue A vs B, pour le readout)",
+                          default=f"{data_root}/gnn_data/DEGs_{grpA}_vs_{grpB}.csv", repo=repo)
+    coexpr     = ask_path("Fichier de co-expression (coexpr_diff.tsv)",
+                          default=f"{data_root}/pyscenic/diff_coexpr/coexpr_diff.tsv", repo=repo)
+
+    build_block_matrix = build_block_meta = ""
+    build_enabled = False
+    if rna == "bulk":
+        print("\n— Bulk : matrice + samplesheet —")
+        build_block_matrix = ask_path("Matrice (gènes × échantillons)",
+                                      default=f"{data_root}/bulk/{name}/expr_all.csv",
+                                      repo=repo)
+        build_block_meta = ask_path("Samplesheet (échantillon → groupe A/B)",
+                                    default=f"{data_root}/bulk/{name}/samplesheet.tsv",
+                                    repo=repo)
+        # start-from-assembly : si coexpr/HuMess existent déjà, le build est sauté.
+        build_enabled = True
+
+    # 5. Exécution ---------------------------------------------------------
+    print("\n— Exécution —")
+    backend = ask("Backend", default="local", choices=["local", "cluster"])
+    device  = "auto" if backend == "cluster" else "cpu"
+    py      = "python3" if backend == "cluster" else "python"
+
+    # 6. Seeds -------------------------------------------------------------
+    print("\n— Robustesse —")
+    n_seeds = ask_int("Nombre de seeds (runs répétés)", default=P["seeds"])
+    seeds = list(range(1, n_seeds + 1))
+
+    # 7. Perturbation ------------------------------------------------------
+    print("\n— Perturbation in silico —")
+    modes_ans = ask("Modes (séparés par des espaces : knockout knockdown overexpress)",
+                    default=" ".join(P["modes"]))
+    modes = [m for m in modes_ans.split() if m]
+    scope = ask("Portée", default=P["perturb"], choices=["targeted", "total"])
+    genes_file = ""
+    if scope == "targeted":
+        genes_file = ask_path("Fichier de cibles (1 gène/ligne, # = commentaire)",
+                              default=f"{data_root}/gene_sets/priority_drivers_targets.txt",
+                              repo=repo)
+
+    # 8. Sources du graphe -------------------------------------------------
+    print("\n— Graphe & entraînement —")
+    print("    'minimal' = PPI+Reactome+coexpr+SCENIC+HuMess ;")
+    print("    'signed'  = + OmniPath (signé) + Reactome FI + décodeur signé.")
+    graph = ask("Configuration du graphe", default=P["graph"], choices=["minimal", "signed"])
+    epochs = ask_int("Epochs d'entraînement", default=P["epochs"])
+    patience = P["patience"]
+
+    # 9. Validation --------------------------------------------------------
+    ora_top_n = ask_int("ORA : top-N drivers", default=P["ora_top_n"])
+    cluster_annotation = P["cluster_annotation"] and n_seeds >= 2  # cross-seed → ≥2 seeds
+
+    # ── Assemblage extra_flags + out_base ─────────────────────────────────
+    extra_flags = f"--n-epochs {epochs} --patience {patience}"
+    if GRAPH_FLAGS[graph]:
+        extra_flags += " " + GRAPH_FLAGS[graph]
+    out_base = ask("\n— Sortie —\n  Dossier de sortie (out_base ; env GNN_OUT_DIR_BASE prime)",
+                   default=f"output/{name}")
+
+    # ── Écriture du config ────────────────────────────────────────────────
+    cfg = f"""# ──────────────────────────────────────────────────────────────────
+# config.{name}.yaml — généré par workflow/init.py (préréglage: {preset_name})
+# Lancement :  bash workflow/run.sh --configfile workflow/config/config.{name}.yaml
+# ──────────────────────────────────────────────────────────────────
+run:
+  name: "{name}"
+  description: "VGAE {rna} — {grpA} vs {grpB} ({backend}, {n_seeds} seed(s))"
+
+paths:
+  data_root: "{data_root}"
+  out_base: "{out_base}"
+  humess_dir: "{humess_dir}"
+  scenic_dir: "{scenic_dir}"
+  de_magnitude_csv: "{de_csv}"
+  coexpr_file: "{coexpr}"
+
+compute:
+  device: "{device}"        # cpu | cuda | auto
+  python: "{py}"
+  python_torch: "{py}"
+  backend: "{backend}"      # local | cluster (wrapper run.sh)
+
+input:
+  rna_type: {rna}
+  degs_path: "{de_csv}"
+
+# Stage 0 : build features data-dérivées (coexpr + HuMess) depuis une matrice.
+# enabled=true (bulk) → orchestré ; si coexpr/HuMess existent déjà, sauté.
+build:
+  enabled: {str(build_enabled).lower()}
+  matrix: "{build_block_matrix}"
+  metadata: "{build_block_meta}"
+  gene_col: "Tracking_id"
+  group_col: 2
+  young_group: "{grpA}"
+  sen_group: "{grpB}"
+  conditions: [{grpA!r}, {grpB!r}]
+  humess_repo: "../humess"
+  humess_cs_nsamples: 1000
+
+models:
+  vgae:
+    enabled: true
+    run_tag: "{name}"
+    seeds: {yaml_list(seeds)}
+    extra_flags: "{extra_flags}"
+  gnn_lite:
+    enabled: false
+
+perturbation:
+  enabled: true
+  modes: [{", ".join(modes)}]
+  scope: all_genes
+  axis_tag: ""
+  out_suffix: ""
+  genes_file: "{genes_file}"   # "" = tous les gènes ; sinon sous-ensemble (cibles)
+
+scoring:
+  de_significance: "pvalue"
+  de_padj_max: 0.05
+  de_abs_lfc_min: 0.5
+
+validation:
+  ora_top_n: {ora_top_n}
+  decoy:
+    enabled: false
+    top_n: 40
+  cluster_annotation:
+    enabled: {str(cluster_annotation).lower()}   # nécessite ≥2 seeds
+
+comparison:
+  enabled: false
+
+output:
+  generate_html_report: false
+"""
+
+    out_path = os.path.join(repo, "workflow", "config", f"config.{name}.yaml")
+    if os.path.exists(out_path) and not ask_yesno(
+            f"\n{out_path} existe déjà — écraser ?", default=False):
+        print("  Annulé.")
+        return
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(cfg)
+
+    # ── Récap + prochaines étapes ─────────────────────────────────────────
+    rel = os.path.relpath(out_path, repo)
+    print("\n" + "=" * 64)
+    print(f"  ✅ Config écrite : {rel}")
+    print("=" * 64)
+    print("  Prochaines étapes :")
+    print(f"    bash workflow/run.sh --configfile {rel} --dry-run     # vérifie le DAG")
+    print(f"    bash workflow/run.sh --configfile {rel}               # lance")
+    if backend == "cluster":
+        print("    (cluster) adapte la partition/QOS dans workflow/profiles/slurm/config.yaml")
+        print("    (cluster) export GNN_OUT_DIR_BASE=/scratch/.../output pour écrire sur scratch")
+    if rna == "bulk" and build_enabled:
+        print("    ⚠️  bulk : si coexpr/HuMess ne sont pas précalculés, le stage build")
+        print("        (HuMess) exige cplex en local — cf. commentaires du config.")
+    print()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print("\n  Interrompu.")
+        sys.exit(1)

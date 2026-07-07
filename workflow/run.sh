@@ -5,6 +5,7 @@
 # C'est LA commande d'entrée pour un utilisateur : elle cache les incantations
 # Snakemake et choisit l'exécuteur.
 #
+#   bash workflow/run.sh --init                       # assistant : génère un config
 #   bash workflow/run.sh [--backend local|cluster] [--configfile FILE]
 #                        [--cores N] [--jobs N] [--dry-run] [-- <args snakemake>]
 #
@@ -28,6 +29,7 @@ DRY=0
 PASS=()                               # args bruts passés à snakemake (après --)
 
 while [[ $# -gt 0 ]]; do case "$1" in
+  --init)        shift; exec "${INIT_PY:-python3}" workflow/init.py "$@" ;;  # assistant de config
   --backend)     BACKEND="$2"; shift 2 ;;
   --configfile)  CONFIGFILE="$2"; shift 2 ;;
   --cores)       CORES="$2"; shift 2 ;;
