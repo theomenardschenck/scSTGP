@@ -1,22 +1,27 @@
 # Workflow Snakemake — pipeline VGAE HUVEC
 
-**Statut** : **fonctionnel** (2026-06-18). Le Snakefile est câblé sur les
-CLI réelles des scripts (plus de stub `python -m gnn_huvec.cli…`). Les
-chemins et paramètres sont pilotés par [`config/config.yaml`](config/config.yaml).
+**Statut** : **fonctionnel** — pipeline testé de bout en bout sur cluster SLURM
+(build → train → perturb → analyse → report). Chemins et paramètres pilotés par
+un `config/config*.yaml` ; le plus simple est de le générer avec l'assistant
+(`bash workflow/run.sh --init`).
 
-L'entraînement utilise toujours le monolithe [`gnn_vgae.py`](../src/gnn/gnn_vgae.py)
-(qui construit le graphe ET entraîne) ; la modularisation `cli/` reste un
-objectif Tier 2.5 mais n'est plus un prérequis pour exécuter le pipeline.
+Depuis le refactor modulaire de [`gnn_vgae.py`](../src/gnn/gnn_vgae.py), la
+construction du graphe (`--build-only`) et l'entraînement (`--reuse-graph`) sont
+**deux règles séparées** : le graphe est bâti **une fois** puis réutilisé par tous
+les seeds (au lieu d'être reconstruit à chaque seed).
 
 ## Structure
 
 ```
 workflow/
-├── Snakefile                 # DAG fonctionnel (train → perturb → score → valid → report)
+├── Snakefile                 # DAG (build_graph → train × seed → perturb → analyse → report)
+├── run.sh                    # LANCEUR : backend local/cluster + assistant --init
+├── init.py                   # assistant interactif de génération de config
 ├── config/
-│   └── config.yaml           # paramètres + chemins (édités par l'utilisateur)
+│   ├── config.yaml           # config par défaut (HUVEC, 3 seeds)
+│   └── config.smoke.yaml     # test fonctionnel rapide (1 seed, cibles)
 └── profiles/
-    └── slurm/config.yaml     # profil de soumission SLURM (à adapter)
+    └── slurm/config.yaml     # profil SLURM (partition + --qos à adapter)
 ```
 
 ## Stages orchestrés
@@ -26,8 +31,9 @@ workflow/
 | 1-2 | Preprocessing scRNA + DE (MAST) | (R, externe) | ✗ précalculé → `data/gnn_data/` |
 | 3 | pySCENIC | (externe) | ✗ précalculé → `paths.scenic_dir` |
 | 4 | HuMess | (externe) | ✗ précalculé → `paths.humess_dir` |
-| 6 | Train VGAE × seed | `gnn_vgae.py` | ✓ rule `train_vgae` |
-| 7 | Perturbation KO/KD/OE × seed | `perturb_top_genes.py` | ✓ rule `perturb` |
+| 6a | **Build graphe** (§1-7) 1× | `gnn_vgae.py --build-only` | ✓ rule `build_graph` |
+| 6b | Train VGAE × seed (`--reuse-graph`) | `gnn_vgae.py` | ✓ rule `train_vgae` |
+| 7 | Perturbation KO/KD/OE — **1 job / (seed, mode)** ; `perturbation.genes_file` = restreint aux cibles | `perturb_top_genes.py` | ✓ rule `perturb` |
 | 8 | Agrégation cross-seed → driver_score | `perturb_report.py` | ✓ rule `aggregate_cross_seed` |
 | 8b | driver_baselines + interpret_embedding [+ décoy] | `driver_baselines.py` / `viz/interpret_embedding.py` / `explain/perturb_decoy.py` | ✓ |
 | 9 | ORA Reactome+aging [+ cluster_annotation] | `ora/ora_consensus.py` / `cluster/cluster_annotation.py` | ✓ |
@@ -62,28 +68,45 @@ injecte depuis `config.paths` :
 Après `git clone`, **stager les données** (non versionnées : cf.
 `.gitignore`) sous `paths.data_root` puis ajuster `config/config.yaml`.
 
-## Lancement
+## Lancement (recommandé : `run.sh`)
 
 ```bash
-# 0. Environnement (depuis la racine du repo)
-conda env create -f environment.yml && conda activate gnn   # fournit snakemake 7.32
+# 0. Environnement (fournit snakemake 7.32 — canal bioconda requis)
+micromamba create -n gnn -f environment.yml && micromamba activate gnn
 
-# 1. Dry-run — visualise le DAG sans rien exécuter
-snakemake -n -s workflow/Snakefile --configfile workflow/config/config.yaml
+# 1. Générer une config (assistant : données, groupes A/B, backend, seeds,
+#    perturbation ciblée/totale, ablations, presets quick|full)
+bash workflow/run.sh --init
 
-# 2. Run LOCAL (8 cœurs). Entraînement GPU si dispo (compute.device: auto)
-snakemake --cores 8 -s workflow/Snakefile --configfile workflow/config/config.yaml
+# 2. Dry-run (vérifie le DAG) puis run
+bash workflow/run.sh --configfile workflow/config/config.<nom>.yaml --dry-run
+bash workflow/run.sh --backend local   --configfile workflow/config/config.<nom>.yaml
+bash workflow/run.sh --backend cluster --configfile workflow/config/config.<nom>.yaml
 
-# 3. Analyse SEULE sur des runs déjà entraînés
-#    → models.vgae.enabled: false dans config.yaml (Snakemake repart des
-#      perturbation_all_genes_*.tsv / best_vgae.pt déjà présents dans out_base)
+# Test fonctionnel rapide (1 seed, cibles) :
+bash workflow/run.sh --configfile workflow/config/config.smoke.yaml
 ```
 
-### Sur le cluster (SLURM, Snakemake 7.x)
+`run.sh` choisit l'exécuteur : `--backend local` → `snakemake --cores N` (+ warning) ;
+`--backend cluster` → `snakemake --profile workflow/profiles/slurm` (soumission SLURM).
+Le backend par défaut est lu depuis `compute.backend` du config. Passer des options
+brutes à snakemake après `--` (ex. `-- --set-resources build_graph:runtime=30`).
+
+**Sorties sur scratch (cluster)** : `export GNN_OUT_DIR_BASE=/scratch/.../output`
+avant le run (prime sur `paths.out_base`).
+
+**Analyse seule** sur des runs déjà entraînés : `models.vgae.enabled: false` dans le
+config (Snakemake repart des `best_vgae.pt` / `perturbation_all_genes_*.tsv` présents).
+
+### Détails cluster (SLURM, Snakemake 7.x)
+
+Éditer d'abord `workflow/profiles/slurm/config.yaml` : **partition** (`sinfo`) et
+**QOS** (`sacctmgr show qos format=Name,MaxWall` — la QOS par défaut `normal` plafonne
+souvent à quelques minutes ; le profil met `short`). Invocation équivalente sans le
+wrapper :
 
 ```bash
-# Éditer d'abord workflow/profiles/slurm/config.yaml (partition, --account…)
-snakemake -s workflow/Snakefile --configfile workflow/config/config.yaml \
+snakemake -s workflow/Snakefile --configfile workflow/config/config.<nom>.yaml \
           --profile workflow/profiles/slurm
 ```
 

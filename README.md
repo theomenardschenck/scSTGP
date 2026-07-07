@@ -14,132 +14,96 @@ L'approche combine :
 3. Un scoring multi-tier (`driver` / `validation` / `discovery`) avec
    robustesse cross-seed et evidence_tier A–E.
 
-**Statut** : projet de stage M2 — soutenance 16 septembre 2026. Repo
-en cours de modularisation (cf. [TODO](TODO) Tier 2.5).
+**Statut** : projet de stage M2 — soutenance 16 septembre 2026. Outil
+**modularisé** (le monolithe `gnn_vgae.py` a été éclaté en modules
+importables, refactor validé **bit-exact** par un golden test) et
+**pipeline Snakemake fonctionnel** de bout en bout (local **ou** cluster
+SLURM), avec un **assistant de configuration** (`bash workflow/run.sh --init`).
 
 ## Documentation
 
-- **Méthodes scientifiques** : [`docs/vgae_report.md`](docs/vgae_report.md)
-  — rapport méthodologique exhaustif (architecture, métriques,
-  résultats par version, FAQ).
-- **Architecture & pipeline cible** :
-  [`docs/pipeline_design.md`](docs/pipeline_design.md) — DAG 11 stages,
-  schéma `config.yaml`, plan de migration vers Snakemake.
-- **Backlog priorisé** : [`TODO`](TODO) — Tier 1 (priorité défense)
-  → Tier 4 (post-stage).
-- **Documentation technique par script** :
-  [`docs/technical/`](docs/technical/) — 1 fichier `.md` par script
-  (20 + README), format frontmatter standardisé. Architecture interne,
-  CLI exhaustive, limites connues, références.
-- **Outils apparentés** : §18 du rapport — positionnement vs
-  CellOracle, scTenifoldKnk, GEARS, DREAMwalk, decoupler-py.
+- **Usage du pipeline** : ce README (§Quickstart) + [`workflow/README.md`](workflow/README.md)
+  — orchestration Snakemake, règles, backend local/cluster, assistant `init`.
+- **Backlog priorisé** : [`TODO`](TODO).
 
-## Architecture (état actuel)
+> Le **rapport scientifique** détaillé (méthodes, métriques, résultats par
+> version) et la doc technique par script vivent dans `docs/` — un **cahier
+> de labo local non versionné** (le dépôt ne contient que l'outil). Demander
+> à l'auteur pour y accéder.
+
+## Architecture
+
+Le VGAE, historiquement un monolithe de ~4800 lignes, est **éclaté en
+modules importables** (refactor validé bit-exact) :
 
 ```
 gnn_huvec/
-├── src/
-│   ├── gnn/                        # Modèles
-│   │   ├── gnn_vgae.py             # VGAE V3.6 + baselines (MLP/Stat/DeepWalk)
-│   │   ├── gnn_classification.py   # GNN_Lite supervisé (HeteroGNN multi-label)
-│   │   ├── gnn_perturbation.py     # Perturbation core (KO/KD/OE + axes)
-│   │   └── omnipath_integration.py # Loader OmniPath signed (V4)
-│   ├── perturbation/
-│   │   └── perturb_top_genes.py    # Batch all-genes × seeds
-│   ├── extraction/                 # pySCENIC + Seurat → TSV
-│   └── validation/
-│       ├── perturb_report.py       # Cross-seed scoring + figures
-│       ├── compare_runs.py         # Cross-ablation / cross-version
-│       ├── ora_consensus.py        # Test hypergéométrique vs DBs
-│       ├── cluster_annotation.py   # Annotation biologique cell_groups
-│       ├── method_comparison_schema.py  # Schéma TSV unifié cross-method
-│       └── visualize_global.py     # Figures de synthèse multi-versions
-├── workflow/                       # Snakemake (ébauche, non fonctionnel)
-├── scripts/                        # Helpers SLURM (cluster Nautilus)
-└── docs/                           # Rapport + design pipeline
+├── src/gnn/
+│   ├── gnn_vgae.py            # ORCHESTRATEUR mince (parse → build → train → score)
+│   ├── _config.py            # parsing CLI + dérivations (modules/features/run_tag)
+│   ├── _paths.py             # résolution des chemins (env + racine repo, layout-robuste)
+│   ├── _graph_build.py       # §1-7 : construction du graphe hétérogène (+ cache)
+│   ├── _train.py             # §8-10 : modèle VGAE + boucle d'entraînement
+│   ├── _score.py             # §11-16 : embeddings + scoring + baselines + export
+│   ├── _vgae_model.py        # classes VGAE (HeteroEncoder, décodeur signé…)
+│   ├── gnn_perturbation.py   # perturbation core (KO/KD/OE + axes sénescence)
+│   └── omnipath_integration.py
+├── src/perturbation/perturb_top_genes.py   # perturbation batch (all-genes / cibles)
+├── src/validation/           # scoring cross-seed, ORA, baselines, annotation, figures
+├── workflow/                 # Snakemake FONCTIONNEL
+│   ├── Snakefile             # DAG : build_graph → train × seed → perturb → analyse → report
+│   ├── run.sh                # lanceur (backend local/cluster) + assistant --init
+│   ├── init.py               # assistant interactif de génération de config
+│   ├── config/config*.yaml   # config utilisateur (+ config.smoke.yaml = test rapide)
+│   └── profiles/slurm/       # profil SLURM (partition/QOS à adapter)
+├── scripts/                  # helpers SLURM (grilles d'ablation, etc.)
+└── tests/golden/             # test de non-régression bit-exact
 ```
 
-Le pipeline actuel est piloté à la main via les CLI argparse de chaque
-script. La modularisation `src/gnn_huvec/` + `cli/` + `workflow/`
-prévue par [`docs/pipeline_design.md`](docs/pipeline_design.md) §3 est
-en cours (Tier 2.5 du TODO).
+Chaque module `_*.py` s'importe indépendamment (`from _graph_build import build_graph`).
+Le graphe est construit **une fois** (`build_graph`, `--build-only`) puis réutilisé
+par tous les seeds (`--reuse-graph`).
 
 ## Quickstart
 
-> ⚠️ Le pipeline n'est pas encore packagé. Les commandes ci-dessous
-> reflètent l'état actuel ; après modularisation Tier 2.5, elles
-> deviendront `python -m gnn_huvec.cli.<command>`.
-
-### Installation
+### 1. Installation (environnement conda)
 
 ```bash
-git clone <repo> gnn_huvec
-cd gnn_huvec
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt    # à figer (Tier 2.5)
+git clone <repo> gnn_huvec && cd gnn_huvec
+micromamba create -n gnn -f environment.yml   # ou conda/mamba (contient snakemake)
+micromamba activate gnn
 ```
 
-Dépendances principales : `torch`, `torch-geometric`, `numpy`,
-`pandas`, `scipy`, `scikit-learn`, `matplotlib`, `seaborn`, `anndata`,
-`pyscenic`, `mygene`, `omnipath` (optionnel V4).
-
-### Données nécessaires
-
-Téléchargements / pré-calculs à placer dans `data/` (gitignored) :
-
-| Fichier | Source | Description |
-|---|---|---|
-| `gnn_data/HUVEC_seurat_processed.rds` | données HUVEC P4/P16 | matrice scRNA Drop-seq normalisée |
-| `gnn_data/DEGs_P4_vs_P16_MAST.csv` | Seurat MAST | DEGs P4 vs P16 |
-| `gnn_data/group_expression.tsv` | `gnn_vgae.py --export-only` | mean expr par cell_group |
-| `dbs/SenMayo.tsv`, `CellAge.tsv`, `GenAge.tsv`, `Fridman.tsv` | bases aging | signatures sénescence |
-| `omnipath/*.tsv.gz` | `scripts/cache_omnipath.py` | cache pour V4 (frontal-only) |
-
-### Run baseline V3.6 (1 seed)
+### 2. Générer sa config (assistant interactif)
 
 ```bash
-# 1. Entraîner le VGAE (1 seed, ~30 min sur 1 GPU)
-python src/gnn/gnn_vgae.py --seed 42 --out-dir output/V3.6/run_s42
-
-# 2. Perturbation in silico (all-genes × KO/KD/OE)
-python src/perturbation/perturb_top_genes.py \
-    --run-dir output/V3.6/run_s42 \
-    --modes KO,KD,OE --all-genes
-
-# 3. Single-seed report (figures + ranking)
-python src/validation/reports/perturb_report.py \
-    --perturb-dir output/V3.6/run_s42/perturbation
+bash workflow/run.sh --init          # pose des questions et écrit workflow/config/config.<nom>.yaml
 ```
+L'assistant demande : préréglage (`quick`/`full`), type de données (`bulk`/`sc`),
+contraste **A vs B** (à ta discrétion : pro/sen, sain/malade, WT/mutant…), chemins,
+backend (local/cluster), nombre de seeds, **perturbation ciblée ou totale**, et
+**ablations** (sources du graphe à désactiver).
 
-### Run cross-seed V3.6 (10 seeds)
+### 3. Lancer le pipeline
 
 ```bash
-# Cluster SLURM Nautilus (job array sur 10 seeds)
-bash scripts/run_ablation_grid.sh
-bash scripts/run_perturbation_grid.sh
+# dry-run (vérifie le DAG sans exécuter)
+bash workflow/run.sh --configfile workflow/config/config.<nom>.yaml --dry-run
 
-# Aggregation cross-seed
-python src/validation/reports/perturb_report.py \
-    --cross-seed \
-    --perturb-dirs output/V3.6/run_s4{2..51}/perturbation \
-    --de-magnitude-csv data/gnn_data/DEGs_P4_vs_P16_MAST.csv \
-    --out-dir output/V3.6/cross_seed_report
+# local (CPU)
+bash workflow/run.sh --backend local   --configfile workflow/config/config.<nom>.yaml
+
+# cluster SLURM (adapter la partition/QOS dans workflow/profiles/slurm/config.yaml ;
+#  export GNN_OUT_DIR_BASE=/scratch/.../output pour écrire les sorties sur scratch)
+bash workflow/run.sh --backend cluster --configfile workflow/config/config.<nom>.yaml
 ```
 
-### Validation externe
+Un **test fonctionnel rapide** (1 seed, peu d'epochs, perturbation sur cibles) est
+fourni : `--configfile workflow/config/config.smoke.yaml`.
 
-```bash
-# Test hypergéométrique vs aging DBs
-python src/validation/ora/ora_consensus.py \
-    --db aging \
-    --consensus-runs output/V3.6/run_s4{2..51} \
-    --out-dir output/V3.6/ora
-
-# Annotation biologique des cell_groups
-python src/validation/cluster/cluster_annotation.py \
-    --run-dir output/V3.6/run_s42 \
-    --cross-seed-dirs output/V3.6/run_s4{2..51}
-```
+Les prérequis (matrice scRNA/bulk, DE, pySCENIC, HuMess, bases aging, cache OmniPath)
+sont des entrées externes précalculées dans `data/` (gitignored). Voir
+[`workflow/README.md`](workflow/README.md) pour le détail des stages et des chemins.
 
 ## Sortie principale
 
