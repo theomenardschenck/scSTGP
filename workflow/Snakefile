@@ -249,24 +249,25 @@ rule train_vgae:
 # Stage 7 — Perturbation in silico (KO/KD/OE, all-genes), 1 job par seed
 # ──────────────────────────────────────────────────────────────────
 rule perturb:
+    # 1 JOB PAR (seed, mode) : wildcard {mode} → parallélisation cluster.
+    # + de modes = + de jobs (1 chacun) ; + de seeds = + de jobs (1 par seed×mode).
     input:
         model=run_dir("{seed}") / "best_vgae.pt" if TRAIN_VGAE else [],
     output:
-        [run_dir("{seed}") / ("perturbation_all_genes" + _PSEG + "_" + str(m) + ".tsv") for m in MODES],
+        run_dir("{seed}") / ("perturbation_all_genes" + _PSEG + "_{mode}.tsv"),
     params:
         rd=lambda wc: run_dir(wc.seed),
-        modes=" ".join(MODES),
         suffix=(("--out-suffix " + str(OUT_SUFFIX)) if OUT_SUFFIX else ""),
         genes=(("--genes-file " + str(GENES_FILE)) if GENES_FILE else ""),
     log:
-        OUT_BASE / "logs" / "perturb_s{seed}.log",
+        OUT_BASE / "logs" / "perturb_s{seed}_{mode}.log",
     threads: 8
     resources:
         mem_mb=32000,
         runtime=480,
     shell:
         "{PY} src/perturbation/perturb_top_genes.py "
-        "--run-dir {params.rd} --all-genes --modes {params.modes} "
+        "--run-dir {params.rd} --all-genes --modes {wildcards.mode} "
         "--device {DEVICE} {params.suffix} {params.genes} &> {log}"
 
 
