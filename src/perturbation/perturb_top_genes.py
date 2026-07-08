@@ -672,6 +672,7 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
         dz_genes: list[str] = []
         dz_modes: list[str] = []
         dz_arrs: list[np.ndarray] = []
+        dz_wsum: list[np.ndarray] = []          # Σw_diff par groupe (échelle)
         dz_group_names: list[str] | None = None
     if (cache_dz or random_axis_n > 0) and not has_axis:
         print("[warn] --cache-delta-z/--random-axis ignoré : pas d'axe sénescence "
@@ -710,9 +711,13 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                     dz_genes.append(str(gene))
                     dz_modes.append(mode)
                     dz_arrs.append(_dz)
+                    _ws = summary.pop("_w_diff_sum_global", None)
+                    dz_wsum.append(_ws if _ws is not None
+                                   else np.zeros(_dz.shape[0], dtype=np.float32))
                     if dz_group_names is None:
                         dz_group_names = summary.get("_dz_group_names")
                 summary.pop("_dz_group_names", None)
+                summary.pop("_w_diff_sum_global", None)
             fo = summary.pop("_signed_fanout_rows", None)
             if fo:
                 k = len(fo["source"])
@@ -744,15 +749,18 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
     # --- Cache Δz + test de spécificité d'axe (ARCH §10.4.7) ---
     if collect_dz and dz_arrs:
         dz_stack = np.stack(dz_arrs).astype(np.float32)   # (N, n_groups, latent)
+        wsum_stack = (np.stack(dz_wsum).astype(np.float32)   # (N, n_groups)
+                      if dz_wsum else np.zeros(dz_stack.shape[:2], dtype=np.float32))
         gnames = dz_group_names or [f"g{i}" for i in range(dz_stack.shape[1])]
         axis_g = np.asarray(ctx["axis_global"], dtype=np.float32)
         if cache_dz:
             npz = out_prefix.with_name(f"{out_prefix.name}_dz_cache.npz")
             np.savez_compressed(
                 npz, genes=np.array(dz_genes), modes=np.array(dz_modes),
-                dz_mean=dz_stack, group_names=np.array(gnames), axis_global=axis_g)
-            print(f"Wrote {npz}  (dz_mean {dz_stack.shape}, "
-                  f"re-projetable sur tout axe)")
+                dz_mean=dz_stack, w_diff_sum=wsum_stack,
+                group_names=np.array(gnames), axis_global=axis_g)
+            print(f"Wrote {npz}  (dz_mean {dz_stack.shape} + w_diff_sum, "
+                  f"re-projetable sur tout axe — diff exact)")
         if random_axis_n > 0:
             for m in modes:
                 idx = [i for i, mm in enumerate(dz_modes) if mm == m]

@@ -962,6 +962,10 @@ def cell_group_shift_projected(mu_base: np.ndarray,
     deg = max(int(target_degree) if target_degree is not None else 1, 1)
     rows = []
     dz_mean_store: dict[str, np.ndarray] = {}   # cache Δz (axis-indépendant)
+    # Échelle Σ w_diff par groupe (scalaire AXIS-INDÉPENDANT) : permet de
+    # reconstruire proj_signed_diff = Σw_diff · (dz_mean·u) pour TOUT axe u à
+    # partir du cache, sans re-perturber (cf. reproject_axes.py).
+    w_diff_sum_store: dict[str, float] = {}
 
     def _row(grp: str, axis_type: str, axis_u: np.ndarray, c_idx: int):
         w = expr[:, c_idx]
@@ -988,6 +992,7 @@ def cell_group_shift_projected(mu_base: np.ndarray,
         # → on le stocke une fois (axe global) pour re-projeter sur tout axe u.
         if collect_dz_mean and axis_type == "global":
             dz_mean_store[grp] = dz_mean.astype(np.float32)
+            w_diff_sum_store[grp] = total_w_diff
         row = {
             "group": grp,
             "axis_type": axis_type,
@@ -1031,6 +1036,7 @@ def cell_group_shift_projected(mu_base: np.ndarray,
     df = pd.DataFrame(rows)
     if collect_dz_mean:
         df.attrs["dz_mean_global"] = dz_mean_store      # {group: (latent,) f32}
+        df.attrs["w_diff_sum_global"] = w_diff_sum_store  # {group: float} échelle
         df.attrs["dz_group_names"] = list(group_names)
     return df
 
@@ -1679,6 +1685,11 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
             summary["_dz_mean_global"] = np.stack(
                 [_dz_store[g] for g in _gn]).astype(np.float32)
             summary["_dz_group_names"] = list(_gn)
+            # Échelle Σw_diff par groupe (même ordre) → proj_signed_diff exact
+            # reconstruit hors-ligne pour tout axe (reproject_axes.py).
+            _ws = shift_proj_df.attrs.get("w_diff_sum_global", {})
+            summary["_w_diff_sum_global"] = np.asarray(
+                [float(_ws.get(g, 0.0)) for g in _gn], dtype=np.float32)
 
         # Degré PPI et n_affected médian — utiles pour interpréter la métrique
         # proj_signed_degree et la relation hub/étendue cross-gene.

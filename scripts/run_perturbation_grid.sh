@@ -19,6 +19,9 @@
 #                MULTI_TRANSITIONS  (default|all-pairs ; défaut default)
 #                MULTI_ANCHOR_MODE  (none|de-markers|manual ; défaut none —
 #                  'manual' requiert data/gnn_data/ahn_cluster_anchors.tsv).
+#                MULTI_CACHE_DZ     (1|0 ; défaut 1) — persiste le cache Δz →
+#                  re-projection d'axes ultérieure sans re-perturber
+#                  (reproject_axes.py).
 # Avec --axis both, chaque run est perturbé deux fois (--out-suffix distinct)
 # → compare V3.7 (axe V4) à V3.6 (axe V3) sur le MÊME modèle entraîné.
 #
@@ -150,6 +153,10 @@ EFF_FLAGS="--effector-axis"
 # ne fait qu'AJOUTER les sous-axes → comparaison propre).
 MULTI_FLAGS="--transition-axes ${MULTI_TRANSITIONS:-default}"
 [[ -n "${MULTI_ANCHOR_MODE:-}" ]] && MULTI_FLAGS+=" --cluster-anchor-mode ${MULTI_ANCHOR_MODE}"
+# Persiste le cache Δz (dz_mean + w_diff_sum, axis-indépendant) → tout NOUVEL
+# axe (ancres, transitions, cross-dataset) devient une simple re-projection
+# via reproject_axes.py, SANS re-perturber. Désactivable : MULTI_CACHE_DZ=0.
+[[ "${MULTI_CACHE_DZ:-1}" != "0" ]] && MULTI_FLAGS+=" --cache-delta-z"
 
 case "$AXIS" in
     v3)
