@@ -69,11 +69,17 @@ GENES_FILE = config["perturbation"].get("genes_file", "")
 TRANSITION_AXES = config["perturbation"].get("transition_axes", "none")   # none|default|all-pairs
 CLUSTER_ANCHOR  = config["perturbation"].get("cluster_anchor_mode", "none")  # none|de-markers|manual
 CACHE_DELTA_Z   = bool(config["perturbation"].get("cache_delta_z", False))
+# Fichier d'ancres pour cluster_anchor_mode=manual (axe polycentrique). Relatif à
+# data_root si non-absolu ; "" → défaut du code (data/gnn_data/ahn_cluster_anchors.tsv).
+_ANCHORS_CFG    = str(config["perturbation"].get("cluster_anchors_file", "")).strip()
+if _ANCHORS_CFG and not os.path.isabs(_ANCHORS_CFG):
+    _ANCHORS_CFG = str(DATA_ROOT / _ANCHORS_CFG)
 _MULTI_FLAGS = " ".join(filter(None, [
     # NB : concaténation (pas de f-string) — le parser Snakemake 7.32 × Python
     # 3.12.13 corrompt les f-strings du Snakefile (cf. LOG #arch-tier25-split).
     ("--transition-axes " + str(TRANSITION_AXES)) if TRANSITION_AXES != "none" else "",
     ("--cluster-anchor-mode " + str(CLUSTER_ANCHOR)) if CLUSTER_ANCHOR != "none" else "",
+    ("--cluster-anchors-file " + _ANCHORS_CFG) if (CLUSTER_ANCHOR == "manual" and _ANCHORS_CFG) else "",
     ("--cache-delta-z" if CACHE_DELTA_Z else ""),
 ]))
 

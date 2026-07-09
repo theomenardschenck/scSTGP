@@ -75,6 +75,18 @@ perturbation:
   scope: all_genes
   axis_tag: ""              # "" = axe V3 (P4) ; "axisV4" si --axis v4 utilisé
   out_suffix: ""            # suffixe de fichier (doit refléter l'axe ; "" par défaut)
+  # ── Readout multi-état (LOG #log-multiaxis) — défauts OFF (comportement inchangé)
+  transition_axes: none     # none|default|all-pairs — axes de transition inter-cluster
+                            #   (default = P4→chaque cluster + chemin c0→c1→c2→c3).
+                            #   REQUIS pour obtenir les cross_seed_gene_ranking__trans_*.tsv
+  cluster_anchor_mode: none # none|de-markers|manual — ancre les centroïdes de cluster
+                            #   (manual = ancres Ahn 2025 ; change aussi l'axe global)
+  # Fichier d'ancres pour cluster_anchor_mode=manual (axe polycentrique) : TSV
+  # (group, gene, weight) — un centroïde pondéré par cell_group. Relatif à data_root
+  # ou absolu. "" → défaut data/gnn_data/ahn_cluster_anchors.tsv (Ahn 2025).
+  cluster_anchors_file: ""
+  cache_delta_z: false      # true = persiste le cache Δz → re-projection d'axes
+                            #   ultérieure sans re-perturber (reproject_axes.py)
 
 # ── Stage 8 : agrégation cross-seed (perturb_report)
 scoring:

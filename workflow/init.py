@@ -231,6 +231,32 @@ def main():
         effector_pro  = ask_path("  Gènes pôle PRO-sénescence (1/ligne)", default="", repo=repo)
         effector_anti = ask_path("  Gènes pôle ANTI-sénescence (1/ligne)", default="", repo=repo)
 
+    # 8c-bis. Axe POLYCENTRIQUE (centroïdes de cluster ancrés) -------------
+    #   Redéfinit les centroïdes P16_cluster_k → change l'axe global + active
+    #   les transitions inter-cluster. Réservé au sc (les clusters n'existent
+    #   que pour les cell_groups P16_cluster_0..3).
+    cluster_anchor_mode = "none"
+    cluster_anchors_file = ""
+    transition_axes = "none"
+    if rna == "sc":
+        print("\n— Axe polycentrique / readout multi-état (optionnel, sc) —")
+        print("    none       = centroïdes par cell_group bruts (défaut) ;")
+        print("    de-markers = centroïdes = top-N marqueurs DE par cluster (DEGs_P16_cluster_k.csv) ;")
+        print("    manual     = centroïdes ancrés sur un TSV (group, gene, weight) — ancres Ahn 2025.")
+        cluster_anchor_mode = ask("Ancrage des centroïdes de cluster", default="none",
+                                  choices=["none", "de-markers", "manual"])
+        if cluster_anchor_mode == "manual":
+            _def_anchor = os.path.join("gnn_data", "ahn_cluster_anchors.tsv")
+            if not os.path.exists(os.path.join(repo, "data", _def_anchor)):
+                _def_anchor = ""
+            cluster_anchors_file = ask(
+                "  Fichier d'ancres TSV (relatif à data_root, ou absolu)",
+                default=_def_anchor)
+        if cluster_anchor_mode != "none":
+            transition_axes = ask(
+                "  Axes de transition inter-cluster", default="default",
+                choices=["none", "default", "all-pairs"])
+
     # 8d. Intégrer le logFC/DE comme FEATURE de nœud (--de-features) -------
     print("\n— logFC dans le graphe (features de nœud) —")
     print("    ⚠️  CIRCULARITÉ : injecter le DE (logFC/pvalue) comme feature de nœud")
@@ -247,30 +273,60 @@ def main():
     deterministic = ask_yesno(
         "Mode déterministe (bit-exact à seed fixe ; ⚠️ threads=1 → plus LENT)", default=False)
 
-    # ── Assemblage extra_flags + out_base ─────────────────────────────────
-    extra_flags = f"--n-epochs {epochs} --patience {patience}"
+    # ── Base des flags (SANS ablations) ───────────────────────────────────
+    base_flags = f"--n-epochs {epochs} --patience {patience}"
     if GRAPH_FLAGS[graph]:
-        extra_flags += " " + GRAPH_FLAGS[graph]
+        base_flags += " " + GRAPH_FLAGS[graph]
     if de_features:
-        extra_flags += " --de-features"
-    # Ablations APRÈS les flags graphe → --no-* prime sur --use-* (argparse last-wins).
-    for a in ablations:
-        extra_flags += " " + ABLATIONS[a]
-    out_base = ask("\n— Sortie —\n  Dossier de sortie (out_base ; env GNN_OUT_DIR_BASE prime)",
+        base_flags += " --de-features"
+
+    # ── Mode d'ablation : comment décliner les ablations en configs ───────
+    abl_mode = "single"
+    if ablations:
+        print("\n— Étude d'ablation —")
+        print("    single      = 1 config, toutes les ablations choisies ENSEMBLE ;")
+        print("    independent = 1 config par ablation (chacune ISOLÉE) ;")
+        print("    progressive = ablations CUMULÉES (baseline → +1 → +2 …).")
+        print("    → une config RÉFÉRENCE sans ablation est toujours générée.")
+        abl_mode = ask("Mode d'ablation", default="single",
+                       choices=["single", "independent", "progressive"])
+
+    # variants = [(suffixe_de_run_tag, [clés d'ablation]), …]  ('' = pas d'ablation)
+    if not ablations:
+        variants = [("", [])]
+    else:
+        variants = [("_baseline", [])]  # référence sans ablation (comparateur)
+        if abl_mode == "single":
+            variants.append(("_" + "-".join("no-" + a for a in ablations), ablations))
+        elif abl_mode == "independent":
+            variants += [("_no-" + a, [a]) for a in ablations]
+        elif abl_mode == "progressive":
+            for i in range(1, len(ablations) + 1):
+                variants.append(("_" + "-".join("no-" + a for a in ablations[:i]),
+                                 ablations[:i]))
+
+    out_base = ask("\n— Sortie —\n  Dossier de sortie racine (out_base ; env GNN_OUT_DIR_BASE prime)",
                    default=f"output/{name}")
 
-    # ── Écriture du config ────────────────────────────────────────────────
-    cfg = f"""# ──────────────────────────────────────────────────────────────────
-# config.{name}.yaml — généré par workflow/init.py (préréglage: {preset_name})
-# Lancement :  bash workflow/run.sh --configfile workflow/config/config.{name}.yaml
+    # ── Écriture du/des config(s) : une par variante d'ablation ───────────
+    written = []
+    for _suffix, _abl in variants:
+        _tag = name + _suffix
+        _flags = base_flags + "".join(" " + ABLATIONS[a] for a in _abl)
+        _out = (out_base + _suffix) if _suffix else out_base
+        _abldesc = "référence (sans ablation)" if not _abl else "sans " + ", ".join(_abl)
+        cfg = f"""# ──────────────────────────────────────────────────────────────────
+# config.{_tag}.yaml — généré par workflow/init.py (préréglage: {preset_name})
+# Ablation : {_abldesc}
+# Lancement :  bash workflow/run.sh --configfile workflow/config/config.{_tag}.yaml
 # ──────────────────────────────────────────────────────────────────
 run:
-  name: "{name}"
-  description: "VGAE {rna} — {grpA} vs {grpB} ({backend}, {n_seeds} seed(s))"
+  name: "{_tag}"
+  description: "VGAE {rna} — {grpA} vs {grpB} ({backend}, {n_seeds} seed(s)) — {_abldesc}"
 
 paths:
   data_root: "{data_root}"
-  out_base: "{out_base}"
+  out_base: "{_out}"
   humess_dir: "{humess_dir}"
   scenic_dir: "{scenic_dir}"
   de_magnitude_csv: "{de_csv}"
@@ -304,9 +360,9 @@ build:
 models:
   vgae:
     enabled: true
-    run_tag: "{name}"
+    run_tag: "{_tag}"
     seeds: {yaml_list(seeds)}
-    extra_flags: "{extra_flags}"
+    extra_flags: "{_flags}"
   gnn_lite:
     enabled: false
 
@@ -324,6 +380,11 @@ perturbation:
   de_axis_rank: "{de_axis_rank or 'stat'}"
   effector_pro: "{effector_pro}"
   effector_anti: "{effector_anti}"
+  # Readout multi-état / axe polycentrique (sc). none = comportement historique.
+  transition_axes: {transition_axes}          # none | default | all-pairs
+  cluster_anchor_mode: {cluster_anchor_mode}     # none | de-markers | manual (ancres Ahn)
+  cluster_anchors_file: "{cluster_anchors_file}"  # TSV (group,gene,weight) si mode=manual ; "" = défaut
+  cache_delta_z: false        # true = persiste le cache Δz (re-projection d'axes)
 
 scoring:
   de_significance: "pvalue"
@@ -344,24 +405,29 @@ comparison:
 output:
   generate_html_report: false
 """
-
-    out_path = os.path.join(repo, "workflow", "config", f"config.{name}.yaml")
-    if os.path.exists(out_path) and not ask_yesno(
-            f"\n{out_path} existe déjà — écraser ?", default=False):
-        print("  Annulé.")
-        return
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(cfg)
+        out_path = os.path.join(repo, "workflow", "config", f"config.{_tag}.yaml")
+        if os.path.exists(out_path) and not ask_yesno(
+                f"\n{out_path} existe déjà — écraser ?", default=False):
+            print(f"  Ignoré : config.{_tag}.yaml")
+            continue
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(cfg)
+        written.append(os.path.relpath(out_path, repo))
 
     # ── Récap + prochaines étapes ─────────────────────────────────────────
-    rel = os.path.relpath(out_path, repo)
     print("\n" + "=" * 64)
-    print(f"  ✅ Config écrite : {rel}")
+    print(f"  ✅ {len(written)} config(s) écrite(s) :")
+    for _r in written:
+        print(f"       {_r}")
     print("=" * 64)
-    print("  Prochaines étapes :")
-    print(f"    bash workflow/run.sh --configfile {rel} --dry-run     # vérifie le DAG")
-    print(f"    bash workflow/run.sh --configfile {rel}               # lance")
+    if written:
+        print("  Lancer (par config) :")
+        print(f"    bash workflow/run.sh --configfile {written[0]} --dry-run   # vérifie le DAG")
+        print(f"    bash workflow/run.sh --configfile {written[0]}")
+        if len(written) > 1:
+            print("    # étude d'ablation → répéter pour chaque config, ex. :")
+            print(f"    for c in workflow/config/config.{name}*.yaml; do bash workflow/run.sh --configfile \"$c\"; done")
     if backend == "cluster":
         print("    (cluster) adapte la partition/QOS dans workflow/profiles/slurm/config.yaml")
         print("    (cluster) export GNN_OUT_DIR_BASE=/scratch/.../output pour écrire sur scratch")
