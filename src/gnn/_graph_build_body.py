@@ -205,6 +205,30 @@ elif MODULES["include_omnipath_genes"]:
           "OmniPath active (--use-omnipath-signaling / --use-omnipath-tf-curated). "
           "Le flag est ignoré.")
 
+# HGNC alias map (V6) — canonicalise symboles OmniPath ↔ nos gene_to_idx en
+# symbole approuvé, à l'expansion du gene universe (section 3) ET à la
+# projection des arêtes (section 6g). Sans ça, les gènes dérivés de
+# nomenclature (H2AFZ↔H2AZ1) perdent toutes leurs arêtes OmniPath curées.
+# Vide ({}) = fallback identité (offline sans cache, ou --no-omnipath-hgnc-alias).
+omnipath_alias_map: dict = {}
+if (MODULES["omnipath_hgnc_alias"]
+        and (MODULES["use_omnipath_signaling"]
+             or MODULES["use_omnipath_tf_curated"])):
+    try:
+        from hgnc_alias import build_alias_map as _build_hgnc_alias
+        omnipath_alias_map = _build_hgnc_alias(
+            cache_dir=OMNIPATH_CACHE_DIR,
+            download_if_missing=CLI_ARGS.omnipath_download_if_missing,
+        )
+        if omnipath_alias_map:
+            print(f"  [hgnc] normalisation d'alias ON "
+                  f"({len(omnipath_alias_map)} variants)")
+        else:
+            print("  [hgnc] alias map vide (cache absent + download OFF) "
+                  "→ fallback identité")
+    except ImportError as _e:
+        print(f"  [warn] import hgnc_alias KO ({_e}) — alias normalization OFF.")
+
 # =============================================================================
 # 3. SÉLECTION DES GÈNES — BASÉE SUR LA CONNECTIVITÉ (pas les DEGs)
 # =============================================================================
@@ -336,8 +360,18 @@ else:
 # gene_to_idx : dictionnaire inverse, symbole → index dans le graphe.
 connected_genes = scenic_genes | coexpr_genes | ppi_genes | reactome_genes
 _connected_before_opi = set(connected_genes & available_set)
+# OmniPath endpoints = symboles approuvés ; nos gènes mesurés = symboles
+# legacy → l'intersection brute manque les gènes alias-driftés. On garde les
+# gènes MESURÉS dont la forme approuvée est un endpoint (alias-aware).
+_opi_measured: set[str] = set()
 if omnipath_endpoints:
-    connected_genes |= omnipath_endpoints
+    if omnipath_alias_map:
+        _ep_canon = {omnipath_alias_map.get(e, e) for e in omnipath_endpoints}
+        _opi_measured = {g for g in available_set
+                         if omnipath_alias_map.get(g, g) in _ep_canon}
+    else:
+        _opi_measured = omnipath_endpoints & available_set
+    connected_genes |= _opi_measured
 gene_symbols = np.array(sorted(connected_genes & available_set))
 gene_to_idx = {g: i for i, g in enumerate(gene_symbols)}
 n_genes = len(gene_symbols)
@@ -348,7 +382,7 @@ print(f"    Co-expression: {len(coexpr_genes & set(gene_symbols))}")
 print(f"    PPI          : {len(ppi_genes & set(gene_symbols))}")
 print(f"    REACTOME     : {len(reactome_genes & set(gene_symbols))}")
 if omnipath_endpoints:
-    _opi_in_graph = omnipath_endpoints & set(gene_symbols)
+    _opi_in_graph = _opi_measured & set(gene_symbols)
     _opi_new = _opi_in_graph - _connected_before_opi
     print(f"    OmniPath     : {len(_opi_in_graph)} "
           f"(dont {len(_opi_new)} nouveaux ∉ des 4 sources V3)")
@@ -1006,6 +1040,7 @@ if MODULES["use_omnipath_signaling"] or MODULES["use_omnipath_tf_curated"]:
             available_genes=available_set,
             gene_to_idx=gene_to_idx,
             download_if_missing=CLI_ARGS.omnipath_download_if_missing,
+            alias_map=omnipath_alias_map,  # {} = identité (alias OFF)
         )
 
         if MODULES["use_omnipath_signaling"]:

@@ -82,6 +82,18 @@ def parse_cli_args(argv=None):
                         "résultat : ~700 TFs CollecTRI sont perdus. "
                         "Requiert --use-omnipath-signaling et/ou "
                         "--use-omnipath-tf-curated.")
+    # V6 : HGNC alias normalization when projecting OmniPath edges.
+    p.add_argument("--omnipath-hgnc-alias", dest="omnipath_hgnc_alias",
+                   action="store_true", default=True,
+                   help="V6 (défaut ON) : canonicalise les symboles OmniPath "
+                        "ET les clés gene_to_idx en symbole HGNC approuvé avant "
+                        "la projection (hgnc_alias.py). Récupère les gènes "
+                        "dérivés de nomenclature (H2AFZ↔H2AZ1 : 0→316 arêtes). "
+                        "Cache data/omnipath/hgnc_alias_map.tsv.gz.")
+    p.add_argument("--no-omnipath-hgnc-alias", dest="omnipath_hgnc_alias",
+                   action="store_false",
+                   help="Désactive la normalisation HGNC → match brut en "
+                        "symbole exact (comportement legacy pré-V6).")
 
     # --- V4.2 : coexpression différentielle P4∪P16 (option A) ---
     p.add_argument("--coexpr-mode", choices=["p16_only", "differential"],

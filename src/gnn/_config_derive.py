@@ -22,6 +22,7 @@ MODULES = {
     "use_omnipath_signaling":    CLI_ARGS.use_omnipath_signaling,
     "use_omnipath_tf_curated":   CLI_ARGS.use_omnipath_tf_curated,
     "include_omnipath_genes":    CLI_ARGS.include_omnipath_genes,
+    "omnipath_hgnc_alias":       CLI_ARGS.omnipath_hgnc_alias,
     "use_reactome_fi":           CLI_ARGS.use_reactome_fi,
 }
 
@@ -86,6 +87,11 @@ def _build_run_tag():
     if MODULES["use_omnipath_signaling"]:   parts.append("op-sig")
     if MODULES["use_omnipath_tf_curated"]:  parts.append("op-tf")
     if MODULES["include_omnipath_genes"]:   parts.append("op-genes")
+    # Alias HGNC ON par défaut → on ne tague QUE la désactivation (provenance).
+    if (not MODULES["omnipath_hgnc_alias"]
+            and (MODULES["use_omnipath_signaling"]
+                 or MODULES["use_omnipath_tf_curated"])):
+        parts.append("no-hgnc-alias")
     if MODULES["use_reactome_fi"]:          parts.append("rfi")
     if COEXPR_DIFFERENTIAL:                 parts.append("coexdiff")
     # V4.3 : tag des choix méthode×prune (uniquement si != défaut).
