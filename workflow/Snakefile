@@ -64,6 +64,37 @@ OUT_SUFFIX = config["perturbation"].get("out_suffix", "")
 # --genes-file. Reste en mode --all-genes → MÊME nom de sortie
 # (perturbation_all_genes_<mode>.tsv), donc l'aval est inchangé. "" = tous les gènes.
 GENES_FILE = config["perturbation"].get("genes_file", "")
+# Multi-axe (P4→cluster + transitions inter-cluster) + cache Δz. Défauts = OFF
+# → comportement historique inchangé. Cf. LOG #log-multiaxis.
+TRANSITION_AXES = config["perturbation"].get("transition_axes", "none")   # none|default|all-pairs
+CLUSTER_ANCHOR  = config["perturbation"].get("cluster_anchor_mode", "none")  # none|de-markers|manual
+CACHE_DELTA_Z   = bool(config["perturbation"].get("cache_delta_z", False))
+_MULTI_FLAGS = " ".join(filter(None, [
+    # NB : concaténation (pas de f-string) — le parser Snakemake 7.32 × Python
+    # 3.12.13 corrompt les f-strings du Snakefile (cf. LOG #arch-tier25-split).
+    ("--transition-axes " + str(TRANSITION_AXES)) if TRANSITION_AXES != "none" else "",
+    ("--cluster-anchor-mode " + str(CLUSTER_ANCHOR)) if CLUSTER_ANCHOR != "none" else "",
+    ("--cache-delta-z" if CACHE_DELTA_Z else ""),
+]))
+
+# Axe PRIMAIRE du driver_score (fixé à la perturbation) :
+#   "phenotypic" (défaut) = contraste A→B des cell_groups (P4→P16) ;
+#   "de"        = axe DE-ancré (--de-axis-file : pôles = top-N up/down d'un DE) ;
+#   "effector"  = axe ancré sur des listes de gènes effecteurs pro/anti (manuel).
+# Complémentaire du multi-axe ci-dessus (par-cluster/transition, re-projeté du cache).
+_PERT = config["perturbation"]
+AXIS_MODE = _PERT.get("axis", "phenotypic")
+if AXIS_MODE == "de":
+    AXIS_FLAGS = ("--de-axis-file " + str(_PERT.get("de_axis_file", DE_CSV))
+                  + " --de-axis-label " + str(_PERT.get("de_axis_label", "sen_vs_pro"))
+                  + " --de-axis-rank " + str(_PERT.get("de_axis_rank", "stat")))
+elif AXIS_MODE in ("effector", "manual"):
+    _ep, _ea = _PERT.get("effector_pro", ""), _PERT.get("effector_anti", "")
+    AXIS_FLAGS = ("--effector-axis"
+                  + ((" --effector-pro " + str(_ep)) if _ep else "")
+                  + ((" --effector-anti " + str(_ea)) if _ea else ""))
+else:
+    AXIS_FLAGS = ""
 
 SCORING        = config["scoring"]
 ORA_TOP_N      = config["validation"]["ora_top_n"]
@@ -91,6 +122,14 @@ GNN_ENV = " ".join([
     "GNN_HUMESS_DIR=" + str(HUMESS_DIR),
     "GNN_SCENIC_DIR=" + str(SCENIC_DIR),
 ])
+
+# Mode déterministe opt-in (compute.deterministic: true) : bit-exact à seed fixe
+# (threads=1 + algos déterministes + PYTHONHASHSEED figé pour l'ordre des arêtes).
+# ⚠️ threads=1 → build/entraînement plus LENTS (surtout CPU). À réserver aux runs
+# de reproductibilité. GNN_DETERMINISTIC est aussi injecté aux perturbations.
+DETERMINISTIC = config.get("compute", {}).get("deterministic", False)
+if DETERMINISTIC:
+    GNN_ENV += " GNN_DETERMINISTIC=1 PYTHONHASHSEED=0"
 
 # ──────────────────────────────────────────────────────────────────
 # Stage 0 — build features data-dérivées (coexpr + HuMess) — OPTIONNEL
@@ -259,6 +298,8 @@ rule perturb:
         rd=lambda wc: run_dir(wc.seed),
         suffix=(("--out-suffix " + str(OUT_SUFFIX)) if OUT_SUFFIX else ""),
         genes=(("--genes-file " + str(GENES_FILE)) if GENES_FILE else ""),
+        multi=_MULTI_FLAGS,
+        axis=AXIS_FLAGS,
     log:
         OUT_BASE / "logs" / "perturb_s{seed}_{mode}.log",
     threads: 8
@@ -268,7 +309,7 @@ rule perturb:
     shell:
         "{PY} src/perturbation/perturb_top_genes.py "
         "--run-dir {params.rd} --all-genes --modes {wildcards.mode} "
-        "--device {DEVICE} {params.suffix} {params.genes} &> {log}"
+        "--device {DEVICE} {params.suffix} {params.genes} {params.multi} {params.axis} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────

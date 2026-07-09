@@ -142,8 +142,20 @@ def main():
                           default="output/pyscenic", repo=repo)
     humess_dir = ask_path("Sorties HuMess (importance métabolique)",
                           default=f"{data_root}/humess/{name}", repo=repo)
+    # Auto-détection du fichier DE : cherche DEGs_<A>_vs_<B>*.csv et propose le
+    # meilleur (préférence _MAST > _Wald > brut), en listant les alternatives.
+    import glob as _glob
+    _de_dir = os.path.join(repo, data_root, "gnn_data")
+    _de_cands = sorted(_glob.glob(os.path.join(_de_dir, f"DEGs_{grpA}_vs_{grpB}*.csv")))
+    _de_default = f"{data_root}/gnn_data/DEGs_{grpA}_vs_{grpB}.csv"
+    if _de_cands:
+        _rank = lambda p: (0 if "_MAST" in p else 1 if "_Wald" in p else 2, p)
+        _best = sorted(_de_cands, key=_rank)[0]
+        _de_default = os.path.relpath(_best, repo)
+        print("    DE trouvés : " + ", ".join(os.path.basename(c) for c in _de_cands))
+        print(f"    → proposé : {os.path.basename(_best)} (préférence MAST/Wald)")
     de_csv     = ask_path("CSV de DE (logFC/pvalue A vs B, pour le readout)",
-                          default=f"{data_root}/gnn_data/DEGs_{grpA}_vs_{grpB}.csv", repo=repo)
+                          default=_de_default, repo=repo)
     coexpr     = ask_path("Fichier de co-expression (coexpr_diff.tsv)",
                           default=f"{data_root}/pyscenic/diff_coexpr/coexpr_diff.tsv", repo=repo)
 
@@ -205,14 +217,42 @@ def main():
         print(f"    → désactivé : {', '.join(ablations)}  "
               "(pense à nommer le run en conséquence, ex. <nom>-no-humess)")
 
+    # 8c. Axe primaire du driver_score -----------------------------------
+    print("\n— Axe primaire (ancrage du driver_score) —")
+    print("    phenotypic = contraste A→B des cell_groups (défaut, comme V5.4.1) ;")
+    print("    de         = axe DE-ancré (pôles = top-N up/down d'un fichier DE) ;")
+    print("    effector   = axe MANUEL, ancré sur tes listes de gènes pro/anti.")
+    axis = ask("Axe", default="phenotypic", choices=["phenotypic", "de", "effector"])
+    de_axis_file = de_axis_rank = effector_pro = effector_anti = ""
+    if axis == "de":
+        de_axis_file = ask_path("  Fichier DE pour l'axe", default=de_csv, repo=repo)
+        de_axis_rank = ask("  Ranking des ancres", default="stat", choices=["stat", "log_fc"])
+    elif axis == "effector":
+        effector_pro  = ask_path("  Gènes pôle PRO-sénescence (1/ligne)", default="", repo=repo)
+        effector_anti = ask_path("  Gènes pôle ANTI-sénescence (1/ligne)", default="", repo=repo)
+
+    # 8d. Intégrer le logFC/DE comme FEATURE de nœud (--de-features) -------
+    print("\n— logFC dans le graphe (features de nœud) —")
+    print("    ⚠️  CIRCULARITÉ : injecter le DE (logFC/pvalue) comme feature de nœud")
+    print("        rend l'encodeur informé de la cible → fuite si l'axe est DE-ancré.")
+    print("        Ton historique : « logFC JAMAIS en feature d'encoder (anti-circularité) ».")
+    print("        Conseil : si tu l'actives, évalue avec un axe EFFECTEUR-ancré (pas 'de').")
+    de_features = ask_yesno("Intégrer le logFC/DE dans le graphe (--de-features) ?", default=False)
+    if de_features and axis == "de":
+        print("    ⚠️⚠️  de_features + axe 'de' = double circularité — fortement déconseillé.")
+
     # 9. Validation --------------------------------------------------------
     ora_top_n = ask_int("ORA : top-N drivers", default=P["ora_top_n"])
     cluster_annotation = P["cluster_annotation"] and n_seeds >= 2  # cross-seed → ≥2 seeds
+    deterministic = ask_yesno(
+        "Mode déterministe (bit-exact à seed fixe ; ⚠️ threads=1 → plus LENT)", default=False)
 
     # ── Assemblage extra_flags + out_base ─────────────────────────────────
     extra_flags = f"--n-epochs {epochs} --patience {patience}"
     if GRAPH_FLAGS[graph]:
         extra_flags += " " + GRAPH_FLAGS[graph]
+    if de_features:
+        extra_flags += " --de-features"
     # Ablations APRÈS les flags graphe → --no-* prime sur --use-* (argparse last-wins).
     for a in ablations:
         extra_flags += " " + ABLATIONS[a]
@@ -241,6 +281,7 @@ compute:
   python: "{py}"
   python_torch: "{py}"
   backend: "{backend}"      # local | cluster (wrapper run.sh)
+  deterministic: {str(deterministic).lower()}   # bit-exact à seed fixe (threads=1 → plus lent)
 
 input:
   rna_type: {rna}
@@ -276,6 +317,13 @@ perturbation:
   axis_tag: ""
   out_suffix: ""
   genes_file: "{genes_file}"   # "" = tous les gènes ; sinon sous-ensemble (cibles)
+  # Axe primaire du driver_score : phenotypic (A→B) | de (DE-ancré) | effector (manuel)
+  axis: "{axis}"
+  de_axis_file: "{de_axis_file}"
+  de_axis_label: "{grpB}_vs_{grpA}"
+  de_axis_rank: "{de_axis_rank or 'stat'}"
+  effector_pro: "{effector_pro}"
+  effector_anti: "{effector_anti}"
 
 scoring:
   de_significance: "pvalue"

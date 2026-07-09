@@ -1,0 +1,86 @@
+# ──────────────────────────────────────────────────────────────────
+# config.V6.1.3seed.yaml — V6.1 en 3 seeds + déterministe (comparable V5.4.1).
+# Dérivé de config.V6.1.yaml : mêmes GRAPH_FLAGS (config v5.4.baseline signée),
+# mais seeds [1,2,3], compute.deterministic:true, DE MAST, run_tag distinct.
+#   bash workflow/run.sh --backend cluster --configfile workflow/config/config.V6.1.3seed.yaml
+# ⚠️ déterministe = threads=1 → build/train plus LENTS. Pour la seule comparaison
+#    scientifique (cœur robuste cross-seed), tu peux mettre deterministic:false (rapide) ;
+#    le déterminisme n'ajoute que la reproductibilité bit-exact.
+# ──────────────────────────────────────────────────────────────────
+run:
+  name: "V6.1_3seed"
+  description: "VGAE sc — P4 vs P16 (cluster, 3 seeds, déterministe)"
+
+paths:
+  data_root: "data"
+  out_base: "output/V6.1_3seed"    # env GNN_OUT_DIR_BASE (scratch) prime
+  humess_dir: "data/humess/output_huvec"
+  scenic_dir: "output/pyscenic"
+  de_magnitude_csv: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"   # MAST (= V5.4.1)
+  coexpr_file: "data/pyscenic/diff_coexpr/coexpr_diff.tsv"
+
+compute:
+  device: "auto"
+  python: "python3"
+  python_torch: "python3"
+  backend: "cluster"
+  deterministic: true       # bit-exact à seed fixe (threads=1 → plus lent)
+
+input:
+  rna_type: sc
+  degs_path: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
+
+build:
+  enabled: false
+  matrix: ""
+  metadata: ""
+  gene_col: "Tracking_id"
+  group_col: 2
+  young_group: "P4"
+  sen_group: "P16"
+  conditions: ['P4', 'P16']
+  humess_repo: "../humess"
+  humess_cs_nsamples: 1000
+
+models:
+  vgae:
+    enabled: true
+    run_tag: "V6.1_3seed"
+    seeds: [1, 2, 3]
+    extra_flags: "--n-epochs 1200 --patience 150 --use-omnipath-signaling --use-omnipath-tf-curated --include-omnipath-genes --use-reactome-fi --signed-message --signed-decoder --decoder-split --kl-beta-max 0.0001"
+  gnn_lite:
+    enabled: false
+
+perturbation:
+  enabled: true
+  modes: [knockout, knockdown, overexpress]
+  scope: all_genes
+  axis_tag: ""
+  out_suffix: ""
+  genes_file: ""            # "" = tous les gènes (comparable V5.4.1)
+  # Axe primaire : phenotypic (A→B), comme V5.4.1. (de / effector via le wizard.)
+  axis: "phenotypic"
+  de_axis_file: ""
+  de_axis_label: "P16_vs_P4"
+  de_axis_rank: "stat"
+  effector_pro: ""
+  effector_anti: ""
+
+scoring:
+  de_significance: "pvalue"
+  de_padj_max: 0.05
+  de_abs_lfc_min: 0.5
+
+validation:
+  ora_top_n: 100
+  decoy:
+    enabled: false
+    top_n: 40
+  cluster_annotation:
+    enabled: true            # 3 seeds → cross-seed OK
+
+comparison:
+  enabled: false
+
+output:
+  generate_html_report: false
