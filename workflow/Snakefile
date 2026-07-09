@@ -374,8 +374,11 @@ rule ora_top_drivers:
         # toujours pré-créé à temps → la 1re redirection `>` échouait). top-N
         # drivers (col1=gène, tri par driver_score col2) → ORA hypergéométrique.
         'mkdir -p "$(dirname {output.genes})" "$(dirname {log})" && '
+        # NB : `sort | head -N` échoue sous `set -o pipefail` (Snakemake strict) —
+        # head ferme le pipe → sort reçoit SIGPIPE (exit 141) → pipefail. On prend
+        # le top-N avec awk (lit tout le flux, pas de fermeture précoce).
         "tail -n +2 {input.ranking} | sort -t$'\\t' -k2,2 -gr | "
-        "head -{params.top_n} | cut -f1 > {output.genes} 2> {log} && "
+        "awk -F'\\t' -v n={params.top_n} 'NR<=n{{print $1}}' > {output.genes} 2> {log} && "
         "{PY} src/validation/ora/ora_consensus.py --genes {output.genes} "
         "--db reactome --out {output.reactome} &>> {log} && "
         "{PY} src/validation/ora/ora_consensus.py --genes {output.genes} "
