@@ -370,7 +370,10 @@ rule ora_top_drivers:
     log:
         OUT_BASE / "logs" / "ora_top_drivers.log",
     shell:
-        # top-N drivers (col1=gène, tri par driver_score col2) → ORA hypergéométrique
+        # mkdir -p : garde-fou (en cluster/NFS le dossier de sortie n'est pas
+        # toujours pré-créé à temps → la 1re redirection `>` échouait). top-N
+        # drivers (col1=gène, tri par driver_score col2) → ORA hypergéométrique.
+        'mkdir -p "$(dirname {output.genes})" "$(dirname {log})" && '
         "tail -n +2 {input.ranking} | sort -t$'\\t' -k2,2 -gr | "
         "head -{params.top_n} | cut -f1 > {output.genes} 2> {log} && "
         "{PY} src/validation/ora/ora_consensus.py --genes {output.genes} "
