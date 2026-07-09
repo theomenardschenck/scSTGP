@@ -4,6 +4,13 @@ OmniPath integration — V4 (signed/directed edges + curated TFs).
 Rewrite complete pour omnipath-py >= 1.0 (l'ancienne API
 `OmnipathInteractions.get(...)` n'existe plus).
 
+V6 (2026-07) : normalisation d'alias HGNC optionnelle. Les loaders et
+`_project_to_graph` acceptent `alias_map` (cf. `hgnc_alias.build_alias_map`) :
+la projection matche en symbole approuvé (H2AFZ↔H2AZ1) au lieu d'un match
+exact qui perdait les gènes dérivés de nomenclature. `alias_map=None` =
+comportement legacy exact (rétro-compatible). Piloté par
+`--omnipath-hgnc-alias` (défaut ON) dans `gnn_vgae`.
+
 3 sources de données prises en charge, chacune cachée sur disque
 sous forme TSV pour pouvoir tourner sur les compute nodes du cluster
 Nautilus (qui n'ont pas accès Internet) :
@@ -220,6 +227,7 @@ def _project_to_graph(
     df: pd.DataFrame,
     available_genes: Iterable[str],
     gene_to_idx: dict,
+    alias_map: Optional[dict] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
     """Projette les paires symbol→symbol sur les indices du graphe.
 
@@ -233,10 +241,31 @@ def _project_to_graph(
     L'argument `available_genes` est conservé pour rétrocompat de
     signature mais ignoré : `gene_to_idx.keys()` est la source de vérité.
 
+    HGNC alias : si `alias_map` (cf. `hgnc_alias.build_alias_map`) est
+    fourni, la jointure se fait en espace symbole **approuvé** — les
+    endpoints d'arête ET les clés `gene_to_idx` sont canonicalisés avant
+    le match, puis les indices ORIGINAUX du graphe sont retournés. Sans
+    lui (None), match brut en symbole exact (legacy) → perd les gènes
+    dérivés de nomenclature (H2AFZ↔H2AZ1). Cf. `hgnc_alias.py`.
+
     Retourne : edge_src, edge_dst, edge_attr=[score, sign], metadata_df
     Toutes vides si aucun lien ne survit au filtrage.
     """
-    in_graph = set(gene_to_idx.keys())
+    if alias_map:
+        # Index de jointure en espace approuvé → indice graphe d'origine
+        # (première clé gagne en cas de collision legacy/approuvé).
+        index_map: dict = {}
+        for _key, _idx in gene_to_idx.items():
+            index_map.setdefault(alias_map.get(_key, _key), _idx)
+        df = df.copy()
+        df["source_symbol"] = df["source_symbol"].map(
+            lambda s: alias_map.get(s, s))
+        df["target_symbol"] = df["target_symbol"].map(
+            lambda s: alias_map.get(s, s))
+    else:
+        index_map = gene_to_idx
+
+    in_graph = set(index_map.keys())
     keep = (
         df["source_symbol"].isin(in_graph)
         & df["target_symbol"].isin(in_graph)
@@ -249,8 +278,8 @@ def _project_to_graph(
                 np.zeros((0, 2), dtype=np.float32),
                 sub)
 
-    src_idx = sub["source_symbol"].map(gene_to_idx).to_numpy(dtype=np.int64)
-    dst_idx = sub["target_symbol"].map(gene_to_idx).to_numpy(dtype=np.int64)
+    src_idx = sub["source_symbol"].map(index_map).to_numpy(dtype=np.int64)
+    dst_idx = sub["target_symbol"].map(index_map).to_numpy(dtype=np.int64)
     # Sanity : après filtrage strict sur gene_to_idx.keys(), aucun NaN/INT64_MIN
     # ne doit subsister. Garde-fou explicite pour détecter une régression future.
     if (src_idx < 0).any() or (dst_idx < 0).any():
@@ -600,8 +629,12 @@ def load_signaling_directed(
     gene_to_idx: dict,
     download_if_missing: bool = False,
     organism: str = "human",
+    alias_map: Optional[dict] = None,
 ):
     """Signaling dirigé OmniPath (kinase-substrat + causal).
+
+    `alias_map` (optionnel) : normalisation HGNC à la projection, cf.
+    `_project_to_graph`.
 
     Returns:
         edge_src, edge_dst : (n,) np.int64 (indices du graphe)
@@ -616,7 +649,7 @@ def load_signaling_directed(
     if df is None:
         return (np.array([], dtype=np.int64), np.array([], dtype=np.int64),
                 np.zeros((0, 2), dtype=np.float32), pd.DataFrame())
-    return _project_to_graph(df, available_genes, gene_to_idx)
+    return _project_to_graph(df, available_genes, gene_to_idx, alias_map)
 
 
 def load_collectri_tf_target(
@@ -626,8 +659,11 @@ def load_collectri_tf_target(
     download_if_missing: bool = False,
     organism: str = "human",
     fallback_dorothea: bool = True,
+    alias_map: Optional[dict] = None,
 ):
     """TF→target curé : CollecTRI, fallback DoRothEA.
+
+    `alias_map` (optionnel) : normalisation HGNC à la projection.
 
     Returns: idem load_signaling_directed.
     """
@@ -645,7 +681,7 @@ def load_collectri_tf_target(
     if df is None:
         return (np.array([], dtype=np.int64), np.array([], dtype=np.int64),
                 np.zeros((0, 2), dtype=np.float32), pd.DataFrame())
-    return _project_to_graph(df, available_genes, gene_to_idx)
+    return _project_to_graph(df, available_genes, gene_to_idx, alias_map)
 
 
 def load_signed_ppi_signor(
@@ -654,8 +690,11 @@ def load_signed_ppi_signor(
     gene_to_idx: dict,
     download_if_missing: bool = False,
     organism: str = "human",
+    alias_map: Optional[dict] = None,
 ):
     """PPI signé/dirigé curé SIGNOR 3.0.
+
+    `alias_map` (optionnel) : normalisation HGNC à la projection.
 
     Returns: idem load_signaling_directed.
     """
@@ -667,7 +706,7 @@ def load_signed_ppi_signor(
     if df is None:
         return (np.array([], dtype=np.int64), np.array([], dtype=np.int64),
                 np.zeros((0, 2), dtype=np.float32), pd.DataFrame())
-    return _project_to_graph(df, available_genes, gene_to_idx)
+    return _project_to_graph(df, available_genes, gene_to_idx, alias_map)
 
 
 # --------------------------------------------------------------------------- #
