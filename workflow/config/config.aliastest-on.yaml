@@ -1,0 +1,100 @@
+# ──────────────────────────────────────────────────────────────────
+# config.aliastest-on.yaml — TEST A/B de la normalisation d'alias HGNC OmniPath.
+#   Version ALIAS ON (défaut, --omnipath-hgnc-alias). Comparer à config.aliastest-off.yaml
+#   (identique sauf --no-omnipath-hgnc-alias) : seules les sources OmniPath signées
+#   (signaling + TF curé) changent → gènes alias-driftés (H2AFZ↔H2AZ1) récupèrent
+#   leurs arêtes. L'effet est au BUILD du graphe (indépendant du seed/entraînement).
+#
+# Test le plus rapide (build seul, ~1 étape) :
+#   bash workflow/run.sh --backend cluster --configfile workflow/config/config.aliastest-on.yaml  -- --until build_graph
+#   bash workflow/run.sh --backend cluster --configfile workflow/config/config.aliastest-off.yaml -- --until build_graph
+# Puis comparer, dans les logs de build (ou le graphe), la ligne :
+#   "[hgnc] normalisation d'alias ON (N variants)"  et  "OmniPath : <k> (dont <n> nouveaux…)".
+#
+# ⚠️ PRÉREQUIS offline : le cache data/omnipath/hgnc_alias_map.tsv.gz DOIT être présent
+#    (download OFF sur les nœuds de calcul). Sinon → alias map vide = fallback identité
+#    (aucun effet, silencieux). Idem caches d'arêtes signed_ppi_signor / tf_collectri.
+# ──────────────────────────────────────────────────────────────────
+run:
+  name: "aliastest_on"
+  description: "A/B alias HGNC OmniPath — ALIAS ON (build V6.1 signé, 1 seed)"
+
+paths:
+  data_root: "data"
+  out_base: "output/aliastest_on"     # env GNN_OUT_DIR_BASE (scratch) prime
+  humess_dir: "data/humess/output_huvec"
+  scenic_dir: "output/pyscenic"
+  de_magnitude_csv: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
+  coexpr_file: "data/pyscenic/diff_coexpr/coexpr_diff.tsv"
+
+compute:
+  device: "auto"
+  python: "python3"
+  python_torch: "python3"
+  backend: "cluster"
+  deterministic: false      # l'effet alias est déterministe au build ; pas besoin de bit-exact
+
+input:
+  rna_type: sc
+  degs_path: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
+
+build:
+  enabled: false
+  matrix: ""
+  metadata: ""
+  gene_col: "Tracking_id"
+  group_col: 2
+  young_group: "P4"
+  sen_group: "P16"
+  conditions: ['P4', 'P16']
+  humess_repo: "../humess"
+  humess_cs_nsamples: 1000
+
+models:
+  vgae:
+    enabled: true
+    run_tag: "aliastest_on"
+    seeds: [1]
+    # Graphe V6.1 signé (OmniPath signaling + TF curé actifs → l'alias joue).
+    # ALIAS ON = défaut (aucun flag) ; la version OFF ajoute --no-omnipath-hgnc-alias.
+    # n-epochs court : le test cible le build, l'entraînement n'affecte pas l'alias.
+    extra_flags: "--n-epochs 300 --patience 50 --use-omnipath-signaling --use-omnipath-tf-curated --include-omnipath-genes --use-reactome-fi --signed-message --signed-decoder --decoder-split --kl-beta-max 0.0001"
+  gnn_lite:
+    enabled: false
+
+perturbation:
+  enabled: true
+  modes: [knockout]
+  scope: all_genes
+  axis_tag: ""
+  out_suffix: ""
+  genes_file: "data/gene_sets/priority_drivers_targets.txt"   # ciblé = perturbation rapide
+  axis: "phenotypic"
+  de_axis_file: ""
+  de_axis_label: "P16_vs_P4"
+  de_axis_rank: "stat"
+  effector_pro: ""
+  effector_anti: ""
+  transition_axes: none
+  cluster_anchor_mode: none
+  cluster_anchors_file: ""
+  cache_delta_z: false
+
+scoring:
+  de_significance: "pvalue"
+  de_padj_max: 0.05
+  de_abs_lfc_min: 0.5
+
+validation:
+  ora_top_n: 100
+  decoy:
+    enabled: false
+    top_n: 40
+  cluster_annotation:
+    enabled: false           # 1 seed → pas de cross-seed
+
+comparison:
+  enabled: false
+
+output:
+  generate_html_report: false

@@ -198,7 +198,7 @@ def final_targets():
     if DECOY_ON:
         t.append(ANALYSIS_DIR / "interpret" / "decoy_confidence.tsv")
     if CLUSTER_ANNOT:
-        t.append(ANALYSIS_DIR / "cluster_annotation" / "cluster_annotation.tsv")
+        t.append(ANALYSIS_DIR / "cluster_annotation" / "cluster_annotation_cross_seed.tsv")
     return t
 
 rule all:
@@ -311,7 +311,7 @@ rule perturb:
     threads: 8
     resources:
         mem_mb=32000,
-        runtime=480,
+        runtime=1200,   # 20 h : all-genes ×11k gènes frôle/dépasse 8 h (mur qos short=24 h)
     shell:
         "{PY} src/perturbation/perturb_top_genes.py "
         "--run-dir {params.rd} --all-genes --modes {wildcards.mode} "
@@ -437,7 +437,7 @@ rule cluster_annotation:
     input:
         ge=expand(str(run_dir("{seed}") / "group_expression.tsv"), seed=SEEDS),
     output:
-        annot=ANALYSIS_DIR / "cluster_annotation" / "cluster_annotation.tsv",
+        annot=ANALYSIS_DIR / "cluster_annotation" / "cluster_annotation_cross_seed.tsv",
     params:
         out_dir=ANALYSIS_DIR / "cluster_annotation",
     log:

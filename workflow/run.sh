@@ -62,6 +62,11 @@ command -v snakemake >/dev/null || {
 }
 
 COMMON=(-s "$SNAKEFILE" --configfile "$CONFIGFILE")
+# --keep-going par défaut : l'échec d'un step (typiquement une VALIDATION comme
+# cluster_annotation) ne doit PAS avorter la branche des livrables scientifiques
+# (cross_seed_gene_ranking, ORA, report). Snakemake termine tous les jobs
+# indépendants puis sort en erreur, au lieu de tout stopper au 1er échec.
+COMMON+=(--keep-going)
 [[ $DRY -eq 1 ]] && COMMON+=(-n)
 
 case "$BACKEND" in
