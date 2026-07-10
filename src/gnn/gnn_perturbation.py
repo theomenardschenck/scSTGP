@@ -104,12 +104,17 @@ CELL_GROUPS = ("P4", "P16_cluster_0", "P16_cluster_1",
 # --------------------------------------------------------------------------- #
 # V5 (TIER 1c) — edge_types qui portent un `sign` (colonne 1 de edge_attr).
 # DOIT rester synchro avec gnn_vgae.SIGNED_EDGE_TYPES.
+# V6 : + 6 edge_types OmniPath supplémentaires (cf. _vgae_model.py).
+OMNIPATH_EXTRA_EDGE_TYPES = [
+    "transcriptional", "tf_target", "kinase_substrate",
+    "ligand_receptor", "pathway", "enzyme_substrate",
+]
 SIGNED_EDGE_TYPES: set = {
     ("gene", "signaling", "gene"),
     ("gene", "tf_curated", "gene"),
     ("gene", "tf_curated_by", "gene"),
     ("gene", "reactome_fi", "gene"),
-}
+} | {("gene", _et, "gene") for _et in OMNIPATH_EXTRA_EDGE_TYPES}
 
 
 class SignedGATConv(GATConv):
@@ -234,7 +239,7 @@ class HeteroEncoder(nn.Module):
         (("gene", "tf_curated", "gene"), 2),
         (("gene", "tf_curated_by", "gene"), 2),
         (("gene", "reactome_fi", "gene"), 2),  # V4.2
-    ]
+    ] + [(("gene", _et, "gene"), 2) for _et in OMNIPATH_EXTRA_EDGE_TYPES]  # V6
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
                  n_heads=4, dropout=0.2, available_edge_types=None,

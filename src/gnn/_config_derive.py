@@ -23,6 +23,7 @@ MODULES = {
     "use_omnipath_tf_curated":   CLI_ARGS.use_omnipath_tf_curated,
     "include_omnipath_genes":    CLI_ARGS.include_omnipath_genes,
     "omnipath_hgnc_alias":       CLI_ARGS.omnipath_hgnc_alias,
+    "use_omnipath_node_features": CLI_ARGS.use_omnipath_node_features,
     "use_reactome_fi":           CLI_ARGS.use_reactome_fi,
 }
 
@@ -64,6 +65,41 @@ GENE_FEATURE_FLAGS = {
     "has_humess":  _feature_enabled("has_humess", MODULES["use_humess_features"]),
 }
 
+# V6 Module 1 : OmniPath-derived node features (localisation + druggabilité +
+# classe moléculaire). Source = master flag ; exclusion fine via
+# --exclude-features. Ordre canonique aligné sur omnipath_node_features.ALL_FEATURES.
+_OMNIPATH_NODE_FEATURES = [
+    "op_transmitter", "op_receiver", "op_secreted", "op_plasma_membrane",
+    "op_druggable", "op_drug_records",
+    "is_protein_coding", "is_lncrna", "is_mirna",
+]
+for _f in _OMNIPATH_NODE_FEATURES:
+    GENE_FEATURE_FLAGS[_f] = _feature_enabled(
+        _f, MODULES["use_omnipath_node_features"])
+
+# V6 Module 1 (extension) : arêtes OmniPath supplémentaires à ajouter.
+# Parse --omnipath-edges (liste ou 'all') → set validé OMNIPATH_EXTRA_EDGES.
+# Doit rester aligné sur _vgae_model.OMNIPATH_EXTRA_EDGE_TYPES.
+_OMNIPATH_EXTRA_ALLOWED = [
+    "transcriptional", "tf_target", "kinase_substrate",
+    "ligand_receptor", "pathway", "enzyme_substrate",
+]
+OMNIPATH_EXTRA_EDGES: list[str] = []
+_raw_op_edges = getattr(CLI_ARGS, "omnipath_edges", "") or ""
+if _raw_op_edges.strip():
+    _req = [s.strip() for s in _raw_op_edges.split(",") if s.strip()]
+    if _req == ["all"]:
+        OMNIPATH_EXTRA_EDGES = list(_OMNIPATH_EXTRA_ALLOWED)
+    else:
+        for _e in _req:
+            if _e in _OMNIPATH_EXTRA_ALLOWED:
+                OMNIPATH_EXTRA_EDGES.append(_e)
+            else:
+                print(f"  [warn] --omnipath-edges : type inconnu '{_e}' ignoré "
+                      f"(valides : {_OMNIPATH_EXTRA_ALLOWED} ou 'all')")
+if OMNIPATH_EXTRA_EDGES:
+    print(f"  OmniPath extra edges (V6) : {OMNIPATH_EXTRA_EDGES}")
+
 
 def _build_run_tag():
     """Construit un tag court à partir des modules désactivés.
@@ -92,6 +128,10 @@ def _build_run_tag():
             and (MODULES["use_omnipath_signaling"]
                  or MODULES["use_omnipath_tf_curated"])):
         parts.append("no-hgnc-alias")
+    if MODULES["use_omnipath_node_features"]: parts.append("op-nodefeat")
+    if OMNIPATH_EXTRA_EDGES:
+        # Tag court : op-edges<N> (N types) ; ex op-edges2. Détail dans run_config.
+        parts.append(f"op-edges{len(OMNIPATH_EXTRA_EDGES)}")
     if MODULES["use_reactome_fi"]:          parts.append("rfi")
     if COEXPR_DIFFERENTIAL:                 parts.append("coexdiff")
     # V4.3 : tag des choix méthode×prune (uniquement si != défaut).

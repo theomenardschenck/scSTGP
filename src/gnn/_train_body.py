@@ -207,6 +207,11 @@ _signed_sources = [
     (op_tf_src, op_tf_dst),         # tf_curated (CollecTRI) — tf_curated_by inverse
     (reactome_fi_src, reactome_fi_dst),  # Reactome FI signé
 ]
+# V6 : arêtes OmniPath supplémentaires (--omnipath-edges) → même pool signé
+# (V5.2 : décodeur cosinus voit toutes les arêtes ; pas de fuite negsamp).
+for _et_name, (_ex_src, _ex_dst) in globals().get(
+        "omnipath_extra_edges", {}).items():
+    _signed_sources.append((_ex_src, _ex_dst))
 all_gene_edges = set()
 for src_list, dst_list in (_unsigned_sources if DECODER_SPLIT
                            else _unsigned_sources + _signed_sources):

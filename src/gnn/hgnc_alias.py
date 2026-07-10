@@ -47,18 +47,22 @@ HGNC_COMPLETE_SET_URL = (
     "hgnc_complete_set.txt"
 )
 _NEEDED_COLS = ["symbol", "alias_symbol", "prev_symbol", "status"]
+_BIOTYPE_COLS = ["symbol", "locus_group", "locus_type", "status"]
 _MAP_CACHE_NAME = "hgnc_alias_map.tsv.gz"
+_BIOTYPE_CACHE_NAME = "hgnc_biotype_map.tsv.gz"
 _MAP_COLS = ["variant", "approved", "kind"]
+_BIOTYPE_OUT_COLS = ["symbol", "is_protein_coding", "is_lncrna", "is_mirna"]
 
 
 # --------------------------------------------------------------------------- #
 # Fetch + build
 # --------------------------------------------------------------------------- #
-def _fetch_hgnc_table(url: str = HGNC_COMPLETE_SET_URL) -> Optional[pd.DataFrame]:
-    """Download the HGNC complete set (needed columns only)."""
+def _fetch_hgnc_table(url: str = HGNC_COMPLETE_SET_URL,
+                      usecols=None) -> Optional[pd.DataFrame]:
+    """Download the HGNC complete set (selected columns only)."""
     try:
-        df = pd.read_csv(url, sep="\t", usecols=_NEEDED_COLS, dtype=str,
-                         low_memory=False)
+        df = pd.read_csv(url, sep="\t", usecols=usecols or _NEEDED_COLS,
+                         dtype=str, low_memory=False)
     except Exception as e:
         warnings.warn(f"hgnc_alias: HGNC download failed ({type(e).__name__}: "
                       f"{e})", RuntimeWarning)
@@ -200,3 +204,56 @@ def coverage_report(symbols: Iterable[str],
         "n_remapped": n_remapped,
         "n_map_variants": len(alias_map),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Molecular-class (biotype) map — protein-coding / lncRNA / miRNA
+# --------------------------------------------------------------------------- #
+def build_biotype_map(
+    cache_dir: str = "data/omnipath",
+    download_if_missing: bool = False,
+    force: bool = False,
+) -> pd.DataFrame:
+    """Return a DataFrame [symbol, is_protein_coding, is_lncrna, is_mirna]
+    from the HGNC `locus_group` / `locus_type`.
+
+    Same offline-first cache pattern as `build_alias_map`. Returns an empty
+    DataFrame when unavailable → callers fall back to all-zero flags (safe).
+    Keyed by the HGNC **approved** symbol (canonicalize your symbols with the
+    alias map before joining).
+    """
+    path = os.path.join(cache_dir, _BIOTYPE_CACHE_NAME)
+    if not force and os.path.exists(path):
+        try:
+            m = pd.read_csv(path, sep="\t", compression="infer")
+            if set(_BIOTYPE_OUT_COLS).issubset(m.columns):
+                print(f"  [hgnc] biotype map cache ({len(m)} symbols)")
+                return m
+        except Exception as e:
+            warnings.warn(f"hgnc_alias: unreadable biotype cache {path}: {e}",
+                          RuntimeWarning)
+
+    if not download_if_missing:
+        print("  [hgnc] biotype map absent, download disabled → empty (zeros)")
+        return pd.DataFrame(columns=_BIOTYPE_OUT_COLS)
+
+    print("  [hgnc] downloading HGNC complete set (biotype)…")
+    df = _fetch_hgnc_table(usecols=_BIOTYPE_COLS)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=_BIOTYPE_OUT_COLS)
+    df = df[df["status"].astype(str).str.lower() == "approved"].copy()
+    lg = df["locus_group"].astype(str).str.lower()
+    lt = df["locus_type"].astype(str).str.lower()
+    out = pd.DataFrame({
+        "symbol": df["symbol"].astype(str),
+        "is_protein_coding": (lg == "protein-coding gene").astype(int),
+        "is_lncrna": (lt == "rna, long non-coding").astype(int),
+        "is_mirna": (lt == "rna, micro").astype(int),
+    }).drop_duplicates("symbol").reset_index(drop=True)
+    os.makedirs(cache_dir, exist_ok=True)
+    out.to_csv(path, sep="\t", index=False, compression="gzip")
+    print(f"  [hgnc] biotype map built: {len(out)} symbols "
+          f"(protein-coding {int(out.is_protein_coding.sum())}, "
+          f"lncRNA {int(out.is_lncrna.sum())}, "
+          f"miRNA {int(out.is_mirna.sum())}) → {path}")
+    return out

@@ -94,6 +94,32 @@ def parse_cli_args(argv=None):
                    action="store_false",
                    help="Désactive la normalisation HGNC → match brut en "
                         "symbole exact (comportement legacy pré-V6).")
+    # V6 Module 1 : OmniPath-derived NODE features (localisation intercell +
+    # druggabilité + classe moléculaire) sur le type 'gene' (PAS de nouveau
+    # type de nœud). Opt-in (défaut OFF, réversible). Exclusion fine possible
+    # via --exclude-features op_secreted,op_druggable,is_lncrna,...
+    p.add_argument("--use-omnipath-node-features",
+                   dest="use_omnipath_node_features",
+                   action="store_true", default=False,
+                   help="V6 : ajoute les features de nœud OmniPath "
+                        "(op_transmitter/receiver/secreted/plasma_membrane, "
+                        "op_druggable/op_drug_records, is_protein_coding/"
+                        "is_lncrna/is_mirna). Requiert graph/nodes.tsv.gz "
+                        "(build_omnipath_graph) + hgnc_biotype_map. Offline-"
+                        "safe : sources absentes → features à 0.")
+    p.add_argument("--no-omnipath-node-features",
+                   dest="use_omnipath_node_features", action="store_false")
+    # V6 Module 1 (extension) : arêtes OmniPath supplémentaires projetées sur
+    # les nœuds gène (protein↔protein signé [score,sign]). Liste modulaire —
+    # ajouter/retirer un type à la fois. Source = graphe autonome
+    # (data/omnipath/graph/edges.tsv.gz, build_omnipath_graph). signaling &
+    # collectri_tf EXCLUS (déjà via --use-omnipath-signaling/-tf-curated).
+    p.add_argument("--omnipath-edges", dest="omnipath_edges", default="",
+                   help="V6 : liste séparée par virgules d'edge_types OmniPath "
+                        "à ajouter : {transcriptional, tf_target, "
+                        "kinase_substrate, ligand_receptor, pathway, "
+                        "enzyme_substrate} ou 'all'. Défaut vide (OFF). "
+                        "Offline-safe : graphe absent → aucune arête ajoutée.")
 
     # --- V4.2 : coexpression différentielle P4∪P16 (option A) ---
     p.add_argument("--coexpr-mode", choices=["p16_only", "differential"],
@@ -370,5 +396,6 @@ def derive_config(args):
         COEXPR_DIFFERENTIAL=ns["COEXPR_DIFFERENTIAL"],
         EDGE_TYPE_WEIGHTS=ns["EDGE_TYPE_WEIGHTS"],
         GENE_FEATURE_FLAGS=ns["GENE_FEATURE_FLAGS"],
+        OMNIPATH_EXTRA_EDGES=ns["OMNIPATH_EXTRA_EDGES"],
         RUN_TAG=ns["RUN_TAG"],
     )

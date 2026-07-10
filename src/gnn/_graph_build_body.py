@@ -1276,6 +1276,28 @@ _FEATURE_VECTORS = [
     ("imp_delta",  imp_delta),
     ("has_humess", has_humess),
 ]
+
+# V6 Module 1 (opt-in) : features de nœud OmniPath (localisation intercell +
+# druggabilité + classe moléculaire) AJOUTÉES EN FIN → l'ordre canonique des
+# features scRNA reste intact quand OFF. Offline-safe (sources absentes → 0).
+if MODULES["use_omnipath_node_features"]:
+    try:
+        from omnipath_node_features import (
+            build_node_feature_arrays as _build_op_nodefeat,
+            coverage_summary as _op_nodefeat_cov,
+        )
+        _op_arrays = _build_op_nodefeat(
+            gene_symbols=list(gene_symbols),
+            cache_dir=OMNIPATH_CACHE_DIR,
+            alias_map=omnipath_alias_map,
+            download_if_missing=CLI_ARGS.omnipath_download_if_missing,
+        )
+        _FEATURE_VECTORS.extend(_op_arrays.items())
+        print(_op_nodefeat_cov(_op_arrays))
+    except ImportError as _e:
+        print(f"  [warn] import omnipath_node_features KO ({_e}) — "
+              f"features de nœud OmniPath OFF.")
+
 _active_feature_names = [n for n, _ in _FEATURE_VECTORS if GENE_FEATURE_FLAGS[n]]
 _active_feature_arrays = [v for n, v in _FEATURE_VECTORS if GENE_FEATURE_FLAGS[n]]
 
@@ -1374,6 +1396,42 @@ if edge_index_tf_curated.numel() > 0:
 if edge_index_reactome_fi.numel() > 0:
     data["gene", "reactome_fi", "gene"].edge_index = edge_index_reactome_fi
     data["gene", "reactome_fi", "gene"].edge_attr = edge_attr_reactome_fi
+
+# V6 Module 1 (extension) — arêtes OmniPath supplémentaires projetées sur les
+# nœuds gène depuis le graphe autonome (edges.tsv.gz), signées [score, sign].
+# Chaque type activable/désactivable via --omnipath-edges. Offline-safe :
+# graphe absent → aucune arête ajoutée (warn). `omnipath_extra_edges` (dict
+# edge_type → (src, dst)) est exposé au pool de reconstruction (_train_body).
+omnipath_extra_edges: dict = {}
+if OMNIPATH_EXTRA_EDGES:
+    print("\n  OmniPath extra edges (V6)…")
+    try:
+        import omnipath_graph as _opg
+        _op_nodes, _op_edges_df = _opg.load_omnipath_graph(OMNIPATH_CACHE_DIR)
+        _proj = _opg.project_to_gene_indices(
+            _op_edges_df, gene_to_idx,
+            edge_types=OMNIPATH_EXTRA_EDGES,
+            alias_map=omnipath_alias_map,
+        )
+        for _et in OMNIPATH_EXTRA_EDGES:
+            _tup = _proj.get(_et)
+            if _tup is None or len(_tup[0]) == 0:
+                print(f"    {_et:16s}: 0 arêtes après projection")
+                continue
+            _s, _d, _attr, _ = _tup
+            data["gene", _et, "gene"].edge_index = torch.tensor(
+                [_s.tolist(), _d.tolist()], dtype=torch.long)
+            data["gene", _et, "gene"].edge_attr = torch.tensor(
+                _attr, dtype=torch.float)
+            omnipath_extra_edges[_et] = (_s, _d)
+            _npos = int((_attr[:, 1] > 0).sum())
+            _nneg = int((_attr[:, 1] < 0).sum())
+            print(f"    {_et:16s}: {len(_s)} arêtes [+:{_npos} −:{_nneg}]")
+    except FileNotFoundError:
+        print(f"    [warn] graphe OmniPath absent sous {OMNIPATH_CACHE_DIR}/"
+              f"graph/ — lance build_omnipath_graph. Aucune arête extra.")
+    except ImportError as _e:
+        print(f"    [warn] import omnipath_graph KO ({_e}) — aucune arête extra.")
 
 print(f"  Noeuds gene       : {n_genes} (features={gene_features.shape[1]})")
 print(f"  Noeuds cell_group : {len(CELL_GROUPS)}")

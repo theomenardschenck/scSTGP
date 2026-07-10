@@ -34,12 +34,22 @@ from torch_geometric.nn import GATConv, HeteroConv
 
 # V5 (TIER 1c) — edge_types qui portent un `sign` (colonne 1 de edge_attr).
 # Synchronisé avec gnn_vgae.py.
+# V6 Module 1 (extension) — 6 edge_types OmniPath supplémentaires projetables
+# sur les nœuds gène (protein↔protein), signés [score, sign]. Ne s'activent que
+# si présents dans le HeteroData (--omnipath-edges …). Source : graphe autonome
+# omnipath_graph (edges.tsv.gz), pas omnipath_integration (qui porte déjà
+# signaling + tf_curated). signaling/collectri_tf exclus (déjà à nous).
+OMNIPATH_EXTRA_EDGE_TYPES = [
+    "transcriptional", "tf_target", "kinase_substrate",
+    "ligand_receptor", "pathway", "enzyme_substrate",
+]
+
 SIGNED_EDGE_TYPES: set = {
     ("gene", "signaling", "gene"),
     ("gene", "tf_curated", "gene"),
     ("gene", "tf_curated_by", "gene"),
     ("gene", "reactome_fi", "gene"),
-}
+} | {("gene", _et, "gene") for _et in OMNIPATH_EXTRA_EDGE_TYPES}
 
 
 class _ScaledConv(nn.Module):
@@ -71,7 +81,7 @@ class HeteroEncoder(nn.Module):
         (("gene", "tf_curated", "gene"), 2),
         (("gene", "tf_curated_by", "gene"), 2),
         (("gene", "reactome_fi", "gene"), 2),  # V4.2
-    ]
+    ] + [(("gene", _et, "gene"), 2) for _et in OMNIPATH_EXTRA_EDGE_TYPES]  # V6
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
                  n_heads=4, dropout=0.2, available_edge_types=None,
