@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Profil d'ablations — LEGACY (sans intégration OmniPath 2026-07) — 2026-07-10
+# ─────────────────────────────────────────────────────────────────────────
+# Référence « avant intégration » : modèle signé V5 + signaling/tf_curated/
+# reactome_fi, MAIS SANS features de nœud OmniPath ni arêtes OmniPath extra.
+# Même grille structurelle que le profil OmniPath → comparaison ablation-par-
+# ablation. Les ablations spécifiques OmniPath (no-nodefeat) sont absentes ici.
+#
+# ⚠️ Caveat signaling : ce profil utilise le MÊME cache signaling enrichi
+# (kinase+causal, DL 2026-07-10). Pour une comparaison « signaling pré-OmniPath »
+# stricte (SIGNOR seul), retirer data/omnipath/signaling_omnipath.tsv.gz avant.
+
+root_tag: "legacy"
+seed: 1
+decoy: true
+
+base_extra_flags: >-
+  --signed-message --signed-decoder --use-reactome-fi
+  --use-omnipath-signaling --use-omnipath-tf-curated
+
+ablation_grid:
+  - {name: base,            add_flags: ""}
+  - {name: dedup,           add_flags: "--dedup-ppi-signed remove"}
+  - {name: no-ppi,          add_flags: "--no-ppi"}
+  - {name: ex-degree,       add_flags: "--exclude-features ppi_degree,reg_degree"}
+  - {name: no-coexpr,       add_flags: "--no-coexpr"}
+  - {name: no-humess-edges, add_flags: "--no-humess-edges"}
+  - {name: no-reactome,     add_flags: "--no-reactome"}
+  - {name: ex-cell-node,    add_flags: "--no-cell-group-edges"}
+  - {name: all,             add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges"}

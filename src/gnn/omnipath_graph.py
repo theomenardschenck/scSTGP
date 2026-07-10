@@ -98,7 +98,11 @@ INTERACTION_RESOURCES = {
     "ligand_receptor":  ("LigRecExtra",     "core",  True,  "protein", "protein"),
     "pathway":          ("PathwayExtra",    "core",  False, "protein", "protein"),
     "tf_mirna":         ("TFmiRNA",         "mirna", True,  "protein", "mirna"),
-    "mirna_target":     ("PostTranslational", "mirna", True, "mirna", "protein"),
+    # NB : PostTranslational (ex-"mirna_target") RETIRÉ le 2026-07-10 — ce
+    # dataset est en réalité protéine-protéine (agrégat post-traductionnel,
+    # superset de signaling/kinase/enzyme_substrate), donc redondant, et son
+    # étiquette "mirna" était fausse (endpoints = accessions UniProt, pas des
+    # miRNA). Le seul vrai miRNA reste tf_mirna (TF→miRNA mature miRBase).
     "small_molecule":   ("SmallMolecule",   "drug",  True,  "small_molecule", "protein"),
 }
 

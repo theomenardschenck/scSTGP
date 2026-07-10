@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Profil d'ablations — VAGUE 1 « après intégration OmniPath » (2026-07-10)
+# ─────────────────────────────────────────────────────────────────────────
+# Lu par scripts/run_omnipath_ablation_wave.sh (PAS directement par Snakemake).
+# Le wrapper génère, pour chaque ablation, un petit config qui SURCHARGE
+# workflow/config/config.yaml (base : chemins, perturbation, scoring, decoy),
+# puis lance le Snakefile : build_graph → train (1 seed) → perturb → cross-seed
+# → driver_baselines/interpret → decoy. Un run par ablation.
+#
+# base_extra_flags = INTÉGRATION OMNIPATH ACTUELLE :
+#   - modèle signé V5 (signed-message + signed-decoder) + reactome_fi
+#   - signaling (kinase+causal+SIGNOR, cache enrichi 2026-07-10 : 14,8k arêtes)
+#     + tf_curated (CollecTRI)
+#   - features de nœud OmniPath (Module 1 : intercell/druggabilité/biotype)
+#   - arêtes OmniPath NON-REDONDANTES (transcriptional ⊃ tf_target écarté ;
+#     enzyme_substrate ⊃ kinase_substrate écarté ; ligand_receptor = SASP).
+# Alias HGNC ON par défaut (récupère H2AFZ↔H2AZ1).
+
+root_tag: "op"          # run_tag par ablation = "op.<name>"
+seed: 1                 # 1 seed / ablation (vague 1 ; multi-seed après tri)
+decoy: true             # perturbation + decoy sur chaque run
+
+base_extra_flags: >-
+  --signed-message --signed-decoder --use-reactome-fi
+  --use-omnipath-signaling --use-omnipath-tf-curated
+  --use-omnipath-node-features
+  --omnipath-edges transcriptional,enzyme_substrate,ligand_receptor
+
+# Grille : chaque entrée = base + add_flags, un run à 1 seed + perturbation + decoy.
+# On teste UN levier à la fois ; 'all' combine tous les retraits structurels pour
+# juger les combinaisons après cette 1re vague.
+ablation_grid:
+  - {name: base,            add_flags: ""}                                             # référence OmniPath
+  - {name: dedup,           add_flags: "--dedup-ppi-signed remove"}                    # PPI redondant retiré (couvert par arête signée)
+  - {name: no-ppi,          add_flags: "--no-ppi"}                                     # PPI STRING retiré entièrement
+  - {name: ex-degree,       add_flags: "--exclude-features ppi_degree,reg_degree"}     # features de degré retirées
+  - {name: no-coexpr,       add_flags: "--no-coexpr"}                                  # arêtes coexpression retirées
+  - {name: no-humess-edges, add_flags: "--no-humess-edges"}                            # arêtes HuMess retirées (features gardées)
+  - {name: no-reactome,     add_flags: "--no-reactome"}                                # REACTOME same_pathway retiré (reactome_fi conservé)
+  - {name: ex-cell-node,    add_flags: "--no-cell-group-edges"}                        # arêtes cell_group↔gene retirées
+  - {name: no-nodefeat,     add_flags: "--no-omnipath-node-features"}                  # contribution des features de nœud OmniPath
+  - {name: all,             add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges"}

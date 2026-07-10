@@ -4,7 +4,7 @@ data/
 # `figures/` ancré à la racine : sinon il ignore aussi le code source
 # src/validation/figures/ (les figures de sortie vivent sous output/).
 /figures/
-docs/technical
+docs/
 to_ignore/
 # ── Python ──────────────────────────────────────────────────────────
 __pycache__/
@@ -60,11 +60,12 @@ scripts/logs/
 # ── Other ──────────────────────────
 CLAUDE.md
 .gitignore
+*.pdf
 
-# ── OmniPath full-graph sub-project (standalone, NOT wired — kept out of
-#    git for now, 2026-06-29) ──────────────────────────────────────────
-src/gnn/omnipath_graph.py
-src/gnn/hgnc_alias.py
+# ── OmniPath full-graph sub-project ───────────────────────────────────
+#    hgnc_alias.py + omnipath_graph.py sont désormais CÂBLÉS dans le pipeline
+#    (alias + arêtes extra V6, _graph_build_body.py) → suivis par git.
+#    Restent ignorés : les scripts de build/exploration et les artefacts data.
 scripts/build_omnipath_graph.py
 scripts/*omnipath_graph*.py
 scripts/*omnipath_graph*.sh
