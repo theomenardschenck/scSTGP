@@ -270,6 +270,23 @@ def main():
     # 9. Validation --------------------------------------------------------
     ora_top_n = ask_int("ORA : top-N drivers", default=P["ora_top_n"])
     cluster_annotation = P["cluster_annotation"] and n_seeds >= 2  # cross-seed → ≥2 seeds
+
+    # 9b. Decoy de base (deux nulls de sanity) -----------------------------
+    print("\n— Decoy de base (nulls de contrôle) —")
+    print("    (1) decoy d'ARÊTES : rewire des connexions des top-N drivers")
+    print("        (même nombre d'arêtes/type, partenaires+signes aléatoires) ;")
+    print("    (2) decoy d'AXE : N axes aléatoires vs l'axe réel (spécificité).")
+    print("    → montre que le signal vient du graphe/axe réels, pas d'un artefact.")
+    decoy_on = ask_yesno("Activer le decoy de base ?", default=True)
+    decoy_top_n = 40
+    random_axis = 0
+    if decoy_on:
+        decoy_top_n = ask_int("  decoy d'arêtes : top-N drivers testés", default=40)
+        random_axis = ask_int("  decoy d'axe : nombre d'axes aléatoires (0 = off)",
+                              default=20)
+        if random_axis > 0 and axis == "phenotypic":
+            print("    (axe phénotypique par défaut → la nulle compare à cet axe.)")
+
     deterministic = ask_yesno(
         "Mode déterministe (bit-exact à seed fixe ; ⚠️ threads=1 → plus LENT)", default=False)
 
@@ -384,7 +401,7 @@ perturbation:
   transition_axes: {transition_axes}          # none | default | all-pairs
   cluster_anchor_mode: {cluster_anchor_mode}     # none | de-markers | manual (ancres Ahn)
   cluster_anchors_file: "{cluster_anchors_file}"  # TSV (group,gene,weight) si mode=manual ; "" = défaut
-  cache_delta_z: false        # true = persiste le cache Δz (re-projection d'axes)
+  cache_delta_z: true         # défaut ON : persiste le cache Δz (re-projection d'axes)
 
 scoring:
   de_significance: "pvalue"
@@ -394,8 +411,10 @@ scoring:
 validation:
   ora_top_n: {ora_top_n}
   decoy:
-    enabled: false
-    top_n: 40
+    enabled: {str(decoy_on).lower()}        # decoy d'arêtes (rewire top-N drivers)
+    top_n: {decoy_top_n}
+    random_axis: {random_axis}         # decoy d'axe : N axes aléatoires (0 = off)
+    random_axis_seed: 0
   cluster_annotation:
     enabled: {str(cluster_annotation).lower()}   # nécessite ≥2 seeds
 

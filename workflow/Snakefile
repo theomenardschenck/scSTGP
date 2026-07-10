@@ -68,7 +68,7 @@ GENES_FILE = config["perturbation"].get("genes_file", "")
 # → comportement historique inchangé. Cf. LOG #log-multiaxis.
 TRANSITION_AXES = config["perturbation"].get("transition_axes", "none")   # none|default|all-pairs
 CLUSTER_ANCHOR  = config["perturbation"].get("cluster_anchor_mode", "none")  # none|de-markers|manual
-CACHE_DELTA_Z   = bool(config["perturbation"].get("cache_delta_z", False))
+CACHE_DELTA_Z   = bool(config["perturbation"].get("cache_delta_z", True))
 # Fichier d'ancres pour cluster_anchor_mode=manual (axe polycentrique). Relatif à
 # data_root si non-absolu ; "" → défaut du code (data/gnn_data/ahn_cluster_anchors.tsv).
 _ANCHORS_CFG    = str(config["perturbation"].get("cluster_anchors_file", "")).strip()
@@ -106,6 +106,11 @@ SCORING        = config["scoring"]
 ORA_TOP_N      = config["validation"]["ora_top_n"]
 DECOY_ON       = config["validation"]["decoy"]["enabled"]
 DECOY_TOP_N    = config["validation"]["decoy"]["top_n"]
+# Decoy d'AXE (nul de spécificité) : N axes aléatoires écrits PENDANT perturb
+# (perturbation_*_random_axis_<mode>.tsv). 0 = off. Requiert un axe (phenotypic/
+# de/effector) ; sans axe le script saute → on ne déclare l'output que si N>0.
+RANDOM_AXIS      = int(config["validation"]["decoy"].get("random_axis", 0))
+RANDOM_AXIS_SEED = int(config["validation"]["decoy"].get("random_axis_seed", 0))
 CLUSTER_ANNOT  = config["validation"]["cluster_annotation"]["enabled"]
 
 # Racine des runs entraînés (= GNN_OUT_DIR_BASE pour gnn_vgae) et des analyses.
@@ -299,13 +304,20 @@ rule perturb:
     input:
         model=run_dir("{seed}") / "best_vgae.pt" if TRAIN_VGAE else [],
     output:
-        run_dir("{seed}") / ("perturbation_all_genes" + _PSEG + "_{mode}.tsv"),
+        # Sortie principale + (si decoy d'axe activé) la nulle random_axis, écrite
+        # par le même run perturb → déclarée en output SEULEMENT si RANDOM_AXIS>0.
+        ([run_dir("{seed}") / ("perturbation_all_genes" + _PSEG + "_{mode}.tsv")]
+         + ([run_dir("{seed}") / ("perturbation_all_genes" + _PSEG + "_random_axis_{mode}.tsv")]
+            if RANDOM_AXIS > 0 else [])),
     params:
         rd=lambda wc: run_dir(wc.seed),
         suffix=(("--out-suffix " + str(OUT_SUFFIX)) if OUT_SUFFIX else ""),
         genes=(("--genes-file " + str(GENES_FILE)) if GENES_FILE else ""),
         multi=_MULTI_FLAGS,
         axis=AXIS_FLAGS,
+        rndaxis=(("--random-axis " + str(RANDOM_AXIS)
+                  + " --random-axis-seed " + str(RANDOM_AXIS_SEED))
+                 if RANDOM_AXIS > 0 else ""),
     log:
         OUT_BASE / "logs" / "perturb_s{seed}_{mode}.log",
     threads: 8
@@ -315,7 +327,8 @@ rule perturb:
     shell:
         "{PY} src/perturbation/perturb_top_genes.py "
         "--run-dir {params.rd} --all-genes --modes {wildcards.mode} "
-        "--device {DEVICE} {params.suffix} {params.genes} {params.multi} {params.axis} &> {log}"
+        "--device {DEVICE} {params.suffix} {params.genes} {params.multi} "
+        "{params.axis} {params.rndaxis} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────

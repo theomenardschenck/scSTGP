@@ -85,7 +85,7 @@ perturbation:
   # (group, gene, weight) — un centroïde pondéré par cell_group. Relatif à data_root
   # ou absolu. "" → défaut data/gnn_data/ahn_cluster_anchors.tsv (Ahn 2025).
   cluster_anchors_file: ""
-  cache_delta_z: false      # true = persiste le cache Δz → re-projection d'axes
+  cache_delta_z: true       # défaut ON : persiste le cache Δz → re-projection d'axes
                             #   ultérieure sans re-perturber (reproject_axes.py)
 
 # ── Stage 8 : agrégation cross-seed (perturb_report)
@@ -97,9 +97,18 @@ scoring:
 # ── Stage 8b/9 : validation
 validation:
   ora_top_n: 100
+  # Decoy de base = deux nulls de sanity (montrent que le signal vient du graphe
+  # réel et de l'axe réel, pas d'un artefact) :
   decoy:
-    enabled: false          # null-models décoy (lourd, torch)
+    enabled: false          # decoy d'ARÊTES : rewire degré/type-préservant des
+                            #   connexions des top-N drivers (même nombre d'arêtes
+                            #   par edge_type, partenaires+signes aléatoires ;
+                            #   rule perturb_decoy → decoy_confidence.tsv). torch.
     top_n: 40
+    random_axis: 0          # decoy d'AXE : N axes unitaires aléatoires comparés à
+                            #   l'axe réel (spécificité ; 0 = off). Écrit pendant
+                            #   perturb : perturbation_*_random_axis_<mode>.tsv.
+    random_axis_seed: 0
   cluster_annotation:
     enabled: true
 
