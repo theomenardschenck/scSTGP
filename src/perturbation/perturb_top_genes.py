@@ -754,7 +754,11 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
         gnames = dz_group_names or [f"g{i}" for i in range(dz_stack.shape[1])]
         axis_g = np.asarray(ctx["axis_global"], dtype=np.float32)
         if cache_dz:
-            npz = out_prefix.with_name(f"{out_prefix.name}_dz_cache.npz")
+            # _ftag = "_<mode>" quand les modes ne sont PAS lancés ensemble
+            # (Snakemake = 1 job/mode) → évite que les 3 jobs écrasent le même
+            # cache. reproject_axes.py glob `*_dz_cache*.npz` (ramasse les deux
+            # conventions ; les modes sont aussi dans le npz interne).
+            npz = out_prefix.with_name(f"{out_prefix.name}_dz_cache{_ftag}.npz")
             np.savez_compressed(
                 npz, genes=np.array(dz_genes), modes=np.array(dz_modes),
                 dz_mean=dz_stack, w_diff_sum=wsum_stack,
