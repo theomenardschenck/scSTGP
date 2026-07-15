@@ -25,12 +25,12 @@ args=(--parsable
 [[ -n "$GRES" ]] && args+=(--gres="$GRES")
 
 # Fix GLIBCXX (compute nodes GLiCID) : leur libstdc++ système (/lib64) est trop
-# vieux pour numpy/torch de l'env conda (manque GLIBCXX_3.4.29). On force le
-# libstdc++ de l'env en tête de LD_LIBRARY_PATH, propagé au job via --export.
-# Sinon /lib64/libstdc++.so.6 gagne et l'import numpy plante avant tout.
-EXPORT="ALL"
+# vieux pour numpy/torch de l'env conda (manque GLIBCXX_3.4.29). On pose le lib de
+# l'env en tête de LD_LIBRARY_PATH DANS NOTRE PROPRE env, puis --export=ALL le
+# propage au job — mécanisme identique au srun qui a fonctionné (plus fiable que
+# la syntaxe --export=ALL,VAR= dont le parsing SLURM est capricieux).
 [[ -n "${CONDA_PREFIX:-}" ]] && \
-  EXPORT="ALL,LD_LIBRARY_PATH=${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
-args+=(--export="$EXPORT")
+  export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+args+=(--export=ALL)
 
 exec sbatch "${args[@]}" "$JOB"
