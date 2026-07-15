@@ -165,45 +165,77 @@ else:
 # Note : le set retourné inclut TOUS les symboles présents dans les caches
 # OmniPath actifs. L'intersection avec `available_set` (gènes scRNA-mesurés)
 # se fait en section 3 — on n'invente pas de gènes hors mesure.
+# =============================================================================
+# 2.5. PRÉ-SCAN endpoints de TOUTES les sources d'arêtes actives (V6.2, 2026-07-15)
+# =============================================================================
+# Le filtre de connectivité (§3) ne comptait QUE ppi/coexpr/scenic/reactome →
+# un gène connecté UNIQUEMENT par OmniPath (signaling/tf_curated/transcriptional/
+# enzyme_substrate/ligand_receptor) ou reactome_fi était jeté AVANT que ces arêtes
+# soient construites (poule-et-œuf : les arêtes ne relient que des gènes déjà dans
+# l'univers). Résultat : op.all tombait à 1742 gènes alors qu'OmniPath+rfi en
+# connectent ~10 000. On pré-scanne donc les endpoints de TOUTES les sources
+# actives, sans condition (le filtre doit garder un gène connecté, peu importe
+# l'origine de l'arête). Ajoutés à l'univers en §3 (alias-aware).
 omnipath_endpoints: set[str] = set()
-if (MODULES["include_omnipath_genes"]
-        and (MODULES["use_omnipath_signaling"]
-             or MODULES["use_omnipath_tf_curated"])):
+_any_op_source = (MODULES["use_omnipath_signaling"]
+                  or MODULES["use_omnipath_tf_curated"]
+                  or bool(OMNIPATH_EXTRA_EDGES)
+                  or MODULES["use_reactome_fi"])
+if _any_op_source:
     print("\n" + "=" * 70)
-    print("2.5. Pré-chargement OmniPath (V4.1) — pour expansion gene_to_idx")
+    print("2.5. Pré-scan endpoints toutes-sources (connectivité §3)")
     print("=" * 70)
-    # Force le mode OFFLINE si l'utilisateur n'a pas autorisé le download :
-    # évite que `import omnipath` déclenche les metadata pre-fetches HTTP
-    # qui timeout 30+ min sur compute nodes Nautilus sans Internet.
     if not CLI_ARGS.omnipath_download_if_missing:
         os.environ["GNN_OMNIPATH_OFFLINE"] = "1"
-    try:
-        from omnipath_integration import (
-            get_omnipath_endpoints as _opi_endpoints,
-            silence_omnipath_logging as _silence_opi,
-        )
-        if not CLI_ARGS.omnipath_download_if_missing:
-            _silence_opi()
-        # Sources actives selon les flags
-        _opi_sources = []
-        if MODULES["use_omnipath_signaling"]:
-            _opi_sources.extend(["signaling", "signor"])
-        if MODULES["use_omnipath_tf_curated"]:
-            _opi_sources.append("collectri")
-        omnipath_endpoints = _opi_endpoints(
-            cache_dir=OMNIPATH_CACHE_DIR,
-            sources=_opi_sources,
-            download_if_missing=CLI_ARGS.omnipath_download_if_missing,
-        )
-        print(f"  Endpoints OmniPath uniques (avant intersection scRNA) : "
-              f"{len(omnipath_endpoints)}")
-    except ImportError as _e:
-        print(f"  [warn] import omnipath_integration KO ({_e}) — "
-              f"--include-omnipath-genes inactif.")
-elif MODULES["include_omnipath_genes"]:
-    print("\n[warn] --include-omnipath-genes activé mais aucune source "
-          "OmniPath active (--use-omnipath-signaling / --use-omnipath-tf-curated). "
-          "Le flag est ignoré.")
+    # (a) signaling / tf_curated (caches omnipath_integration, prod)
+    if MODULES["use_omnipath_signaling"] or MODULES["use_omnipath_tf_curated"]:
+        try:
+            from omnipath_integration import (
+                get_omnipath_endpoints as _opi_endpoints,
+                silence_omnipath_logging as _silence_opi,
+            )
+            if not CLI_ARGS.omnipath_download_if_missing:
+                _silence_opi()
+            _src = []
+            if MODULES["use_omnipath_signaling"]:  _src += ["signaling", "signor"]
+            if MODULES["use_omnipath_tf_curated"]: _src += ["collectri"]
+            _e = _opi_endpoints(cache_dir=OMNIPATH_CACHE_DIR, sources=_src,
+                                download_if_missing=CLI_ARGS.omnipath_download_if_missing)
+            omnipath_endpoints |= _e
+            print(f"  signaling/tf_curated : +{len(_e)} endpoints")
+        except ImportError as _e:
+            print(f"  [warn] omnipath_integration KO ({_e})")
+    # (b) arêtes OmniPath supplémentaires (graphe autonome edges.tsv.gz)
+    if OMNIPATH_EXTRA_EDGES:
+        try:
+            import omnipath_graph as _opg
+            _, _opg_edges = _opg.load_omnipath_graph(OMNIPATH_CACHE_DIR)
+            _sub = _opg_edges[_opg_edges["edge_type"].isin(OMNIPATH_EXTRA_EDGES)]
+            _e = (set(_sub["source_symbol"].astype(str))
+                  | set(_sub["target_symbol"].astype(str)))
+            omnipath_endpoints |= _e
+            print(f"  extra edges {OMNIPATH_EXTRA_EDGES} : +{len(_e)} endpoints")
+        except (FileNotFoundError, ImportError) as _e:
+            print(f"  [warn] graphe OmniPath absent pour endpoints extra ({_e})")
+    # (c) reactome_fi : pré-scan Gene1/Gene2 du fichier FI (même résolution qu'en 6)
+    if MODULES["use_reactome_fi"]:
+        _fip = CLI_ARGS.reactome_fi_file
+        if not os.path.isabs(_fip):
+            _fip = os.path.join(DATA_DIR,
+                                _fip[5:] if _fip.startswith("data/") else _fip)
+        if os.path.exists(_fip):
+            try:
+                _fi = pd.read_csv(_fip, sep="\t", usecols=["Gene1", "Gene2"])
+                _e = (set(_fi["Gene1"].astype(str))
+                      | set(_fi["Gene2"].astype(str)))
+                omnipath_endpoints |= _e
+                print(f"  reactome_fi : +{len(_e)} endpoints")
+            except Exception as _e:
+                print(f"  [warn] lecture reactome_fi KO ({_e})")
+        else:
+            print(f"  [warn] reactome_fi absent ({_fip})")
+    print(f"  → endpoints toutes-sources : {len(omnipath_endpoints)} "
+          f"(avant ∩ gènes mesurés)")
 
 # HGNC alias map (V6) — canonicalise symboles OmniPath ↔ nos gene_to_idx en
 # symbole approuvé, à l'expansion du gene universe (section 3) ET à la
@@ -211,9 +243,7 @@ elif MODULES["include_omnipath_genes"]:
 # nomenclature (H2AFZ↔H2AZ1) perdent toutes leurs arêtes OmniPath curées.
 # Vide ({}) = fallback identité (offline sans cache, ou --no-omnipath-hgnc-alias).
 omnipath_alias_map: dict = {}
-if (MODULES["omnipath_hgnc_alias"]
-        and (MODULES["use_omnipath_signaling"]
-             or MODULES["use_omnipath_tf_curated"])):
+if MODULES["omnipath_hgnc_alias"] and _any_op_source:
     try:
         from hgnc_alias import build_alias_map as _build_hgnc_alias
         omnipath_alias_map = _build_hgnc_alias(
