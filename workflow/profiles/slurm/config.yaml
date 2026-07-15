@@ -29,12 +29,14 @@ default-resources:
   - "slurm_qos='short'"              # 'normal' plafonne à 5 min ; 'short' = 24 h
   - "slurm_gres=''"                  # pas de GPU par défaut
 
-# Routage par règle — train_vgae sur GPU (partition/qos/gres du cluster).
+# TOUT EN CPU (partition standard / qos short) — pas de routage GPU (choix
+# 2026-07-15 : évite les limites de la QOS gpus). train_vgae tourne alors sur CPU
+# (gnn_vgae --device auto → CPU) : plus lent (~2-4 h vs ~1 h GPU) mais robuste.
+# Runtime relevé pour couvrir le CPU, sous le plafond 24 h de la QOS short.
+# Pour re-router train sur GPU plus tard : ré-ajouter slurm_partition='gpu',
+# slurm_qos='gpus', slurm_gres='gpu:1' + runtime ≤ plafond QOS gpus.
 set-resources:
-  - "train_vgae:slurm_partition='gpu'"
-  - "train_vgae:slurm_qos='gpus'"
-  - "train_vgae:slurm_gres='gpu:1'"
-  - "train_vgae:runtime=240"         # 4 h (train GPU ~1 h ; ajuster si la QOS gpus plafonne)
+  - "train_vgae:runtime=480"         # 8 h CPU (marge large ; QOS short = 24 h)
 
 # Soumission via wrapper (ajoute --gres seulement si non vide). Snakemake ajoute
 # le jobscript en dernier argument.
