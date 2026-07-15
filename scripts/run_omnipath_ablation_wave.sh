@@ -90,7 +90,11 @@ if [[ -z "$DRY" ]] && ! printf '%s\n' "${SNAKE_ARGS[@]}" | grep -q -- "--profile
   [[ "${FORCE_LOCAL:-0}" == "1" ]] || exit 3
 fi
 
-TMPDIR="$(mktemp -d)"
+# ⚠️ FS PARTAGÉ obligatoire (pas /tmp) : en mode --cluster, chaque job re-invoque
+# snakemake sur un COMPUTE NODE et relit --configfile. /tmp est LOCAL au nœud → le
+# job ne verrait pas le config généré (FileNotFoundError). On génère donc les
+# configs sous le repo courant ($PWD, sur le FS partagé /LAB-DATA), pas /tmp.
+TMPDIR="$(mktemp -d "${PWD}/.ablwave.XXXXXX")"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 # Génère un config par ablation (surcharge minimale) et un index _grid.tsv.
