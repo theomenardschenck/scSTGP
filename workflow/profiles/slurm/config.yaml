@@ -4,18 +4,19 @@
 # Usage :
 #   snakemake -s workflow/Snakefile --configfile workflow/config/config.yaml \
 #             --profile workflow/profiles/slurm
+#   (ou, pour la vague : ...ablation_wave.sh <profil> --profile workflow/profiles/slurm)
 #
-# ⚠️ À ADAPTER : remplacer la partition `standard` (et ajouter --account si
-#    requis) par les vôtres. `squeue`/`sinfo` pour lister les partitions.
+# ⚠️ SANS ce profil, `snakemake -j N` exécute TOUT en LOCAL (nœud frontal) —
+#    aucun job dans squeue, séquentiel, lent. C'était le bug V6.1.3.
 #
-# Ce profil cible les étapes CPU (perturbation → agrégation → validation).
-# Pour l'entraînement VGAE (GPU long), 2 options :
-#   (a) RECOMMANDÉ : entraîner via scripts/run_ablation_grid.sh (array GPU
-#       éprouvé), puis lancer ce pipeline avec models.vgae.enabled: false ;
-#   (b) router rule train_vgae vers une partition GPU (ajouter une entrée
-#       set-resources train_vgae: slurm_partition=<gpu> + --gres dans cluster).
+# Partitions/QOS = défauts des scripts éprouvés (run_v6_train.sh) :
+#   CPU : standard / short   |   GPU : gpu / gpus / gpu:1
+#   Adapter via `sinfo`/`sacctmgr show qos` si votre cluster diffère.
+#
+# train_vgae (GPU, ~1-3 h) est routé vers la partition GPU ci-dessous ; toutes
+# les autres règles (build_graph, perturb, agrégation, validation) → CPU.
 
-jobs: 20
+jobs: 20                 # jusqu'à 20 jobs SLURM en parallèle (parallélise les modes/ablations)
 latency-wait: 60
 printshellcmds: true
 rerun-incomplete: true
@@ -23,20 +24,21 @@ keep-going: true
 
 default-resources:
   - "mem_mb=8000"
-  - "runtime=120"
+  - "runtime=120"                    # minutes
   - "slurm_partition='standard'"
-  # QOS : la QOS par défaut 'normal' plafonne à 5 min (QOSMaxWallDurationPerJobLimit).
-  # 'short' = 24 h → couvre tous les runtime de prod (train jusqu'à 12 h). Adapter
-  # selon `sacctmgr show qos format=Name,MaxWall` (short/medium/long/quick…).
-  - "slurm_qos='short'"
+  - "slurm_qos='short'"              # 'normal' plafonne à 5 min ; 'short' = 24 h
+  - "slurm_gres=''"                  # pas de GPU par défaut
 
+# Routage par règle — train_vgae sur GPU (partition/qos/gres du cluster).
+set-resources:
+  - "train_vgae:slurm_partition='gpu'"
+  - "train_vgae:slurm_qos='gpus'"
+  - "train_vgae:slurm_gres='gpu:1'"
+  - "train_vgae:runtime=240"         # 4 h (train GPU ~1 h ; ajuster si la QOS gpus plafonne)
+
+# Soumission via wrapper (ajoute --gres seulement si non vide). Snakemake ajoute
+# le jobscript en dernier argument.
 cluster: >-
-  mkdir -p logs/slurm &&
-  sbatch --parsable
-  --partition={resources.slurm_partition}
-  --qos={resources.slurm_qos}
-  --cpus-per-task={threads}
-  --mem={resources.mem_mb}
-  --time={resources.runtime}
-  --job-name=smk-{rule}
-  --output=logs/slurm/{rule}_%j.log
+  workflow/profiles/slurm/submit.sh
+  {rule} {threads} {resources.mem_mb} {resources.runtime}
+  {resources.slurm_partition} {resources.slurm_qos} '{resources.slurm_gres}'

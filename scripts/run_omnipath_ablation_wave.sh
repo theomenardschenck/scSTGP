@@ -78,6 +78,18 @@ if [[ "$NEEDS_OP" == "1" ]]; then
   fi
 fi
 
+# ── PREFLIGHT SLURM : sans --profile, snakemake exécute TOUT en LOCAL (frontal) —
+#    pas de job dans squeue, séquentiel, très lent. C'était le bug V6.1.3.
+if [[ -z "$DRY" ]] && ! printf '%s\n' "${SNAKE_ARGS[@]}" | grep -q -- "--profile"; then
+  echo "╔═══════════════════════════════════════════════════════════════════════" >&2
+  echo "║ ⚠ AUCUN --profile → snakemake tournerait en LOCAL (nœud frontal) :"       >&2
+  echo "║   pas de soumission SLURM, séquentiel, lent (bug V6.1.3)."                >&2
+  echo "║ Ajoute :  --profile workflow/profiles/slurm"                             >&2
+  echo "║ (FORCE_LOCAL=1 pour exécuter en local volontairement, ex. test rapide.)"  >&2
+  echo "╚═══════════════════════════════════════════════════════════════════════" >&2
+  [[ "${FORCE_LOCAL:-0}" == "1" ]] || exit 3
+fi
+
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
