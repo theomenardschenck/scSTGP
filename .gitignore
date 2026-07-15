@@ -51,6 +51,7 @@ scripts/logs/
 
 # ── Snakemake ───────────────────────────────────────────────────────
 .snakemake/
+.ablwave.*/          # configs d'ablation générés sur FS partagé (run_omnipath_ablation_wave)
 
 # ── Modèles entraînés (gros, recalculables) ─────────────────────────
 *.pt
@@ -63,13 +64,15 @@ CLAUDE.md
 *.pdf
 
 # ── OmniPath full-graph sub-project ───────────────────────────────────
-#    hgnc_alias.py + omnipath_graph.py sont désormais CÂBLÉS dans le pipeline
-#    (alias + arêtes extra V6, _graph_build_body.py) → suivis par git.
-#    Restent ignorés : les scripts de build/exploration et les artefacts data.
-scripts/build_omnipath_graph.py
-scripts/*omnipath_graph*.py
-scripts/*omnipath_graph*.sh
-# generated artifacts (large, recalculable)
+#    hgnc_alias.py + omnipath_graph.py + build_omnipath_graph.py sont CÂBLÉS/
+#    requis par le pipeline (alias + features + arêtes extra V6) → suivis par git,
+#    pour que le cluster puisse RECONSTRUIRE l'artefact sur le frontal (sinon run
+#    INERTE : features à 0, 0 arête extra — cf. échec V6.1.3).
+#    Restent ignorés : l'exploration locale et les artefacts data (à STAGER via
+#    rsync, ou reconstruire avec build_omnipath_graph.py sur le frontal).
+scripts/explore_omnipath_graph.py
+# generated artifacts (large, recalculable — pas via git ; rsync/rebuild frontal)
 data/omnipath/graph/
 data/omnipath/graph_raw/
 data/omnipath/hgnc_alias_map.tsv.gz
+data/omnipath/hgnc_biotype_map.tsv.gz
