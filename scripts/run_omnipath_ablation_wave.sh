@@ -33,16 +33,20 @@ shift
 BASE_CONFIG="workflow/config/config.yaml"
 ONLY=""
 DRY=""
+PARALLEL=1               # nb d'ablations lancées CONCURREMMENT (chacune orchestre
+                         # ses propres jobs SLURM via le profil). 1 = séquentiel.
 SNAKE_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --only)        ONLY="$2"; shift 2;;
     --base-config) BASE_CONFIG="$2"; shift 2;;
+    --parallel)    PARALLEL="$2"; shift 2;;
     --dry-run|-n)  DRY="-n"; shift;;
     --)            shift; while [[ $# -gt 0 ]]; do SNAKE_ARGS+=("$1"); shift; done;;
     *)             SNAKE_ARGS+=("$1"); shift;;
   esac
 done
+[[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -ge 1 ]] || { echo "--parallel doit être un entier ≥1" >&2; exit 1; }
 
 [[ -f "$PROFILE" ]]     || { echo "profil introuvable : $PROFILE" >&2; exit 1; }
 [[ -f "$BASE_CONFIG" ]] || { echo "config de base introuvable : $BASE_CONFIG" >&2; exit 1; }
@@ -137,22 +141,43 @@ PY
 
 echo
 FAILED=()
+# Lance une ablation. En parallèle : sortie vers logs/wave/<tag>.log + --nolock
+# (chaque ablation écrit dans des chemins DISJOINTS — run_tag distinct — donc pas
+# de collision ; le lock .snakemake unique empêcherait juste la concurrence).
+# Un SEUL --configfile avec les 2 fichiers → snakemake les fusionne (base puis
+# surcharge). RÉSILIENCE : un échec ne tue pas la vague (set -e).
+mkdir -p logs/wave
+declare -A PIDTAG
+run_one() {  # $1=tag $2=cfg  ; en séquentiel: sortie live ; en parallèle: fichier
+  local tag="$1" cfg="$2"
+  if [[ "$PARALLEL" -gt 1 ]]; then
+    snakemake --configfile "$BASE_CONFIG" "$cfg" $DRY --nolock "${SNAKE_ARGS[@]}" \
+      &> "logs/wave/${tag}.log"
+  else
+    snakemake --configfile "$BASE_CONFIG" "$cfg" $DRY "${SNAKE_ARGS[@]}"
+  fi
+}
+
 while IFS=$'\t' read -r TAG CFG EXTRA; do
   [[ -z "${TAG:-}" ]] && continue
-  echo "================================================================"
-  echo "=== [ablation] $TAG"
-  echo "================================================================"
-  # Un SEUL --configfile avec les 2 fichiers → snakemake les fusionne dans
-  # l'ordre (base puis surcharge d'ablation). Deux --configfile séparés ne
-  # fusionnent PAS (le second écrase) → 'paths' serait perdu.
-  # RÉSILIENCE : une ablation qui échoue ne tue PAS la vague (sinon, sous
-  # set -e, un crash — ex. cluster_annotation V6.1.3 — avortait toute la grille
-  # après la 1re ablation). On loggue et on continue.
-  if ! snakemake --configfile "$BASE_CONFIG" "$CFG" $DRY "${SNAKE_ARGS[@]}"; then
-    echo "[wave] ⚠ ÉCHEC ablation $TAG — on continue avec la suivante" >&2
-    FAILED+=("$TAG")
+  if [[ "$PARALLEL" -le 1 ]]; then
+    echo "=== [ablation] $TAG ============================================="
+    run_one "$TAG" "$CFG" || FAILED+=("$TAG")
+  else
+    # Throttle : attendre qu'un slot se libère avant de lancer la suivante.
+    while (( $(jobs -rp | wc -l) >= PARALLEL )); do wait -n; done
+    echo "=== [ablation] $TAG → logs/wave/${TAG}.log (parallèle, slot ≤$PARALLEL)"
+    run_one "$TAG" "$CFG" &
+    PIDTAG[$!]="$TAG"
   fi
 done < "$TMPDIR/_grid.tsv"
+
+# En parallèle : attendre tous les background + collecter les échecs.
+if [[ "$PARALLEL" -gt 1 ]]; then
+  for pid in "${!PIDTAG[@]}"; do
+    wait "$pid" || FAILED+=("${PIDTAG[$pid]}")
+  done
+fi
 
 if [[ ${#FAILED[@]} -gt 0 ]]; then
   echo "[wave] terminé AVEC ÉCHECS : ${FAILED[*]}" >&2
