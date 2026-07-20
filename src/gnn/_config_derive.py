@@ -77,6 +77,17 @@ for _f in _OMNIPATH_NODE_FEATURES:
     GENE_FEATURE_FLAGS[_f] = _feature_enabled(
         _f, MODULES["use_omnipath_node_features"])
 
+# V-sup : CIRCULAR DE node features (--de-features). Built at GRAPH BUILD time
+# like every other node feature, so the graph cache signature and the run tag
+# both reflect them. Order must match SupervisedLabels.de_feature_names().
+DE_NODE_FEATURES = [
+    "de_log2fc_global", "de_neg_log_padj", "de_delta_pct",
+    "de_log2fc_c0", "de_log2fc_c1", "de_log2fc_c2", "de_log2fc_c3",
+]
+for _f in DE_NODE_FEATURES:
+    GENE_FEATURE_FLAGS[_f] = _feature_enabled(
+        _f, getattr(CLI_ARGS, "de_features", False))
+
 # V6 Module 1 (extension) : arêtes OmniPath supplémentaires à ajouter.
 # Parse --omnipath-edges (liste ou 'all') → set validé OMNIPATH_EXTRA_EDGES.
 # Doit rester aligné sur _vgae_model.OMNIPATH_EXTRA_EDGE_TYPES.
@@ -129,6 +140,10 @@ def _build_run_tag():
                  or MODULES["use_omnipath_tf_curated"])):
         parts.append("no-hgnc-alias")
     if MODULES["use_omnipath_node_features"]: parts.append("op-nodefeat")
+    # V-sup : circularity must be visible in the run name — a run WITH DE
+    # features never shares a directory with an anti-circular one.
+    if getattr(CLI_ARGS, "de_features", False):  parts.append("de-feat")
+    if getattr(CLI_ARGS, "supervised", False):   parts.append("sup")
     if OMNIPATH_EXTRA_EDGES:
         # Tag court : op-edges<N> (N types) ; ex op-edges2. Détail dans run_config.
         parts.append(f"op-edges{len(OMNIPATH_EXTRA_EDGES)}")

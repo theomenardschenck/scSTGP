@@ -25,5 +25,9 @@ def train_vgae(ctx):
     résultant (nouvelles liaisons : model, embeddings, tête sup, métriques…) pour
     que gnn_vgae le fusionne dans ses globals avant le scoring."""
     ns = {k: v for k, v in ctx.items() if not k.startswith("__")}
+    # Cf. _graph_build.build_graph : __file__ doit être posé sur le corps, sinon
+    # le bloc V-sup (--supervised) lève NameError en se localisant. Le filtre `__*`
+    # du retour l'empêche de fuir dans les globals de gnn_vgae.
+    ns["__file__"] = _BODY_PATH
     exec(_TRAIN_CODE, ns)
     return {k: v for k, v in ns.items() if not k.startswith("__")}

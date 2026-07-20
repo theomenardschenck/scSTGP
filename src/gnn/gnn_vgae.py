@@ -9,10 +9,14 @@ PROBLÈME RÉSOLU : le pipeline supervisé précédent (gnn.py) souffrait de
 circularité (features = log2FC/padj → labels = DEG basés sur ces mêmes stats).
 Ici, le score d'importance ÉMERGE de l'espace latent, pas d'une formule.
 
-MODE V-sup (--supervised) : plafond CIRCULAIRE assumé. Réutilise le MÊME graphe
-et le MÊME backbone HeteroEncoder, mais entraîne l'encodeur end-to-end sur les
-labels DEG multi-label (+ features DE en nœud) et calcule l'importance par
-cluster. Opposé au VGAE non supervisé (mesure ce que la topologie seule capte).
+MODE V-sup — DEUX FLAGS ORTHOGONAUX, UN SEUL ENTRAÎNEMENT :
+  --de-features : ajoute les stats DE (log2FC global/par cluster, -log10 padj,
+                  Δpct) aux features de nœud, AU BUILD DU GRAPHE. Circulaire par
+                  construction ; invalide le cache graphe, tagué 'de-feat'.
+  --supervised  : attache une tête de classification multi-label (P4_vs_P16 +
+                  cluster_0..3) sur μ, co-entraînée DANS la boucle VGAE
+                  (loss = recon + β·KL + λ_signed·signed_aux + λ_sup·BCE).
+La reconstruction n'est jamais interrompue → le run reste perturbation-ready.
 Cf. _supervised.py + build_supervised_labels.py + docs/technical/gnn_supervised.md.
 
 DONNÉES : GSE102090 (HUVEC), n=1 par condition (P4, P16).
@@ -399,7 +403,7 @@ def download_if_absent(url, local_path, label=""):
 # la signature (mtime+taille), tout changement de jeu de données — donc de
 # NB DE GÈNES — invalide le cache. n_genes est stocké et ré-affiché au
 # chargement pour vérification → jamais de graphe obsolète réutilisé.
-_CACHE_VARS = ["CELL_GROUPS", "_COEXPR_DIM", "_dst", "_f", "_g", "_src", "b", "cell_group_features", "coexpr_dst", "coexpr_src", "coexpr_w_tensor", "col", "data", "edge_attr_cocat", "edge_attr_expresses", "edge_attr_ppi", "edge_attr_reactome_fi", "edge_attr_regulates", "edge_attr_signaling", "edge_attr_tf_curated", "edge_index_cocat", "edge_index_coexpr", "edge_index_expresses", "edge_index_pathway", "edge_index_ppi", "edge_index_reactome_fi", "edge_index_regulates", "edge_index_signaling", "edge_index_tf_curated", "f", "g", "gene_features", "gene_symbols", "gene_to_idx", "group_stats", "grp", "i", "idx", "j", "line", "mask", "mean_expr_per_group", "mu", "n_genes", "omnipath_endpoints", "op_sig_dst", "op_sig_src", "op_tf_dst", "op_tf_src", "pair", "parts", "ppi_dst", "ppi_src", "react_dst", "react_src", "reactome_fi_dst", "reactome_fi_src", "reg_dst", "reg_src", "score", "sign", "std", "target"]
+_CACHE_VARS = ["CELL_GROUPS", "_COEXPR_DIM", "_dst", "_f", "_g", "_src", "b", "cell_group_features", "coexpr_dst", "coexpr_src", "coexpr_w_tensor", "col", "data", "edge_attr_cocat", "edge_attr_expresses", "edge_attr_ppi", "edge_attr_reactome_fi", "edge_attr_regulates", "edge_attr_signaling", "edge_attr_tf_curated", "edge_index_cocat", "edge_index_coexpr", "edge_index_expresses", "edge_index_pathway", "edge_index_ppi", "edge_index_reactome_fi", "edge_index_regulates", "edge_index_signaling", "edge_index_tf_curated", "f", "g", "gene_features", "gene_symbols", "gene_to_idx", "group_stats", "grp", "i", "idx", "j", "line", "mask", "mean_expr_per_group", "mu", "n_genes", "omnipath_endpoints", "op_sig_dst", "op_sig_src", "op_tf_dst", "op_tf_src", "pair", "parts", "ppi_dst", "ppi_src", "react_dst", "react_src", "reactome_fi_dst", "reactome_fi_src", "reg_dst", "reg_src", "SUP_LABELS", "score", "sign", "std", "target"]
 import hashlib as _hashlib
 def _mtime_sig(_p):
     try:
@@ -411,10 +415,13 @@ def _resolve_expr_path():
 _TRAIN_ONLY = {"seed", "run_tag", "n_epochs", "patience", "reuse_graph",
                "graph_cache", "build_only", "device", "lr", "kl_beta_max",
                "no_baselines", "no_validation",
-               # V-sup : n'affectent que l'étape post-build (features DE ajoutées
-               # APRÈS restauration du cache + tête jointe) → cache réutilisable.
-               "supervised", "de_features", "supervised_loss_weight",
-               "supervised_recompute_labels"}  # post-build only
+               # V-sup : la TÊTE de classification est post-build (elle ne touche
+               # ni au graphe ni aux features) → n'invalide pas le cache.
+               # ⚠ --de-features N'EST PAS ici : depuis 2026-07-20 les features DE
+               # sont construites au build (_graph_build_body) → elles DOIVENT
+               # entrer dans la signature, sinon un cache propre serait réutilisé
+               # pour un run circulaire.
+               "supervised", "supervised_loss_weight"}  # post-build only
 _sig_obj = {
     "env": {_k: os.environ.get(_k, "") for _k in
             ("GNN_EXPR_MATRIX", "GNN_GROUP_META", "GNN_CELL_GROUPS",

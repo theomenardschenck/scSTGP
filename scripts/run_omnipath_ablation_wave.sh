@@ -124,7 +124,14 @@ for g in grid:
                             "extra_flags": extra}},
         # 1 seed/ablation → cluster_annotation (cross-seed, exige ≥2 runs)
         # planterait et stopperait tout le pipeline. On le désactive ici.
-        "validation": {"decoy": {"enabled": bool(p.get("decoy", True))},
+        # decoy_random_axis : N axes aléatoires (nulle de SPÉCIFICITÉ d'axe),
+        # écrits en perturbation_*_random_axis_<mode>.tsv. 0 = off. Distinct du
+        # décoy N2/N4 (nulle de STRUCTURE, `decoy: true`) — les deux sont
+        # complémentaires : N2 teste le voisinage, random_axis teste l'axe.
+        "validation": {"decoy": {"enabled": bool(p.get("decoy", True)),
+                                 "random_axis": int(p.get("decoy_random_axis", 0)),
+                                 "random_axis_seed": int(
+                                     p.get("decoy_random_axis_seed", 0))},
                        "cluster_annotation": {"enabled": False}},
     }
     fp = os.path.join(tmpd, tag.replace("/", "_") + ".yaml")

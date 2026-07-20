@@ -58,17 +58,15 @@ from _vgae_model import (  # noqa: E402  (import mid-module : après le catalogu
 
 
 # =============================================================================
-# V-sup : préparation du mode supervisé circulaire (labels + features DE)
+# V-sup : labels DEG pour la tête de classification (--supervised)
 # =============================================================================
-# S'exécute dans les deux chemins (build frais OU cache restauré) car
-# gene_features/gene_symbols/data sont des globals après le bloc `if not
-# _REUSE_OK`. Les labels DEG (P4_vs_P16 + cluster_0..3) sont construits quel que
-# soit --de-features ; les FEATURES DE (circulaires) ne sont concaténées que si
-# --de-features (défaut ON en mode supervisé). Le VGAE non supervisé n'est JAMAIS
-# affecté (SUP_LABELS reste None, gene_features inchangées).
-SUP_LABELS = None
-_VSUP_ON = getattr(CLI_ARGS, "de_features", False) or getattr(CLI_ARGS, "supervised", False)
-if _VSUP_ON:
+# Les FEATURES DE (--de-features) sont construites AU BUILD DU GRAPHE
+# (_graph_build_body) — plus rien à concaténer ici. Ce bloc ne sert qu'à garantir
+# la présence des LABELS pour la tête : ils arrivent déjà via SUP_LABELS quand
+# --de-features est ON (globals du build / cache --reuse-graph), sinon on les
+# construit ici (--supervised seul = tête sur topologie pure).
+SUP_LABELS = globals().get("SUP_LABELS")
+if getattr(CLI_ARGS, "supervised", False) and SUP_LABELS is None:
     import sys as _sys_sup
     # Robuste aux 2 layouts : local (src/gnn/, src/data/preprocess/) ET cluster
     # à plat (tous les .py sous src/). On ajoute les candidats au sys.path.
@@ -78,27 +76,15 @@ if _VSUP_ON:
         if os.path.isdir(_cand) and _cand not in _sys_sup.path:
             _sys_sup.path.insert(0, _cand)
     from build_supervised_labels import build_supervised_labels as _build_sup_labels
-    print("\n" + "=" * 70)
-    print("MODE V-sup — VGAE CIRCULAIRE (reconstruit) "
-          f"{'+ features DE ' if CLI_ARGS.de_features else ''}"
-          f"{'+ tête classif jointe' if CLI_ARGS.supervised else ''}")
-    print("=" * 70)
-    # Labels requis pour la tête (--supervised) ET/OU pour dériver les features DE.
     SUP_LABELS = _build_sup_labels(
         gene_symbols, GNN_DATA_DIR,
         recompute=getattr(CLI_ARGS, "supervised_recompute_labels", False))
-    if getattr(CLI_ARGS, "de_features", False):
-        # Le VGAE RECONSTRUIT avec ces features DE circulaires en plus (l'invariant
-        # anti-circularité du VGAE non supervisé n'est levé QUE si --de-features).
-        _de_mat = SUP_LABELS.de_feature_matrix()
-        gene_features = torch.cat(
-            [gene_features, torch.tensor(_de_mat, dtype=torch.float)], dim=1)
-        data["gene"].x = gene_features
-        print(f"  [V-sup] +{_de_mat.shape[1]} features DE CIRCULAIRES "
-              f"{SUP_LABELS.de_feature_names()} → gene_features "
-              f"{tuple(gene_features.shape)} (le VGAE reconstruit AVEC)")
-    else:
-        print("  [V-sup] --supervised sans --de-features : tête sur topologie seule")
+if getattr(CLI_ARGS, "de_features", False) or getattr(CLI_ARGS, "supervised", False):
+    print("\n" + "=" * 70)
+    print("MODE V-sup — VGAE reconstruit "
+          f"{'+ features DE CIRCULAIRES ' if CLI_ARGS.de_features else ''}"
+          f"{'+ tête classif jointe' if CLI_ARGS.supervised else ''}")
+    print("=" * 70)
 
 # --- Instanciation du modèle ---
 # L'encoder prend les features brutes (8 dim gene, 3 dim cell_group) et
@@ -326,7 +312,7 @@ if getattr(CLI_ARGS, "supervised", False):
     _HERE_DIR2 = os.path.dirname(os.path.abspath(__file__))
     if _HERE_DIR2 not in _sys_sup2.path:
         _sys_sup2.path.insert(0, _HERE_DIR2)
-    from _supervised import SupervisedHead, _node_split as _sup_node_split
+    from _supervised import SupervisedHead, node_split as _sup_node_split, weighted_bce
     _SUP_HEAD = SupervisedHead(LATENT_DIM, n_labels=len(SUP_LABELS.label_names))
     _SUP_LABELS_T = torch.tensor(SUP_LABELS.labels)
     _SUP_CONF_T = torch.tensor(SUP_LABELS.confidence)
@@ -631,13 +617,8 @@ for epoch in range(N_EPOCHS):
     # V-sup : + λ × classification JOINTE (multi-tâche) sur μ. L'encodeur reste
     # entraîné par reconstruction ; la tête ajoute le signal DEG par cluster.
     if _SUP_HEAD is not None:
-        _clf_logits = _SUP_HEAD(mu)
-        _clf_bce = F.binary_cross_entropy_with_logits(
-            _clf_logits[_SUP_TRAIN_MASK], _SUP_LABELS_T[_SUP_TRAIN_MASK],
-            reduction="none")
-        _clf_w = _SUP_CONF_T[_SUP_TRAIN_MASK].unsqueeze(1)
-        _clf_loss = (_clf_bce * _clf_w).sum() / (
-            _clf_w.sum() * _clf_logits.shape[1] + 1e-8)
+        _clf_loss = weighted_bce(_SUP_HEAD(mu), _SUP_LABELS_T, _SUP_CONF_T,
+                                 _SUP_TRAIN_MASK)
         loss = loss + CLI_ARGS.supervised_loss_weight * _clf_loss
     loss.backward()
     # Gradient clipping : empêche les mises à jour explosives
@@ -746,15 +727,11 @@ print(f"\n  Meilleur modèle : epoch {best_epoch+1}, AUC = {best_test_auc:.4f}")
 model.load_state_dict(torch.load(os.path.join(OUT_DIR, "best_vgae.pt"), weights_only=True))
 
 # =============================================================================
-# V-sup : finalisation (graphe augmenté + tête classif) après reconstruction
+# V-sup : finalisation de la tête de classification après reconstruction
 # =============================================================================
-# Re-sauve hetero_graph_vgae.pt (le save du build est topologie-seule et absent
-# en --reuse-graph) → les 2 perturbations chargent le graphe EXACT (gene.x
-# augmenté DE si --de-features), cohérent avec vgae_weights.pt.
-if _VSUP_ON:
-    torch.save(data, os.path.join(OUT_DIR, "hetero_graph_vgae.pt"))
-    print(f"  [V-sup] hetero_graph_vgae.pt re-sauvé "
-          f"(gene.x={tuple(data['gene'].x.shape)}) → perturbation OK")
+# Plus de re-save de hetero_graph_vgae.pt ici : les features DE font désormais
+# partie du build, donc le graphe écrit par gnn_vgae.py (build ET --reuse-graph)
+# porte déjà le gene.x exact que la perturbation doit recharger.
 if _SUP_HEAD is not None:
     from _supervised import finalize_supervised
     _hp_best = os.path.join(OUT_DIR, "best_sup_head.pt")
@@ -766,5 +743,10 @@ if _SUP_HEAD is not None:
         hyperparams={"hidden": HIDDEN_DIM, "latent": LATENT_DIM,
                      "n_layers": N_LAYERS, "n_heads": N_HEADS,
                      "signed_message": CLI_ARGS.signed_message,
-                     "signed_decoder": CLI_ARGS.signed_decoder},
+                     "signed_decoder": CLI_ARGS.signed_decoder,
+                     # Required by load_supervised_run to rebuild the exact
+                     # encoder/decoder shapes (V5 bilinear + γ_t per edge type).
+                     "signed_decoder_dim": SIGNED_DECODER_DIM,
+                     "edge_type_weights": EDGE_TYPE_WEIGHTS or None,
+                     "de_features": bool(getattr(CLI_ARGS, "de_features", False))},
         train_mask=_SUP_TRAIN_MASK, test_mask=_SUP_TEST_MASK, data=data)

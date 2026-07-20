@@ -30,5 +30,10 @@ with open(_BODY_PATH, encoding="utf-8") as _fh:
 def build_graph(ctx):
     """Exécute §1-7 dans un namespace pré-rempli par ctx. Retourne le bundle _CACHE_VARS."""
     ns = {k: v for k, v in ctx.items() if not k.startswith("__")}
+    # `ctx` est filtré des clés `__*`, donc __file__ n'arrive PAS de l'appelant.
+    # On le pose explicitement sur le CORPS : sans lui, tout code du body qui se
+    # localise via __file__ (résolution de sys.path vers src/data/preprocess…)
+    # lève NameError. Retiré du bundle par le filtre _CACHE_VARS ci-dessous.
+    ns["__file__"] = _BODY_PATH
     exec(_BUILD_CODE, ns)          # sémantique module-level (assign/read sur ns)
     return {k: ns[k] for k in ns["_CACHE_VARS"] if k in ns}

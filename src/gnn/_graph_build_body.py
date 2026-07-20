@@ -1391,6 +1391,32 @@ if MODULES["use_omnipath_node_features"]:
         print(f"  [warn] import omnipath_node_features KO ({_e}) — "
               f"features de nœud OmniPath OFF.")
 
+# V-sup (opt-in, --de-features) : CIRCULAR DE node features (global/per-cluster
+# log2FC, -log10 padj, Δpct) APPENDED LAST, so the canonical scRNA feature order
+# is untouched when OFF. These deliberately BREAK the anti-circularity invariant
+# — that is the point of the circular-ceiling pole. Because they are built here,
+# --de-features invalidates the graph cache and shows up in RUN_TAG ('de-feat').
+# SUP_LABELS is exported so --supervised reuses it without rebuilding.
+SUP_LABELS = None
+if getattr(CLI_ARGS, "de_features", False):
+    import sys as _sys_de
+    _HERE_DE = os.path.dirname(os.path.abspath(__file__))
+    for _cand in (os.path.join(_HERE_DE, "..", "data", "preprocess"), _HERE_DE):
+        _cand = os.path.abspath(_cand)
+        if os.path.isdir(_cand) and _cand not in _sys_de.path:
+            _sys_de.path.insert(0, _cand)
+    from build_supervised_labels import build_supervised_labels as _build_sup_labels
+
+    SUP_LABELS = _build_sup_labels(
+        gene_symbols, GNN_DATA_DIR,
+        recompute=getattr(CLI_ARGS, "supervised_recompute_labels", False))
+    _de_mat = SUP_LABELS.de_feature_matrix()
+    _de_names = SUP_LABELS.de_feature_names()
+    assert _de_mat.shape[1] == len(_de_names), (
+        f"de_feature_matrix {_de_mat.shape} vs {len(_de_names)} names")
+    _FEATURE_VECTORS.extend(zip(_de_names, _de_mat.T))
+    print(f"  [V-sup] +{_de_mat.shape[1]} features DE CIRCULAIRES {_de_names}")
+
 _active_feature_names = [n for n, _ in _FEATURE_VECTORS if GENE_FEATURE_FLAGS[n]]
 _active_feature_arrays = [v for n, v in _FEATURE_VECTORS if GENE_FEATURE_FLAGS[n]]
 
@@ -1407,7 +1433,9 @@ gene_features = torch.tensor(
 )
 print(f"\n  Gene features : {gene_features.shape}")
 print(f"    actives : {_active_feature_names}")
-print(f"    PAS de log2FC, padj, delta_pct (circularité supprimée)")
+print("    /!\\ CIRCULAIRE : log2FC/padj/Δpct INCLUS (--de-features)"
+      if SUP_LABELS is not None else
+      "    PAS de log2FC, padj, delta_pct (circularité supprimée)")
 
 # =============================================================================
 # 7. ASSEMBLAGE DU GRAPHE HÉTÉROGÈNE
