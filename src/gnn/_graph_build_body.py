@@ -1129,6 +1129,9 @@ edge_index_tf_curated_by = (torch.tensor([op_tf_dst.tolist(),
 # Apport mesuré (audit 2026-05-12) : ~45k arêtes signées NOUVELLES (75%
 # absentes de PPI/SIGNOR/CollecTRI). Cf. §14bis.6quater du rapport.
 reactome_fi_src, reactome_fi_dst, reactome_fi_attr = [], [], []
+# V6.2 (2026-07-16) : arêtes reactome_fi à orientation INCONNUE (Direction '-')
+# séparées dans un edge_type distinct, suppressible. Vide en mode legacy.
+reactome_fi_und_src, reactome_fi_und_dst, reactome_fi_und_attr = [], [], []
 if MODULES["use_reactome_fi"]:
     _fi_path = CLI_ARGS.reactome_fi_file
     if not os.path.isabs(_fi_path):
@@ -1144,37 +1147,91 @@ if MODULES["use_reactome_fi"]:
     else:
         _fi = pd.read_csv(_fi_path, sep="\t")
         _n_raw = len(_fi)
-        # Exclure les FI purement prédites (non curées)
-        _fi = _fi[~_fi["Annotation"].astype(str).str.contains(
-            "predicted", case=False, na=False)]
+        # ── V6.2 flags (défaut = LEGACY V5/V6 strict) ────────────────────────
+        #   --reactome-fi-directed   : exploite la colonne Direction pour
+        #       ORIENTER les arêtes (au lieu de tout symétriser). Sépare les
+        #       arêtes à orientation inconnue ('-') dans `reactome_fi_undirected`.
+        #   --reactome-fi-predicted  : inclut les FI 'predicted' (défaut exclues).
+        #   --no-reactome-fi-undirected : en mode directed, JETTE les arêtes non
+        #       orientées (ne garde que le causal ->/<-/<->/-|/|-).
+        _fi_directed = bool(getattr(CLI_ARGS, "reactome_fi_directed", False))
+        _fi_keep_pred = bool(getattr(CLI_ARGS, "reactome_fi_predicted", False))
+        _fi_keep_und = not bool(getattr(CLI_ARGS, "no_reactome_fi_undirected", False))
+        if not _fi_keep_pred:                # exclure les FI purement prédites
+            _fi = _fi[~_fi["Annotation"].astype(str).str.contains(
+                "predicted", case=False, na=False)]
 
-        def _fi_sign(d: str) -> float:
+        def _fi_sign(d: str) -> float:       # LEGACY : signe seul (V5/V6)
             d = str(d)
-            if "|" in d:                    # notation inhibition Reactome FI
+            if "|" in d:
                 return -1.0
-            if ">" in d or "<" in d:        # direction d'activation
+            if ">" in d or "<" in d:
                 return 1.0
             return 0.0
+
+        def _fi_parse(d: str):
+            """Direction → (orientation, sign). Le symbole marque l'EXTRÉMITÉ
+            CIBLE : droite ('>'/'|') = Gene2 (forward), gauche ('<'/'|') =
+            Gene1 (backward) ; '|' = inhibition. '-' = orientation inconnue."""
+            d = str(d).strip()
+            if d in ("", "-", "nan"):
+                return "none", 0.0
+            left, right = d[0] in "<|", d[-1] in ">|"
+            sign = -1.0 if "|" in d else 1.0
+            if left and right:
+                return "both", sign
+            if right:
+                return "forward", sign
+            if left:
+                return "backward", sign
+            return "none", sign
 
         _seen_fi = set()
         for _, r in _fi.iterrows():
             g1, g2 = str(r["Gene1"]), str(r["Gene2"])
-            if g1 in gene_to_idx and g2 in gene_to_idx:
-                i, j = gene_to_idx[g1], gene_to_idx[g2]
-                pair = (min(i, j), max(i, j))
-                if pair in _seen_fi:
-                    continue
-                _seen_fi.add(pair)
+            if g1 not in gene_to_idx or g2 not in gene_to_idx:
+                continue
+            i, j = gene_to_idx[g1], gene_to_idx[g2]
+            pair = (min(i, j), max(i, j))
+            if pair in _seen_fi:
+                continue
+            _seen_fi.add(pair)
+            score = float(r["Score"]) if not pd.isna(r["Score"]) else 1.0
+            if not _fi_directed:
+                # LEGACY : signe seul, symétrique (comportement V5/V6).
                 sign = _fi_sign(r["Direction"])
-                score = float(r["Score"]) if not pd.isna(r["Score"]) else 1.0
-                # Bidirectionnel (FI = interaction fonctionnelle, on
-                # propage dans les deux sens comme PPI/coexpr)
+                reactome_fi_src.extend([i, j])
+                reactome_fi_dst.extend([j, i])
+                reactome_fi_attr.extend([[score, sign], [score, sign]])
+                continue
+            orient, sign = _fi_parse(r["Direction"])
+            if orient == "none":             # orientation inconnue → type séparé
+                if _fi_keep_und:
+                    reactome_fi_und_src.extend([i, j])
+                    reactome_fi_und_dst.extend([j, i])
+                    reactome_fi_und_attr.extend([[score, sign], [score, sign]])
+            elif orient == "forward":        # Gene1 → Gene2
+                reactome_fi_src.append(i)
+                reactome_fi_dst.append(j)
+                reactome_fi_attr.append([score, sign])
+            elif orient == "backward":       # Gene2 → Gene1
+                reactome_fi_src.append(j)
+                reactome_fi_dst.append(i)
+                reactome_fi_attr.append([score, sign])
+            else:                            # both : ->/<- attesté dans les 2 sens
                 reactome_fi_src.extend([i, j])
                 reactome_fi_dst.extend([j, i])
                 reactome_fi_attr.extend([[score, sign], [score, sign]])
         n_fi_signed = sum(1 for a in reactome_fi_attr if a[1] != 0)
-        print(f"  Reactome FI : {_n_raw} brut → {len(_seen_fi)} paires "
-              f"curées dans le graphe ({n_fi_signed//2} signées)")
+        if _fi_directed:
+            print(f"  Reactome FI [directed] : {_n_raw} brut → "
+                  f"{len(reactome_fi_src)} orientées ({n_fi_signed} signées) + "
+                  f"{len(reactome_fi_und_src)} non-orientées"
+                  + ("" if _fi_keep_und else " [JETÉES --no-reactome-fi-undirected]")
+                  + (" [+predicted]" if _fi_keep_pred else ""))
+        else:
+            print(f"  Reactome FI [legacy] : {_n_raw} brut → {len(_seen_fi)} "
+                  f"paires curées ({n_fi_signed//2} signées)")
 
 edge_index_reactome_fi = (torch.tensor([reactome_fi_src, reactome_fi_dst],
                                        dtype=torch.long)
@@ -1183,6 +1240,12 @@ edge_index_reactome_fi = (torch.tensor([reactome_fi_src, reactome_fi_dst],
 edge_attr_reactome_fi = (torch.tensor(reactome_fi_attr, dtype=torch.float)
                          if reactome_fi_attr
                          else torch.zeros((0, 2), dtype=torch.float))
+edge_index_reactome_fi_und = (torch.tensor(
+    [reactome_fi_und_src, reactome_fi_und_dst], dtype=torch.long)
+    if reactome_fi_und_src else torch.zeros((2, 0), dtype=torch.long))
+edge_attr_reactome_fi_und = (torch.tensor(reactome_fi_und_attr, dtype=torch.float)
+                             if reactome_fi_und_attr
+                             else torch.zeros((0, 2), dtype=torch.float))
 
 # ── V4.2 : déduplication PPI vs arêtes signées+orientées ─────────────────────
 # Pour une paire (a,b), si une arête SIGNÉE ORIENTÉE existe (signaling /
@@ -1426,6 +1489,9 @@ if edge_index_tf_curated.numel() > 0:
 if edge_index_reactome_fi.numel() > 0:
     data["gene", "reactome_fi", "gene"].edge_index = edge_index_reactome_fi
     data["gene", "reactome_fi", "gene"].edge_attr = edge_attr_reactome_fi
+if edge_index_reactome_fi_und.numel() > 0:   # V6.2 : orientation inconnue séparée
+    data["gene", "reactome_fi_undirected", "gene"].edge_index = edge_index_reactome_fi_und
+    data["gene", "reactome_fi_undirected", "gene"].edge_attr = edge_attr_reactome_fi_und
 
 # V6 Module 1 (extension) — arêtes OmniPath supplémentaires projetées sur les
 # nœuds gène depuis le graphe autonome (edges.tsv.gz), signées [score, sign].

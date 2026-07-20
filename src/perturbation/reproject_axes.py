@@ -58,8 +58,16 @@ from perturb_report import (_canon_axis, _compute_driver_score,        # noqa: E
                             write_per_axis_rankings)
 
 
-def _compute_axes(run_dir: Path, quiescent, p16, cluster_anchors, transition_pairs):
-    """Rebuild axis vectors from the run's μ + group_expression (no torch)."""
+def _compute_axes(run_dir: Path, quiescent, p16, cluster_anchors, transition_pairs,
+                  n_random=0, random_seed=0, effector_genes=None,
+                  global_axis_name=None):
+    """Rebuild axis vectors from the run's μ + group_expression (no torch).
+
+    Si n_random>0, ajoute N axes UNITAIRES ALÉATOIRES (decoy de spécificité
+    d'axe) — pondérés par le dernier groupe sénescent. La projection est
+    identique à celle des vrais axes (dz_mean·u) → le null de spécificité est
+    entièrement reconstructible depuis le cache, sans re-perturber. Graine fixe
+    ⇒ mêmes directions aléatoires entre runs (moyennables cross-seed)."""
     from gnn_perturbation import compute_senescence_axes
     emb = pd.read_csv(run_dir / "gene_embeddings_vgae.csv", index_col=0)
     gene_symbols = emb.index.to_numpy().astype(str)
@@ -79,13 +87,31 @@ def _compute_axes(run_dir: Path, quiescent, p16, cluster_anchors, transition_pai
         mu, group_expr, gene_symbols,
         quiescent_groups=(tuple(quiescent) if quiescent else None),
         p16_groups=tuple(p16_list),
+        effector_axis_genes=effector_genes,
         cluster_anchors=cluster_anchors, transition_pairs=transition_pairs)
     # Axis registry : name -> (unit vector, weighting cell_group).
     axes: dict[str, tuple[np.ndarray, str]] = {}
+    # Global axis, exposed as a NAMED axis only when explicitly anchored
+    # (DE poles or effector gene lists). Weighted by the most senescent group,
+    # like the random decoys. Un-anchored global stays implicit (the headline
+    # ranking already carries it) to keep the axis registry unambiguous.
+    if global_axis_name is not None:
+        _wref = p16_list[-1] if p16_list else "P4"
+        axes[global_axis_name] = (np.asarray(_ag, np.float32), _wref)
     for grp, u in axes_cluster.items():
         axes[grp] = (np.asarray(u, np.float32), grp)             # weight = ck
     for (src, dst), u in axes_transition.items():
         axes[f"trans_{src}->{dst}"] = (np.asarray(u, np.float32), dst)  # weight = dst
+    # Decoy d'axe : N directions aléatoires dans l'espace latent, pondérées par le
+    # groupe le plus sénescent présent (référence de comparaison aux vrais axes).
+    if n_random > 0:
+        _rng = np.random.default_rng(random_seed)
+        _latent = mu.shape[1]
+        _ref = p16_list[-1] if p16_list else axes and next(iter(axes.values()))[1]
+        for _k in range(n_random):
+            _u = _rng.standard_normal(_latent).astype(np.float32)
+            _u /= (np.linalg.norm(_u) + 1e-8)
+            axes[f"random_{_k}"] = (_u, _ref)
     return axes
 
 
@@ -144,7 +170,47 @@ def main():
                     choices=["none", "default", "all-pairs"], default="default")
     ap.add_argument("--transition-pairs", default=None)
     ap.add_argument("--mode-agg", choices=["aligned", "oe-only"], default="aligned")
+    ap.add_argument("--random-axis", type=int, default=0,
+                    help="N axes aléatoires (decoy de spécificité d'axe), "
+                         "reconstruits depuis le cache Δz — aucune re-perturbation.")
+    ap.add_argument("--random-axis-seed", type=int, default=0)
+    # ── Anchored GLOBAL axis (V6) — reproject the headline axis from the Δz
+    #    cache with poles fixed by MEASUREMENT (DE) or by curated effector
+    #    lists, instead of the latent cell_group contrast. logFC stays a
+    #    readout signal (never an encoder feature). Both routes feed
+    #    `effector_axis_genes` of compute_senescence_axes.
+    ap.add_argument("--de-axis-file", type=Path, default=None,
+                    help="DE file -> anchored global axis (+ pole = top-N up "
+                         "= pro-senescent, - pole = top-N down). Mutually "
+                         "exclusive with --effector-axis.")
+    ap.add_argument("--de-axis-label", default="sen_vs_pro")
+    ap.add_argument("--de-axis-rank", default="stat")
+    ap.add_argument("--de-axis-top-n", type=int, default=150)
+    ap.add_argument("--de-axis-padj", type=float, default=0.05)
+    ap.add_argument("--effector-axis", action="store_true",
+                    help="anchored global axis = unit(mean(mu[pro]) - mean(mu[anti])).")
+    ap.add_argument("--effector-pro", default="",
+                    help="comma-separated pro-senescent effector symbols.")
+    ap.add_argument("--effector-anti", default="",
+                    help="comma-separated anti-senescent effector symbols.")
     args = ap.parse_args()
+
+    if args.de_axis_file and args.effector_axis:
+        sys.exit("[reproject] --de-axis-file et --effector-axis sont exclusifs.")
+    effector_genes, global_axis_name = None, None
+    if args.de_axis_file:
+        from perturb_top_genes import _load_de_axis_anchors     # noqa: E402
+        effector_genes = _load_de_axis_anchors(
+            args.de_axis_file, args.de_axis_label, args.de_axis_top_n,
+            args.de_axis_rank, args.de_axis_padj)
+        global_axis_name = "de_anchored"
+    elif args.effector_axis:
+        effector_genes = (
+            tuple(s.strip() for s in args.effector_pro.split(",") if s.strip()),
+            tuple(s.strip() for s in args.effector_anti.split(",") if s.strip()))
+        if not effector_genes[0] or not effector_genes[1]:
+            sys.exit("[reproject] --effector-axis exige --effector-pro ET --effector-anti.")
+        global_axis_name = "effector_anchored"
 
     run_dirs = []
     for pat in args.run_dirs:
@@ -174,7 +240,11 @@ def main():
         if not caches:
             print(f"[reproject] {rd.name}: aucun dz_cache — sauté.")
             continue
-        axes = _compute_axes(rd, quiescent, p16, anchors, trans)
+        axes = _compute_axes(rd, quiescent, p16, anchors, trans,
+                             n_random=args.random_axis,
+                             random_seed=args.random_axis_seed,
+                             effector_genes=effector_genes,
+                             global_axis_name=global_axis_name)
         axis_names |= set(axes)
         for c in caches:
             n_cache += 1

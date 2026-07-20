@@ -239,6 +239,7 @@ class HeteroEncoder(nn.Module):
         (("gene", "tf_curated", "gene"), 2),
         (("gene", "tf_curated_by", "gene"), 2),
         (("gene", "reactome_fi", "gene"), 2),  # V4.2
+        (("gene", "reactome_fi_undirected", "gene"), 2),  # V6.2 (orientation inconnue)
     ] + [(("gene", _et, "gene"), 2) for _et in OMNIPATH_EXTRA_EDGE_TYPES]  # V6
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
@@ -1054,10 +1055,22 @@ def cell_group_shift_projected(mu_base: np.ndarray,
 # (cible → TF), de direction inverse : l'inclure compterait S comme aval.
 # `reactome_fi` est conservée malgré une directionnalité parfois faible
 # (les FI Reactome sont souvent bidirectionnelles) ; à filtrer si besoin.
-FANOUT_EDGE_TYPES: tuple = (
-    ("gene", "signaling", "gene"),
-    ("gene", "tf_curated", "gene"),
-    ("gene", "reactome_fi", "gene"),
+# Reverse edge types : PyG stores each curated relation twice so messages can
+# flow both ways in the encoder. For a DOWNSTREAM fan-out they are semantically
+# wrong — following `tf_curated_by` from a gene walks to its *regulators*, not
+# its targets — so they are excluded from the readout (they stay in the encoder).
+REVERSE_EDGE_TYPES: frozenset = frozenset({"tf_curated_by", "regulated_by"})
+
+# Fan-out = every SIGNED, forward-directed gene->gene relation. Derived from
+# SIGNED_EDGE_TYPES so that new sources (OmniPath transcriptional /
+# enzyme_substrate / ligand_receptor, added 2026-07-10) are picked up
+# automatically. The previous hardcoded triple silently dropped 21% of the
+# signed graph — and ~50% of the out-edges of kinases (CDK1) and TFs (TP53),
+# i.e. exactly the regulators the readout is meant to measure.
+# Types absent from a given run (ablation, --omnipath-edges off) are filtered
+# out downstream by `precompute_signed_fanout_context` (`present_types`).
+FANOUT_EDGE_TYPES: tuple = tuple(
+    et for et in sorted(SIGNED_EDGE_TYPES) if et[1] not in REVERSE_EDGE_TYPES
 )
 
 

@@ -133,6 +133,14 @@ def _build_run_tag():
         # Tag court : op-edges<N> (N types) ; ex op-edges2. Détail dans run_config.
         parts.append(f"op-edges{len(OMNIPATH_EXTRA_EDGES)}")
     if MODULES["use_reactome_fi"]:          parts.append("rfi")
+    # V6.2 : orientation reactome_fi (défaut legacy → pas de tag).
+    if getattr(CLI_ARGS, "reactome_fi_directed", False):
+        _rt = "rfi-dir"
+        if getattr(CLI_ARGS, "no_reactome_fi_undirected", False):
+            _rt += "-noundir"
+        parts.append(_rt)
+    if getattr(CLI_ARGS, "reactome_fi_predicted", False):
+        parts.append("rfi-pred")
     if COEXPR_DIFFERENTIAL:                 parts.append("coexdiff")
     # V4.3 : tag des choix méthode×prune (uniquement si != défaut).
     if CLI_ARGS.coexpr_method != "sklearn":

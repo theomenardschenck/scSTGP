@@ -201,6 +201,9 @@ _unsigned_sources = [
     (react_src, react_dst),
     (reg_src, reg_dst), (reg_dst, reg_src),  # Regulates + regulated_by
     (coexpr_src, coexpr_dst),
+    # V6.2 : reactome_fi non-orienté (sign=0, module) → pool cosinus non-signé.
+    (globals().get("reactome_fi_und_src", []),
+     globals().get("reactome_fi_und_dst", [])),
 ]
 _signed_sources = [
     (op_sig_src, op_sig_dst),       # signaling (OmniPath kinase + SIGNOR)

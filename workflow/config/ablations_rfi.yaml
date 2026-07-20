@@ -1,0 +1,66 @@
+# ===========================================================================
+# ablations_rfi.yaml — V6.2 wave: does exploiting reactome_fi's Direction
+# column change the drivers?
+#
+# Context (LOG §23-24): reactome_fi was stored 100% symmetric although 33.8% of
+# the source rows carry an orientation. It is also the dominant edge type of the
+# stripped graph (265k edges = 63% of op.all), so the fix matters MOST there.
+#
+# Grid = 2 contexts x FI treatments, each with its LEGACY control so the
+# comparison is apples-to-apples:
+#   * rich  (full OmniPath stack, ~= op.base)  -> effect on the reference config
+#   * pure  (all data-derived edges stripped)  -> effect on the counterfactual base
+#
+# Legacy controls reproduce V5/V6 byte-identically (verified: 257 314 edges =
+# V6.1.2 exact), so any delta is attributable to the FI treatment alone.
+#
+# Hypernodes (OmniPath named complexes) land in a SEPARATE profile once coded —
+# they need the complex_membership layer wired first.
+#
+# Usage:
+#   scripts/run_omnipath_ablation_wave.sh workflow/config/ablations_rfi.yaml \
+#       --profile workflow/profiles/slurm -j 8
+# ===========================================================================
+
+root_tag: "rfi"          # run_tag per ablation = "rfi.<name>"
+seed: 1                  # 1 seed/ablation (wave 1; multi-seed after triage)
+
+# TWO independent null models, both wanted here:
+#   decoy: true          -> N2/N4 structural null (degree-preserving rewiring)
+#                           => decoy_confidence.tsv. Tests "does the effect beat
+#                           what a degree-matched neighbourhood would produce?"
+#   decoy_random_axis: N -> axis-specificity null: N random unit axes projected
+#                           from the same Delta-z => perturbation_*_random_axis_*.tsv.
+#                           Tests "is the signal specific to the senescence axis?"
+# The wave wrapper forwards both into validation.decoy.* (base config has
+# random_axis: 0, so it MUST be set here or no axis null is produced).
+decoy: true
+decoy_random_axis: 20            # 5 was too few for a stable per-gene null
+decoy_random_axis_seed: 0        # fixed => same directions across ablations
+
+# Full OmniPath stack, identical to ablations_omnipath.yaml so results are
+# directly comparable with the V6.1.3 wave.
+base_extra_flags: >-
+  --signed-message --signed-decoder --use-reactome-fi
+  --use-omnipath-signaling --use-omnipath-tf-curated
+  --use-omnipath-node-features
+  --omnipath-edges transcriptional,enzyme_substrate,ligand_receptor
+
+# "pure" = strip every data-derived edge (coexpr / HuMess / PPI / same_pathway /
+# cell_group). Same flag set as op.all in ablations_omnipath.yaml.
+_pure_flags: &pure >-
+  --dedup-ppi-signed remove --no-ppi
+  --exclude-features ppi_degree,reg_degree
+  --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges
+
+ablation_grid:
+  # ── Context A : rich graph (reference) ────────────────────────────────────
+  - {name: rich-legacy,      add_flags: ""}                                                  # control = current V6.1.3 behaviour
+  - {name: rich-dir,         add_flags: "--reactome-fi-directed"}                            # orientation exploited
+  - {name: rich-dir-noundir, add_flags: "--reactome-fi-directed --no-reactome-fi-undirected"} # causal only (drops 66% unoriented)
+  - {name: rich-dir-pred,    add_flags: "--reactome-fi-directed --reactome-fi-predicted"}    # + the 29% 'predicted' FI
+
+  # ── Context B : pure graph (counterfactual base, FI = 63% of edges) ───────
+  - {name: pure-legacy,      add_flags: *pure}                                               # control = current op.all
+  - {name: pure-dir,         add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --reactome-fi-directed"}
+  - {name: pure-dir-noundir, add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --reactome-fi-directed --no-reactome-fi-undirected"}

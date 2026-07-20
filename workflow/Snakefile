@@ -115,11 +115,19 @@ CLUSTER_ANNOT  = config["validation"]["cluster_annotation"]["enabled"]
 
 # Racine des runs entraînés (= GNN_OUT_DIR_BASE pour gnn_vgae) et des analyses.
 RUNS_DIR     = OUT_BASE
-ANALYSIS_DIR = OUT_BASE / "analysis" / RUN_TAG
+# RÉORG 2026-07-15 : tout ce qui concerne UNE config vit sous OUT_BASE/<run_tag>/
+#   → build/, s<seed>/, logs/, analysis/, _graph_cache.pkl. Évite (a) le mélange
+#   build/seed et (b) l'écrasement des logs entre configs de la vague (chemins de
+#   log étaient partagés). run_tag avec "/" = OK (os.path.join → dossiers imbriqués,
+#   cf. _paths.py:66 ; run_tag n'est sinon qu'un champ métadonnée).
+CONFIG_DIR   = OUT_BASE / str(RUN_TAG)
+ANALYSIS_DIR = CONFIG_DIR / "analysis"
+LOG_DIR      = CONFIG_DIR / "logs"
 
 def run_dir(seed):
-    """Run dir déterministe écrit par gnn_vgae : OUT_DIR_BASE/<tag>.s<seed>."""
-    return RUNS_DIR / (str(RUN_TAG) + ".s" + str(seed))
+    """Run dir d'un seed : OUT_BASE/<run_tag>/s<seed> (écrit par gnn_vgae via
+    --run-tag <run_tag>/s<seed>)."""
+    return CONFIG_DIR / ("s" + str(seed))
 
 # Préfixe de fichier de perturbation : perturbation_all_genes[_<suffix>]_<mode>.tsv
 _PSEG = ("_" + str(OUT_SUFFIX)) if OUT_SUFFIX else ""
@@ -186,7 +194,7 @@ if BUILD_ON:
 #   dans _TRAIN_ONLY (exclus de la signature) → un seul cache sert tous les seeds.
 #   GRAPH_CACHE : un cache par run_tag (seed-indépendant), bâti 1× puis réutilisé.
 GRAPH_FLAGS = (str(EXTRA_FLAGS) + " " + str(TRAIN_COEXPR_FLAGS)).strip()
-GRAPH_CACHE = RUNS_DIR / ("_graph_cache_" + str(RUN_TAG) + ".pkl")
+GRAPH_CACHE = CONFIG_DIR / "_graph_cache.pkl"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -230,7 +238,7 @@ rule build_features:
         repo=BUILD.get("humess_repo", "../humess"),
         cs=BUILD.get("humess_cs_nsamples", 1000),
     log:
-        OUT_BASE / "logs" / "build_features.log",
+        LOG_DIR / "build_features.log",
     threads: 8
     resources:
         mem_mb=16000,
@@ -260,14 +268,14 @@ rule build_graph:
     output:
         cache=GRAPH_CACHE,
     log:
-        OUT_BASE / "logs" / "build_graph.log",
+        LOG_DIR / "build_graph.log",
     threads: 4
     resources:
         mem_mb=32000,
         runtime=120,
     shell:
         "{GNN_ENV} {PY} src/gnn/gnn_vgae.py --build-only "
-        "--run-tag {RUN_TAG}.build --graph-cache {output.cache} "
+        "--run-tag {RUN_TAG}/build --graph-cache {output.cache} "
         "{GRAPH_FLAGS} &> {log}"
 
 
@@ -282,7 +290,7 @@ rule train_vgae:
         ranking=run_dir("{seed}") / "gene_ranking_vgae.csv",
         group_expr=run_dir("{seed}") / "group_expression.tsv",
     log:
-        OUT_BASE / "logs" / "train_vgae_s{seed}.log",
+        LOG_DIR / "train_vgae_s{seed}.log",
     threads: 4
     resources:
         mem_mb=32000,
@@ -290,7 +298,7 @@ rule train_vgae:
         gpu=1,          # mappé vers --gres=gpu:1 par le profil cluster
     shell:
         "{GNN_ENV} {PY} src/gnn/gnn_vgae.py "
-        "--seed {wildcards.seed} --run-tag {RUN_TAG}.s{wildcards.seed} "
+        "--seed {wildcards.seed} --run-tag {RUN_TAG}/s{wildcards.seed} "
         "--reuse-graph --graph-cache {input.cache} "
         "{GRAPH_FLAGS} &> {log}"
 
@@ -319,7 +327,7 @@ rule perturb:
                   + " --random-axis-seed " + str(RANDOM_AXIS_SEED))
                  if RANDOM_AXIS > 0 else ""),
     log:
-        OUT_BASE / "logs" / "perturb_s{seed}_{mode}.log",
+        LOG_DIR / "perturb_s{seed}_{mode}.log",
     threads: 8
     resources:
         mem_mb=32000,
@@ -353,7 +361,7 @@ rule aggregate_cross_seed:
         padj=SCORING["de_padj_max"],
         lfc=SCORING["de_abs_lfc_min"],
     log:
-        OUT_BASE / "logs" / "aggregate_cross_seed.log",
+        LOG_DIR / "aggregate_cross_seed.log",
     threads: 4
     shell:
         "{PY} src/validation/reports/perturb_report.py --cross-seed {params.runs} "
@@ -373,7 +381,7 @@ rule driver_baselines:
     output:
         baselines=ANALYSIS_DIR / "interpret" / "driver_baselines.tsv",
     log:
-        OUT_BASE / "logs" / "driver_baselines.log",
+        LOG_DIR / "driver_baselines.log",
     shell:
         "{PY} src/validation/reports/driver_baselines.py "
         "--ranking {input.ranking} --coexpr-file {COEXPR} "
@@ -391,7 +399,7 @@ rule interpret_embedding:
         rd=run_dir(SEEDS[0]),
         out_dir=ANALYSIS_DIR / "interpret",
     log:
-        OUT_BASE / "logs" / "interpret_embedding.log",
+        LOG_DIR / "interpret_embedding.log",
     shell:
         "{PY_TORCH} src/validation/viz/interpret_embedding.py "
         "--run-dir {params.rd} --ranking {input.ranking} --shinygo "
@@ -408,7 +416,7 @@ rule perturb_decoy:
         rd=run_dir(SEEDS[0]),
         top_n=DECOY_TOP_N,
     log:
-        OUT_BASE / "logs" / "perturb_decoy.log",
+        LOG_DIR / "perturb_decoy.log",
     shell:
         "{PY_TORCH} src/validation/explain/perturb_decoy.py confidence "
         "--run-dir {params.rd} --ranking {input.ranking} "
@@ -428,7 +436,7 @@ rule ora_top_drivers:
     params:
         top_n=ORA_TOP_N,
     log:
-        OUT_BASE / "logs" / "ora_top_drivers.log",
+        LOG_DIR / "ora_top_drivers.log",
     shell:
         # mkdir -p : garde-fou (en cluster/NFS le dossier de sortie n'est pas
         # toujours pré-créé à temps → la 1re redirection `>` échouait). top-N
@@ -454,7 +462,7 @@ rule cluster_annotation:
     params:
         out_dir=ANALYSIS_DIR / "cluster_annotation",
     log:
-        OUT_BASE / "logs" / "cluster_annotation.log",
+        LOG_DIR / "cluster_annotation.log",
     shell:
         "{PY} src/validation/cluster/cluster_annotation.py "
         "--cross-seed-runs {input.ge} --out-dir {params.out_dir} &> {log}"

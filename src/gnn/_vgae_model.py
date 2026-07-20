@@ -81,6 +81,7 @@ class HeteroEncoder(nn.Module):
         (("gene", "tf_curated", "gene"), 2),
         (("gene", "tf_curated_by", "gene"), 2),
         (("gene", "reactome_fi", "gene"), 2),  # V4.2
+        (("gene", "reactome_fi_undirected", "gene"), 2),  # V6.2 (orientation inconnue)
     ] + [(("gene", _et, "gene"), 2) for _et in OMNIPATH_EXTRA_EDGE_TYPES]  # V6
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,

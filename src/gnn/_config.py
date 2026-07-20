@@ -170,6 +170,25 @@ def parse_cli_args(argv=None):
                    default="data/reactome_fi/FIsInGene_with_annotations.txt",
                    help="V4.2 : chemin du fichier Reactome FI décompressé "
                         "(Gene1, Gene2, Annotation, Direction, Score).")
+    # ── V6.2 (2026-07-16) : exploitation de la colonne Direction ─────────────
+    # Défaut = LEGACY V5/V6 (tout symétrisé, signe seul). Opt-in réversible.
+    p.add_argument("--reactome-fi-directed", dest="reactome_fi_directed",
+                   action="store_true", default=False,
+                   help="V6.2 : ORIENTE les arêtes reactome_fi via la colonne "
+                        "Direction (->/<-/<->/-|/|-) au lieu de tout symétriser. "
+                        "Les arêtes à orientation inconnue ('-', 66%%) vont dans "
+                        "l'edge_type séparé 'reactome_fi_undirected'. Défaut OFF "
+                        "= comportement V5/V6 strict.")
+    p.add_argument("--no-reactome-fi-undirected",
+                   dest="no_reactome_fi_undirected",
+                   action="store_true", default=False,
+                   help="V6.2 (avec --reactome-fi-directed) : JETTE les arêtes "
+                        "reactome_fi à orientation inconnue ('-'), ne garde que "
+                        "le causal orienté.")
+    p.add_argument("--reactome-fi-predicted", dest="reactome_fi_predicted",
+                   action="store_true", default=False,
+                   help="V6.2 : INCLUT les FI 'predicted' (computationnelles non "
+                        "curées, ~29%%). Défaut OFF = exclues comme en V5/V6.")
 
     # --- V4.2 : pondération γ_t par edge_type (niveau message) ---
     # NB : la loss VGAE est poolée (PPI∪REACTOME∪reg∪coexpr dédupliqués),
