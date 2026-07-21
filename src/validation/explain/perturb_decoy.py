@@ -16,6 +16,22 @@ voisinage réelle). D'où la **colonne de confiance décoy** (mode confidence) :
     decoy_confidence = 1 − |proj_N2_moy| / |proj_réel|      (par gène, mode KO)
 ≈0 = diffusé/marqueur ; ↗1 = network-causal (type TP53).
 
+⚠️ DEUX CORRECTIONS 2026-07-21 (LOG §25bis / §26) :
+ 1. **n≥50 obligatoire.** À `--n-rewires 5` les SD sont sous-estimées ~10×
+    (HMGB2 0.3→4.4) et trois « passages » sur quatre disparaissent à n=50.
+    Le défaut de `confidence` (3) est donc trop bas : les colonnes
+    `decoy_confidence` produites avant cette date sont NON FIABLES.
+ 2. **Nulle sur le COSINUS ajoutée.** Le test ne portait que sur
+    `proj_signed_diff`, la projection porteuse de MAGNITUDE — or LOG §25
+    montre qu'elle est confondue au degré (ρ +0.45, signe qui s'inverse avec
+    la densité du graphe). Le cosinus, qui est la statistique séparant
+    réellement les cibles (SYNJ2 |cos| 0.85 vs TP53 0.05), n'avait AUCUNE
+    nulle : il était calculé par `_project` puis jeté (`[0]`). Colonnes
+    `n2_cos_mean/n2_p_cos` (per-gene) et `decoy_confidence_cos/decoy_p_cos`
+    (confidence). Coût nul — même forward.
+⚠️ N4 est non informatif sur un graphe SANS canal expression (op.all) :
+   neutraliser les features y supprime l'objet même de la perturbation.
+
 Usage
 -----
     # quelques gènes, N2+N4, modes KO/KD/OE
@@ -133,8 +149,9 @@ def run_per_gene(args):
     data, model, gs, g2i, _b, gx = load_run(args.run_dir, **HP)
     x_mean = data["gene"].x.mean(dim=0)
     mu_base, ag, ac = _base_axis(model, data, gx, gs)
-    print(f"{'gene':9s} {'mode':4s} | {'REAL':>8} {'cos':>5} | "
-          f"{'N2 moy±sd':>13} {'p':>4} | {'N4':>8}", flush=True)
+    print(f"{'gene':9s} {'mode':4s} | {'REAL':>8} {'cos':>6} | "
+          f"{'N2 moy±sd':>13} {'p':>4} | {'N2cos±sd':>12} {'p_cos':>5} | "
+          f"{'N4':>8}", flush=True)
     rows = []
     for G in args.genes:
         if G not in g2i:
@@ -146,14 +163,28 @@ def run_per_gene(args):
         dn = neutralize(data, idx, x_mean); mb4, ag4, ac4 = _base_axis(model, dn, gx, gs)
         for mode in args.modes:
             rd, rc = _project(model, data, idx, mode, mu_base, ag, ac, gx, gs)
-            nd = [_project(model, dr, idx, mode, mb, agr, acr, gx, gs)[0]
+            # V6.2 (2026-07-21) : the null is now kept on BOTH statistics.
+            # It used to discard the cosine ([0] only) and test `proj_signed_diff`
+            # alone -- i.e. the MAGNITUDE-carrying projection, which LOG §25 shows
+            # is degree-confounded (rho +0.45, sign flipping with graph density).
+            # The cosine is the statistic that actually separates the targets
+            # (SYNJ2 |cos|=0.85 vs TP53 0.05), and it had NO null at all. Both
+            # values are produced by the same forward pass, so this is free.
+            _n = [_project(model, dr, idx, mode, mb, agr, acr, gx, gs)
                   for dr, (mb, agr, acr) in zip(rew_d, rew)]
-            nd = np.array(nd); p = float((np.abs(nd) >= abs(rd)).mean())
-            n4d, _ = _project(model, dn, idx, mode, mb4, ag4, ac4, gx, gs)
-            print(f"{G:9s} {mode[:4]:4s} | {rd:8.1f} {rc:5.2f} | "
-                  f"{nd.mean():8.1f}±{nd.std():4.1f} {p:4.2f} | {n4d:8.1f}", flush=True)
+            nd = np.array([v[0] for v in _n])
+            nc = np.array([v[1] for v in _n])
+            p = float((np.abs(nd) >= abs(rd)).mean())
+            p_cos = float((np.abs(nc) >= abs(rc)).mean())
+            n4d, n4c = _project(model, dn, idx, mode, mb4, ag4, ac4, gx, gs)
+            print(f"{G:9s} {mode[:4]:4s} | {rd:8.1f} {rc:6.2f} | "
+                  f"{nd.mean():8.1f}±{nd.std():4.1f} {p:4.2f} | "
+                  f"{nc.mean():7.2f}±{nc.std():4.2f} {p_cos:5.2f} | "
+                  f"{n4d:8.1f}", flush=True)
             rows.append(dict(gene=G, mode=mode, real=rd, cos=rc,
-                             n2_mean=nd.mean(), n2_p=p, n4=n4d))
+                             n2_mean=nd.mean(), n2_sd=nd.std(), n2_p=p,
+                             n2_cos_mean=nc.mean(), n2_cos_sd=nc.std(),
+                             n2_p_cos=p_cos, n4=n4d, n4_cos=n4c))
     if args.out:
         pd.DataFrame(rows).to_csv(args.out, sep="\t", index=False)
         print(f"[wrote] {args.out}")
@@ -172,20 +203,31 @@ def run_confidence(args):
         if G not in g2i:
             continue
         idx = g2i[G]
-        rd, _ = _project(model, data, idx, args.mode, mu_base, ag, ac, gx, gs)
-        nd = []
+        rd, rc = _project(model, data, idx, args.mode, mu_base, ag, ac, gx, gs)
+        nd, nc = [], []
         for s in range(args.n_rewires):
             dr = rewire(data, idx, np.random.default_rng(4000 + s))
             mb, agr, acr = _base_axis(model, dr, gx, gs)
-            nd.append(_project(model, dr, idx, args.mode, mb, agr, acr, gx, gs)[0])
+            _v = _project(model, dr, idx, args.mode, mb, agr, acr, gx, gs)
+            nd.append(_v[0]); nc.append(_v[1])
         nm = float(np.mean(nd))
         conf = (1.0 - abs(nm) / (abs(rd) + 1e-9)) if abs(rd) >= args.min_signal else np.nan
+        # V6.2 : cosine-based confidence. Unlike `decoy_confidence` it needs no
+        # `min_signal` gate -- the cosine is scale-free, so a weak-amplitude gene
+        # (all our metabolic targets) still gets a defined value instead of NaN.
+        ncm = float(np.mean(nc))
+        conf_cos = 1.0 - abs(ncm) / (abs(rc) + 1e-9)
+        p_cos = float((np.abs(np.asarray(nc)) >= abs(rc)).mean())
         rows.append(dict(rank=i + 1, gene=G,
                          driver_score=getattr(row, "driver_score", np.nan),
                          real_proj=round(rd, 1), null_proj=round(nm, 1),
                          decoy_confidence=round(conf, 3) if conf == conf else np.nan,
+                         real_cos=round(rc, 3), null_cos=round(ncm, 3),
+                         decoy_confidence_cos=round(conf_cos, 3),
+                         decoy_p_cos=round(p_cos, 3),
                          total_degree=int(td[idx])))
-        print(f"{i+1:3d} {G:9s} real={rd:7.1f} null={nm:7.1f} conf={conf:+.2f}", flush=True)
+        print(f"{i+1:3d} {G:9s} real={rd:7.1f} null={nm:7.1f} conf={conf:+.2f} | "
+              f"cos={rc:+.2f} null_cos={ncm:+.2f} p_cos={p_cos:.2f}", flush=True)
     pd.DataFrame(rows).to_csv(args.out, sep="\t", index=False)
     print(f"[wrote] {args.out}")
 
