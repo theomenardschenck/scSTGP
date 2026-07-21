@@ -476,10 +476,45 @@ def compute_importance(model, data, baseline_specificity):
 # --------------------------------------------------------------------------- #
 # Perturbation.
 # --------------------------------------------------------------------------- #
+def resolve_feature_mask(data, spec):
+    """Map a --perturb-features spec to a boolean column mask over gene features.
+
+    `spec` is None/"all" (perturb every column, historical behaviour) or a
+    comma-separated list of column names / prefixes matched against
+    `data["gene"].feature_names` (written by the graph build). Prefix matching
+    lets "expr" select expr_P4, expr_P16_cluster_0, … and "de" select the DE
+    block, without hard-coding a dataset's cell groups.
+
+    Returns None when every column is selected, so callers keep the fast path.
+    Raises ValueError on a spec that matches nothing — silently perturbing all
+    columns after a typo would look like a working run and quietly invalidate it.
+    """
+    if spec is None or str(spec).strip().lower() in ("", "all"):
+        return None
+    names = list(getattr(data["gene"], "feature_names", []) or [])
+    if not names:
+        raise ValueError(
+            "--perturb-features demandé mais le graphe ne porte pas "
+            "data['gene'].feature_names (graphe construit avant 2026-07-21). "
+            "Reconstruisez le graphe, ou utilisez 'all'.")
+    wanted = [s.strip() for s in str(spec).split(",") if s.strip()]
+    mask = torch.zeros(len(names), dtype=torch.bool)
+    for w in wanted:
+        hit = [i for i, n in enumerate(names) if n == w or n.startswith(w)]
+        if not hit:
+            raise ValueError(
+                f"--perturb-features : '{w}' ne correspond à aucune feature. "
+                f"Disponibles : {names}")
+        mask[hit] = True
+    if bool(mask.all()):
+        return None
+    return mask
+
+
 def apply_perturbation(data, target_idx: torch.Tensor, mode: str, factor: float,
                        ko_mode: str = "mask", ko_soft_factor: float = 0.1,
                        kd_factor: float = 0.15, ko_edge_factor: float = 1.0,
-                       legacy: bool = False):
+                       legacy: bool = False, feature_mask=None):
     """Apply a knockdown / knockout / overexpression to the target genes.
 
     Sémantique V5.5 (refactor 2026-06-04, biologiquement monotone
@@ -513,9 +548,19 @@ def apply_perturbation(data, target_idx: torch.Tensor, mode: str, factor: float,
         legacy      : si True, restaure le comportement V3.3-V5.4
                       (KD: feature→0 ; KO: feature→0 + cut arêtes). Flag
                       temporaire en attendant la validation expérimentale.
+        feature_mask : bool tensor (n_features,) restreignant la perturbation à
+                      un SOUS-ENSEMBLE de colonnes (cf. `resolve_feature_mask`).
+                      None (défaut) = toutes les colonnes, comportement
+                      historique. Motivation : perturber TOUT le vecteur scale
+                      aussi is_tf / ppi_degree / has_humess — un KO ne devrait
+                      pas rendre un gène « moins TF » ni baisser son degré PPI —
+                      et, avec --de-features, écrase les colonnes DE, confondant
+                      « KO » et « je retire l'évidence différentielle ». Le
+                      masquage des ARÊTES (ko_mode) est indépendant de ce masque.
     """
     pert = data.clone()
     x = pert["gene"].x.clone()
+    x_before = x.clone() if feature_mask is not None else None
     if legacy:
         # --- Comportement historique V3.3-V5.4 ---
         if mode == "knockdown":
@@ -539,6 +584,12 @@ def apply_perturbation(data, target_idx: torch.Tensor, mode: str, factor: float,
                 x[target_idx] = 0.0
         else:
             raise ValueError(f"unknown mode: {mode}")
+    # Restore the untouched columns for the targeted genes: every branch above
+    # writes the whole row, so the mask is applied once, here, uniformly.
+    if feature_mask is not None:
+        keep = ~feature_mask.to(x.device)
+        x[target_idx.unsqueeze(1), keep.nonzero(as_tuple=True)[0]] = \
+            x_before[target_idx.unsqueeze(1), keep.nonzero(as_tuple=True)[0]]
     pert["gene"].x = x
 
     # Gestion des arêtes pour le KO :
@@ -1496,7 +1547,7 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
                           include_details=False,
                           ko_mode="mask", ko_soft_factor=0.1,
                           kd_factor=0.15, ko_edge_factor=1.0, legacy=False,
-                          axes_transition=None):
+                          axes_transition=None, feature_mask=None):
     """Run a single perturbation and return its summary dict.
 
     Args:
@@ -1534,7 +1585,7 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
                                    ko_soft_factor=ko_soft_factor,
                                    kd_factor=kd_factor,
                                    ko_edge_factor=ko_edge_factor,
-                                   legacy=legacy)
+                                   legacy=legacy, feature_mask=feature_mask)
     pert = compute_importance(model, pert_data, spec)
     pert_imp = pert["importance"]
     pert_rank = rankdata(-pert_imp, method="ordinal").astype(int)

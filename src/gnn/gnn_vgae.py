@@ -133,6 +133,8 @@ COEXPR_MODE         = _CFG.COEXPR_MODE
 COEXPR_DIFFERENTIAL = _CFG.COEXPR_DIFFERENTIAL
 EDGE_TYPE_WEIGHTS   = _CFG.EDGE_TYPE_WEIGHTS
 GENE_FEATURE_FLAGS  = _CFG.GENE_FEATURE_FLAGS
+USE_EXPR_NODE_FEATURES   = _CFG.USE_EXPR_NODE_FEATURES
+EXPR_NODE_FEATURE_PREFIX = _CFG.EXPR_NODE_FEATURE_PREFIX
 OMNIPATH_EXTRA_EDGES = _CFG.OMNIPATH_EXTRA_EDGES
 RUN_TAG             = _CFG.RUN_TAG
 
@@ -403,7 +405,7 @@ def download_if_absent(url, local_path, label=""):
 # la signature (mtime+taille), tout changement de jeu de données — donc de
 # NB DE GÈNES — invalide le cache. n_genes est stocké et ré-affiché au
 # chargement pour vérification → jamais de graphe obsolète réutilisé.
-_CACHE_VARS = ["CELL_GROUPS", "_COEXPR_DIM", "_dst", "_f", "_g", "_src", "b", "cell_group_features", "coexpr_dst", "coexpr_src", "coexpr_w_tensor", "col", "data", "edge_attr_cocat", "edge_attr_expresses", "edge_attr_ppi", "edge_attr_reactome_fi", "edge_attr_regulates", "edge_attr_signaling", "edge_attr_tf_curated", "edge_index_cocat", "edge_index_coexpr", "edge_index_expresses", "edge_index_pathway", "edge_index_ppi", "edge_index_reactome_fi", "edge_index_regulates", "edge_index_signaling", "edge_index_tf_curated", "f", "g", "gene_features", "gene_symbols", "gene_to_idx", "group_stats", "grp", "i", "idx", "j", "line", "mask", "mean_expr_per_group", "mu", "n_genes", "omnipath_endpoints", "op_sig_dst", "op_sig_src", "op_tf_dst", "op_tf_src", "pair", "parts", "ppi_dst", "ppi_src", "react_dst", "react_src", "reactome_fi_dst", "reactome_fi_src", "reg_dst", "reg_src", "SUP_LABELS", "score", "sign", "std", "target"]
+_CACHE_VARS = ["CELL_GROUPS", "_COEXPR_DIM", "_dst", "_f", "_g", "_src", "b", "cell_group_features", "coexpr_dst", "coexpr_src", "coexpr_w_tensor", "col", "data", "edge_attr_cocat", "edge_attr_expresses", "edge_attr_ppi", "edge_attr_reactome_fi", "edge_attr_regulates", "edge_attr_signaling", "edge_attr_tf_curated", "edge_index_cocat", "edge_index_coexpr", "edge_index_expresses", "edge_index_pathway", "edge_index_ppi", "edge_index_reactome_fi", "edge_index_regulates", "edge_index_signaling", "edge_index_tf_curated", "f", "g", "gene_features", "gene_symbols", "gene_to_idx", "group_stats", "grp", "i", "idx", "j", "line", "mask", "mean_expr_per_group", "mu", "n_genes", "omnipath_endpoints", "op_sig_dst", "op_sig_src", "op_tf_dst", "op_tf_src", "pair", "parts", "ppi_dst", "ppi_src", "react_dst", "react_src", "reactome_fi_dst", "reactome_fi_src", "reg_dst", "reg_src", "score", "sign", "std", "target"]
 import hashlib as _hashlib
 def _mtime_sig(_p):
     try:

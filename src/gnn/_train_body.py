@@ -62,9 +62,10 @@ from _vgae_model import (  # noqa: E402  (import mid-module : après le catalogu
 # =============================================================================
 # Les FEATURES DE (--de-features) sont construites AU BUILD DU GRAPHE
 # (_graph_build_body) — plus rien à concaténer ici. Ce bloc ne sert qu'à garantir
-# la présence des LABELS pour la tête : ils arrivent déjà via SUP_LABELS quand
-# --de-features est ON (globals du build / cache --reuse-graph), sinon on les
-# construit ici (--supervised seul = tête sur topologie pure).
+# la présence des LABELS pour la tête. SUP_LABELS n'est PAS propagé par le build
+# (hors _CACHE_VARS : il casserait le dépicklage du cache --reuse-graph, cf. le
+# commentaire dans _graph_build_body) → on le reconstruit ici quand --supervised.
+# Chemin identique en build frais et en cache réutilisé.
 SUP_LABELS = globals().get("SUP_LABELS")
 if getattr(CLI_ARGS, "supervised", False) and SUP_LABELS is None:
     import sys as _sys_sup

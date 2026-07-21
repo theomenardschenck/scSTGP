@@ -1396,7 +1396,34 @@ if MODULES["use_omnipath_node_features"]:
 # is untouched when OFF. These deliberately BREAK the anti-circularity invariant
 # — that is the point of the circular-ceiling pole. Because they are built here,
 # --de-features invalidates the graph cache and shows up in RUN_TAG ('de-feat').
-# SUP_LABELS is exported so --supervised reuses it without rebuilding.
+# V6.3 (opt-in, --expr-features) : RAW mean expression per cell group as node
+# features, APPENDED before the DE block. Unlike the DE features below this is a
+# LEVEL, not a P4-vs-P16 contrast — it does not put the readout axis directly in
+# the encoder. It fills a real gap: expression otherwise lives ONLY on the
+# `expresses` edges, so a KO/KD/OE scales is_tf/ppi_degree and never touches the
+# gene's expression. Values are z-scored across genes PER GROUP: the biology of
+# interest is which genes stand out within a state, and a raw library-size
+# difference between groups would otherwise dominate. Flags are registered here
+# because the names follow CELL_GROUPS (dataset-dependent).
+if USE_EXPR_NODE_FEATURES:
+    _expr_names = []
+    for _gi, _grp in enumerate(CELL_GROUPS):
+        _col = mean_expr_per_group[_gi].astype(np.float32)
+        _z = (_col - _col.mean()) / (_col.std() + 1e-8)
+        _name = f"{EXPR_NODE_FEATURE_PREFIX}{_grp}"
+        # Register the flag lazily, honouring --exclude-features.
+        GENE_FEATURE_FLAGS[_name] = _name not in _EXCLUDED_FEATURES
+        _FEATURE_VECTORS.append((_name, _z.astype(np.float32)))
+        _expr_names.append(_name)
+    print(f"  [expr-feat] +{len(_expr_names)} features d'expression BRUTE "
+          f"(z-score par groupe) {_expr_names}")
+
+# SUP_LABELS stays LOCAL to the build (deliberately OUT of _CACHE_VARS): the
+# --reuse-graph pickler would serialise it together with its class, and
+# unpickling from gnn_vgae.py — whose sys.path does not yet include
+# src/data/preprocess at that point — raises ModuleNotFoundError, making the
+# WHOLE cache unreadable ("cache illisible" → full rebuild every run). The head
+# (--supervised) rebuilds its labels from the CSVs instead; that is cheap.
 SUP_LABELS = None
 if getattr(CLI_ARGS, "de_features", False):
     import sys as _sys_de
@@ -1466,8 +1493,12 @@ print("=" * 70)
 data = HeteroData()
 
 # --- Noeuds ---
-data["gene"].x = gene_features            # (n_genes, 8)
+data["gene"].x = gene_features            # (n_genes, n_active_features)
 data["gene"].num_nodes = n_genes
+# Column names travel WITH the graph so downstream consumers can address feature
+# columns by name instead of by a hard-coded index — required by
+# `apply_perturbation(..., feature_mask=)` to perturb e.g. expression only.
+data["gene"].feature_names = list(_active_feature_names)
 data["cell_group"].x = cell_group_features  # (5, 3)
 data["cell_group"].num_nodes = len(CELL_GROUPS)
 

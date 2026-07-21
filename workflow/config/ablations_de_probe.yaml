@@ -1,0 +1,65 @@
+# ===========================================================================
+# ablations_de_probe.yaml — V6.2 probe: what is the CIRCULAR CEILING?
+#
+# Context (LOG §25). On the stripped graph the targets are on-axis but
+# low-amplitude (SYNJ2 |cos|=0.85, rank #26 under amp x cos_brut, #134 under
+# degree-stratified |cos|). The signal IS there -> the weakness is the readout,
+# not an empty graph. Injecting DE into the ENCODER would therefore trade the
+# anti-circularity backbone for a problem that does not exist.
+#
+# This profile runs it anyway, ON PURPOSE, as a labelled CEILING: how high can
+# the ranking go if we allow ourselves to cheat? The gap pure <-> circular is
+# itself a result (it quantifies how much of the ranking the DE alone buys).
+# It is NOT a headline config and must never be reported as one.
+#
+# A/B/C by design — one run proves nothing. All arms are identical except the
+# feature flag, so each delta is attributable to that flag alone:
+#   * pure-dir-nodrug       control  (topology only, FI corrected, no druggability)
+#   * pure-dir-nodrug-de    ceiling  (same + DE stats  = P4-vs-P16 CONTRAST)
+#   * pure-dir-nodrug-expr  middle   (same + raw expr = per-group LEVEL)
+#
+# The third arm (2026-07-21) separates two things the DE arm conflates. log2FC
+# hands the encoder the readout axis itself; raw per-group expression only says
+# "how much is this gene expressed in each state". If -expr recovers most of the
+# -de gain, the ceiling is mostly about expression LEVEL, not about the
+# contrast — a much weaker circularity claim. Read it together with the N4 null
+# (features -> mean): a gain that N4 abolishes lives in the features, not in the
+# propagation.
+#
+# Druggability node features (op_druggable / op_drug_records) are dropped in
+# BOTH arms: they are a SELECTION prior, so ranking druggable targets with
+# druggability as input is circular on the actionability axis (target.md §15) --
+# the same objection we make to coexpr on the DE axis.
+#
+# Usage (detached! the orchestrator must survive to submit downstream jobs):
+#   tmux new -s deprobe
+#   scripts/run_omnipath_ablation_wave.sh workflow/config/ablations_de_probe.yaml \
+#       --profile workflow/profiles/slurm -j 8 --parallel 2
+# ===========================================================================
+
+root_tag: "deprobe"
+seed: 1                  # probe = 1 seed; no cross-seed claim is made from it
+
+decoy: true
+decoy_random_axis: 20
+decoy_random_axis_seed: 0
+
+base_extra_flags: >-
+  --signed-message --signed-decoder --use-reactome-fi
+  --use-omnipath-signaling --use-omnipath-tf-curated
+  --use-omnipath-node-features
+  --omnipath-edges transcriptional,enzyme_substrate,ligand_receptor
+
+# NOTE: --exclude-features must appear ONCE per run (argparse keeps the last
+# occurrence), so the pure-graph exclusions and the druggability exclusions are
+# merged into a single flag here.
+_pure_nodrug: &pure >-
+  --dedup-ppi-signed remove --no-ppi
+  --exclude-features ppi_degree,reg_degree,op_druggable,op_drug_records
+  --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges
+  --reactome-fi-directed
+
+ablation_grid:
+  - {name: pure-dir-nodrug,    add_flags: *pure}                      # control
+  - {name: pure-dir-nodrug-de, add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree,op_druggable,op_drug_records --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --reactome-fi-directed --de-features"}
+  - {name: pure-dir-nodrug-expr, add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree,op_druggable,op_drug_records --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --reactome-fi-directed --expr-features"}

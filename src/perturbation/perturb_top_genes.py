@@ -147,7 +147,7 @@ def _run_perturbation_compat(model, data, gene_symbols, gene_to_idx,
                             out_dir=None, include_details=False,
                             ko_mode="mask", ko_soft_factor=0.1,
                             kd_factor=0.15, ko_edge_factor=1.0, legacy=False,
-                            axes_transition=None):
+                            axes_transition=None, feature_mask=None):
     """Wrapper to run_perturbation_once that handles rétro-compatibility.
 
     Tries to pass include_details + ko_mode (+ V5.5 kd_factor/ko_edge_factor/
@@ -175,8 +175,26 @@ def _run_perturbation_compat(model, data, gene_symbols, gene_to_idx,
             write_full=True, include_details=include_details,
             ko_mode=ko_mode, ko_soft_factor=ko_soft_factor,
             kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy,
-            axes_transition=axes_transition)
+            axes_transition=axes_transition, feature_mask=feature_mask)
     except TypeError as e:
+        # feature_mask unsupported: do NOT silently fall back — dropping the mask
+        # would perturb every feature column and quietly answer a different
+        # question than the one asked. Fail loudly instead.
+        if "feature_mask" in str(e):
+            if feature_mask is not None:
+                raise RuntimeError(
+                    "--perturb-features demandé mais le gnn_perturbation chargé "
+                    "ne supporte pas feature_mask (version antérieure au "
+                    "2026-07-21). Mettez-le à jour : retomber sur 'toutes les "
+                    "colonnes' fausserait silencieusement le résultat.") from e
+            return _run_perturbation_compat(
+                model, data, gene_symbols, gene_to_idx,
+                spec, base_imp, base_rank, z_cg_base, mu_base,
+                targets, mode, factor, top_k, fdr,
+                reactome, background, group_expr,
+                axis_global, axes_cluster, out_dir, include_details,
+                ko_mode, ko_soft_factor, kd_factor, ko_edge_factor, legacy,
+                axes_transition, feature_mask=None)
         if "axes_transition" in str(e):
             # gnn_perturbation antérieur au multi-axe transition → retry sans.
             print("[compat] gnn_perturbation sans axes_transition ; retry sans "
@@ -515,7 +533,8 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
                              quiescent_groups=None, p16_groups=None,
                              de_file: Path | None = None, de_sign: int = 1,
                              effector_axis_genes=None, device: str = "cpu",
-                             cluster_anchors=None, transition_pairs=None):
+                             cluster_anchors=None, transition_pairs=None,
+                             perturb_features=None):
     """Load the VGAE run + compute the shared baseline once.
 
     Imports gnn_perturbation lazily so the subprocess TOP-N mode doesn't
@@ -535,6 +554,7 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
         load_run, prepare_baseline,
         load_reactome_gmt as _load_gmt,
         load_background as _load_bg,
+        resolve_feature_mask as _resolve_feature_mask,
     )
     data, model, gene_symbols, gene_to_idx, baseline, group_expr = load_run(
         run_dir, hidden, latent, n_layers, n_heads, device=device)
@@ -548,6 +568,15 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
         quiescent_groups=quiescent_groups, p16_groups=p16_groups,
         effector_axis_genes=effector_axis_genes,
         cluster_anchors=cluster_anchors, transition_pairs=transition_pairs)
+    # V6.3 : restrict the perturbation to a subset of feature columns (e.g.
+    # expression only). Resolved ONCE against the graph's feature_names; an
+    # unmatched spec raises here rather than silently perturbing everything.
+    feature_mask = _resolve_feature_mask(data, perturb_features)
+    if feature_mask is not None:
+        _fn = list(getattr(data["gene"], "feature_names", []))
+        _sel = [n for n, m in zip(_fn, feature_mask.tolist()) if m]
+        print(f"  [perturb-features] intervention restreinte à {len(_sel)}/"
+              f"{len(_fn)} colonnes : {_sel}")
     reactome = _load_gmt()
     background = _load_bg()
     print(f"Loaded run ({len(gene_symbols)} genes); baseline computed; "
@@ -562,6 +591,7 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
         "mu_base": mu_base, "group_expr": group_expr,
         "axis_global": axis_global, "axes_cluster": axes_cluster,
         "axes_transition": axes_transition,
+        "feature_mask": feature_mask,
         "reactome": reactome, "background": background,
     }
 
@@ -702,7 +732,8 @@ def run_all_genes(ctx: dict, modes: tuple, oe_factor: float,
                 axes_transition=ctx.get("axes_transition"),
                 out_dir=None, include_details=True,
                 ko_mode=ko_mode, ko_soft_factor=ko_soft_factor,
-                kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy)
+                kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy,
+                feature_mask=ctx.get("feature_mask"))
             if summary is None:
                 continue
             if collect_dz:
@@ -821,7 +852,8 @@ def run_all_pathways(ctx: dict, modes: tuple, oe_factor: float,
                 axes_transition=ctx.get("axes_transition"),
                 out_dir=None, include_details=True,
                 ko_mode=ko_mode, ko_soft_factor=ko_soft_factor,
-                kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy)
+                kd_factor=kd_factor, ko_edge_factor=ko_edge_factor, legacy=legacy,
+                feature_mask=ctx.get("feature_mask"))
             if summary is None:
                 continue
             rows_by_mode[mode].append(
@@ -989,6 +1021,15 @@ def main():
                          "feature=0, GARDE le graphe (corrige le bug KO-cut). "
                          "cut (legacy) = feature=0 + coupe arêtes incidentes. "
                          "soft = feature × ko_soft_factor.")
+    ap.add_argument("--perturb-features", type=str, default="all",
+                    help="V6.3 : restreint la perturbation (KO/KD/OE) à un "
+                         "SOUS-ENSEMBLE de colonnes de features, par nom ou "
+                         "préfixe (ex. 'expr' = expression brute seule, 'de' = "
+                         "features DE). Défaut 'all' = toutes les colonnes "
+                         "(comportement historique). Motivation : perturber tout "
+                         "le vecteur scale aussi is_tf/ppi_degree — un KO ne rend "
+                         "pas un gène moins TF. Un spec qui ne matche rien est "
+                         "une ERREUR (pas de repli silencieux sur 'all').")
     ap.add_argument("--ko-soft-factor", type=float, default=0.1,
                     help="Multiplicateur appliqué quand --ko-mode soft "
                          "(défaut 0.1).")
@@ -1169,7 +1210,8 @@ def main():
                                        de_file=args.de_file, de_sign=args.de_sign,
                                        effector_axis_genes=_eff, device=args.device,
                                        cluster_anchors=_anchors,
-                                       transition_pairs=_trans)
+                                       transition_pairs=_trans,
+                                       perturb_features=args.perturb_features)
         _suffix = args.out_suffix  # "" si non fourni → comportement V3 inchangé
         # Subset in-process (--genes-file/--extra-genes) : perturbe une liste
         # choisie AVEC l'axe DE (test concordance). Sinon None → tous les gènes.

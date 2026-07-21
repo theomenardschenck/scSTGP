@@ -349,6 +349,23 @@ def parse_cli_args(argv=None):
     # la perturbation Δμ standard) ; --de-features AJOUTE les stats DE aux nœuds
     # (circulaire) ; --supervised attache EN PLUS une tête de classification
     # entraînée CONJOINTEMENT (multi-tâche). Les deux activables indépendamment.
+    # --- V6.3 : RAW expression as node features (distinct from --de-features) ---
+    # A LEVEL per cell group (mean expression in P4, c0..c3), not a P4-vs-P16
+    # CONTRAST: it does not hand the encoder the readout axis the way log2FC
+    # does. Motivation: today NO node feature carries expression at all — it
+    # lives only on the `expresses` edges — so perturbing a gene scales is_tf /
+    # ppi_degree and never its expression. Pair with `--perturb-features expr`
+    # (gnn_perturbation) to intervene on expression ONLY.
+    p.add_argument("--expr-features", dest="expr_features", action="store_true",
+                   default=False,
+                   help="V6.3 : ajoute l'expression moyenne BRUTE par cell_group "
+                        "comme features de nœud (expr_<group>). Niveau, pas "
+                        "contraste → moins circulaire que --de-features, mais "
+                        "l'axe reste partiellement lisible depuis les features "
+                        "(à contrôler par la nulle N4). Défaut OFF.")
+    p.add_argument("--no-expr-features", dest="expr_features",
+                   action="store_false",
+                   help="Désactive explicitement les features d'expression brute.")
     p.add_argument("--de-features", dest="de_features", action="store_true",
                    default=False,
                    help="V-sup : injecte les features DE de nœud (log2FC global/par "
@@ -415,6 +432,10 @@ def derive_config(args):
         COEXPR_DIFFERENTIAL=ns["COEXPR_DIFFERENTIAL"],
         EDGE_TYPE_WEIGHTS=ns["EDGE_TYPE_WEIGHTS"],
         GENE_FEATURE_FLAGS=ns["GENE_FEATURE_FLAGS"],
+        # V6.3 : raw-expression node features. Their names depend on CELL_GROUPS
+        # (dataset-dependent), so the build registers the flags itself.
+        USE_EXPR_NODE_FEATURES=ns["USE_EXPR_NODE_FEATURES"],
+        EXPR_NODE_FEATURE_PREFIX=ns["EXPR_NODE_FEATURE_PREFIX"],
         OMNIPATH_EXTRA_EDGES=ns["OMNIPATH_EXTRA_EDGES"],
         RUN_TAG=ns["RUN_TAG"],
     )

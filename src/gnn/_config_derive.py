@@ -77,6 +77,14 @@ for _f in _OMNIPATH_NODE_FEATURES:
     GENE_FEATURE_FLAGS[_f] = _feature_enabled(
         _f, MODULES["use_omnipath_node_features"])
 
+# V6.3 : RAW per-group expression as node features (--expr-features). Distinct
+# from the DE features below: a LEVEL, not a P4-vs-P16 CONTRAST, so it does not
+# hand the encoder the readout axis the way log2FC does. Names are derived from
+# CELL_GROUPS at build time (expr_<group>); the flags are registered lazily there
+# because CELL_GROUPS is dataset-dependent (env GNN_CELL_GROUPS).
+EXPR_NODE_FEATURE_PREFIX = "expr_"
+USE_EXPR_NODE_FEATURES = bool(getattr(CLI_ARGS, "expr_features", False))
+
 # V-sup : CIRCULAR DE node features (--de-features). Built at GRAPH BUILD time
 # like every other node feature, so the graph cache signature and the run tag
 # both reflect them. Order must match SupervisedLabels.de_feature_names().
@@ -142,6 +150,7 @@ def _build_run_tag():
     if MODULES["use_omnipath_node_features"]: parts.append("op-nodefeat")
     # V-sup : circularity must be visible in the run name — a run WITH DE
     # features never shares a directory with an anti-circular one.
+    if USE_EXPR_NODE_FEATURES:                   parts.append("expr-feat")
     if getattr(CLI_ARGS, "de_features", False):  parts.append("de-feat")
     if getattr(CLI_ARGS, "supervised", False):   parts.append("sup")
     if OMNIPATH_EXTRA_EDGES:
