@@ -89,7 +89,30 @@ perturbation:
   # (group, gene, weight) — un centroïde pondéré par cell_group. Relatif à data_root
   # ou absolu. "" → défaut data/gnn_data/ahn_cluster_anchors.tsv (Ahn 2025).
   cluster_anchors_file: ""
-  cache_delta_z: true       # défaut ON : persiste le cache Δz → re-projection d'axes
+  cache_delta_z: true
+
+  # ── F1 (FUT §2.8) : ESTIMATEUR de l'axe global — mêmes pôles, direction
+  #    dérivée autrement. Deux réglages DISTINCTS :
+  #  axis_method         = l'estimateur du driver_score HEADLINE, figé à la
+  #                        perturbation. Le changer change LE résultat publié.
+  #  axis_method_compare = liste re-projetée APRÈS coup depuis le cache Δz
+  #                        (reproject_axes.py) : aucune re-perturbation,
+  #                        ~secondes. Voie à privilégier — donne « N définitions
+  #                        d'axe × mêmes drivers » sans engager le headline.
+  #    diff = différence de centroïdes (défaut historique)
+  #    lda  = direction blanchie Sw⁻¹Δμ (Fisher 1936) — corrige la covariance
+  #           que 'diff' ignore ; teste directement l'axe flottant (ASNS :
+  #           cos 0.058→0.514 selon kl1, donc l'axe PIVOTE avec les hyperparams)
+  #    cav  = normale d'un probe logistique (Kim 2018, TCAV)
+  #    pca  = PC1 du latent — NULL NON SUPERVISÉ : si 'pca' donne les mêmes
+  #           drivers que 'diff', l'axe n'apporte rien de plus que la variance
+  #           dominante du latent.
+  axis_method: diff
+  axis_method_compare: ""        # ex. "diff,lda,cav,pca" — exige cache_delta_z
+  axis_lda_shrinkage: 0.05       # 0 = LDA pur, 1 = retour à 'diff'
+  axis_cav_top_n: 500
+  axis_cav_seed: 0
+  axis_cav_permutations: 0       # null TCAV sur l'accuracy du probe ; 100 = p-value       # défaut ON : persiste le cache Δz → re-projection d'axes
                             #   ultérieure sans re-perturber (reproject_axes.py)
 
 # ── Stage 8 : agrégation cross-seed (perturb_report)

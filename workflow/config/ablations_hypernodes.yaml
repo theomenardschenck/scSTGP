@@ -63,6 +63,16 @@ decoy_n_rewires: 50
 decoy_random_axis: 20
 decoy_random_axis_seed: 0
 
+# F1 (FUT §2.8) — comparaison d'ESTIMATEURS d'axe, re-projetée depuis le cache
+# Δz : aucune re-perturbation, ~secondes. Le headline reste `diff` ; on obtient
+# en plus la table « N définitions d'axe × mêmes drivers ». `pca` est le NULL
+# NON SUPERVISÉ : s'il sort les mêmes drivers que `diff`, l'axe n'apporte rien
+# de plus que la variance dominante du latent. `lda` teste l'axe flottant
+# (ASNS : cos 0.058→0.514 selon kl1 ⇒ l'axe PIVOTE avec les hyperparamètres).
+axis_method: diff
+axis_method_compare: "diff,lda,cav,pca"
+axis_cav_permutations: 100      # null TCAV -> p-value sur l'accuracy du probe
+
 base_extra_flags: >-
   --signed-message --signed-decoder --use-reactome-fi
   --use-omnipath-signaling --use-omnipath-tf-curated

@@ -134,6 +134,16 @@ for g in grid:
         # écrits en perturbation_*_random_axis_<mode>.tsv. 0 = off. Distinct du
         # décoy N2/N4 (nulle de STRUCTURE, `decoy: true`) — les deux sont
         # complémentaires : N2 teste le voisinage, random_axis teste l'axe.
+        # F1 : estimateur d'axe. `axis_method` fige le HEADLINE ;
+        # `axis_method_compare` re-projette le cache Δz après coup (gratuit).
+        "perturbation": {
+            "axis_method": str(p.get("axis_method", "diff")),
+            "axis_method_compare": str(p.get("axis_method_compare", "")),
+            "axis_lda_shrinkage": float(p.get("axis_lda_shrinkage", 0.05)),
+            "axis_cav_top_n": int(p.get("axis_cav_top_n", 500)),
+            "axis_cav_seed": int(p.get("axis_cav_seed", 0)),
+            "axis_cav_permutations": int(p.get("axis_cav_permutations", 0)),
+        },
         "validation": {"decoy": {"enabled": bool(p.get("decoy", True)),
                                  # n>=50 obligatoire (LOG §25bis)
                                  "n_rewires": int(p.get("decoy_n_rewires", 50)),

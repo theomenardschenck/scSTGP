@@ -102,6 +102,40 @@ elif AXIS_MODE in ("effector", "manual"):
 else:
     AXIS_FLAGS = ""
 
+# ── F1 (FUT §2.8 / BIB §21.13) : ESTIMATEUR de l'axe global ─────────────────
+# Mêmes pôles, direction dérivée autrement. Deux usages DISTINCTS :
+#   * axis_method        -> l'estimateur du driver_score HEADLINE, figé à la
+#                           perturbation. "diff" = défaut historique.
+#   * axis_method_compare-> liste d'estimateurs re-projetés APRÈS coup depuis le
+#                           cache Δz (reproject_axes.py) : aucune re-perturbation,
+#                           coût ~secondes. C'est la voie à privilégier — elle
+#                           donne « N définitions d'axe × mêmes drivers » sans
+#                           multiplier les runs, et n'engage pas le headline.
+# Motivation : ASNS (cos 0.058→0.514 selon kl1) montre que l'axe PIVOTE avec les
+# hyperparamètres ; 'lda' blanchit par la covariance intra-classe, ce qui teste
+# précisément cette instabilité. 'pca' est un null NON supervisé.
+AXIS_METHOD = str(_PERT.get("axis_method", "diff")).strip() or "diff"
+if AXIS_METHOD not in ("diff", "lda", "cav", "pca"):
+    raise ValueError("perturbation.axis_method doit être diff|lda|cav|pca, "
+                     "reçu : " + AXIS_METHOD)
+_AXIS_EST_FLAGS = " ".join(filter(None, [
+    ("--axis-method " + AXIS_METHOD) if AXIS_METHOD != "diff" else "",
+    ("--axis-lda-shrinkage " + str(_PERT.get("axis_lda_shrinkage", 0.05))
+     ) if AXIS_METHOD == "lda" else "",
+    ("--axis-cav-top-n " + str(_PERT.get("axis_cav_top_n", 500))
+     + " --axis-cav-seed " + str(_PERT.get("axis_cav_seed", 0))
+     + " --axis-cav-permutations " + str(_PERT.get("axis_cav_permutations", 0))
+     ) if AXIS_METHOD == "cav" else "",
+]))
+AXIS_FLAGS = (AXIS_FLAGS + " " + _AXIS_EST_FLAGS).strip()
+
+# Comparaison post-hoc (liste, vide = off). Exige le cache Δz.
+AXIS_COMPARE = str(_PERT.get("axis_method_compare", "")).strip()
+if AXIS_COMPARE and not CACHE_DELTA_Z:
+    raise ValueError("perturbation.axis_method_compare exige cache_delta_z: true "
+                     "(la comparaison re-projette le cache Δz, elle ne "
+                     "re-perturbe pas).")
+
 SCORING        = config["scoring"]
 ORA_TOP_N      = config["validation"]["ora_top_n"]
 DECOY_ON       = config["validation"]["decoy"]["enabled"]
@@ -212,6 +246,8 @@ def final_targets():
         ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_aging.tsv"),
         ANALYSIS_DIR / "report" / "SUMMARY.md",
     ]
+    if AXIS_COMPARE:
+        t.append(ANALYSIS_DIR / "axis_methods" / "axis_method_comparison.tsv")
     if DECOY_ON:
         t.append(ANALYSIS_DIR / "interpret" / "decoy_confidence.tsv")
     if CLUSTER_ANNOT:
@@ -373,6 +409,40 @@ rule aggregate_cross_seed:
         "--de-magnitude-csv {DE_CSV} --coexpr-degree-file {COEXPR} "
         "--de-significance {params.de_sig} --de-padj-max {params.padj} "
         "--de-abs-lfc-min {params.lfc} --no-signed-fanout &> {log}"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Stage 8a-bis — F1 : comparaison d'ESTIMATEURS d'axe (opt-in)
+#   Re-projette le cache Δz sur N définitions de l'axe global — AUCUNE
+#   re-perturbation, donc quelques secondes. Répond à « les mêmes drivers
+#   sortent-ils quelle que soit la façon de tracer l'axe ? », qui est le seul
+#   contrôle direct de l'axe flottant (ASNS : cos 0.058→0.514 selon kl1).
+#   'pca' sert de NULL non supervisé : s'il donne les mêmes drivers que 'diff',
+#   l'axe n'apporte rien que la variance dominante du latent ne donne déjà.
+# ──────────────────────────────────────────────────────────────────
+rule axis_method_compare:
+    """F1 — N définitions d'axe × mêmes drivers, depuis le cache Δz."""
+    input:
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+    output:
+        cmp=ANALYSIS_DIR / "axis_methods" / "axis_method_comparison.tsv",
+    params:
+        runs=[str(run_dir(s)) for s in SEEDS],
+        out_dir=ANALYSIS_DIR / "axis_methods",
+        methods=AXIS_COMPARE,
+        shrink=_PERT.get("axis_lda_shrinkage", 0.05),
+        cav_n=_PERT.get("axis_cav_top_n", 500),
+        cav_seed=_PERT.get("axis_cav_seed", 0),
+        cav_perm=_PERT.get("axis_cav_permutations", 0),
+    log:
+        LOG_DIR / "axis_method_compare.log",
+    shell:
+        "{PY_TORCH} src/perturbation/reproject_axes.py "
+        "--run-dirs {params.runs} --out {params.out_dir} "
+        "--axis-method {params.methods} "
+        "--axis-lda-shrinkage {params.shrink} "
+        "--axis-cav-top-n {params.cav_n} --axis-cav-seed {params.cav_seed} "
+        "--axis-cav-permutations {params.cav_perm} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────
