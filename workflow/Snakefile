@@ -106,6 +106,10 @@ SCORING        = config["scoring"]
 ORA_TOP_N      = config["validation"]["ora_top_n"]
 DECOY_ON       = config["validation"]["decoy"]["enabled"]
 DECOY_TOP_N    = config["validation"]["decoy"]["top_n"]
+# V6.2 (LOG §25bis) : n>=50 obligatoire — a n=3-5 les SD sont sous-estimees ~10x
+# et 3 "passages" sur 4 s'evaporent a n=50. L'ancien defaut (3) est non fiable.
+DECOY_REWIRES  = config["validation"]["decoy"].get("n_rewires", 50)
+DECOY_FROZEN   = config["validation"]["decoy"].get("frozen_axis", False)
 # Decoy d'AXE (nul de spécificité) : N axes aléatoires écrits PENDANT perturb
 # (perturbation_*_random_axis_<mode>.tsv). 0 = off. Requiert un axe (phenotypic/
 # de/effector) ; sans axe le script saute → on ne déclare l'output que si N>0.
@@ -415,12 +419,15 @@ rule perturb_decoy:
     params:
         rd=run_dir(SEEDS[0]),
         top_n=DECOY_TOP_N,
+        rewires=DECOY_REWIRES,
+        frozen=("--frozen-axis" if DECOY_FROZEN else ""),
     log:
         LOG_DIR / "perturb_decoy.log",
     shell:
         "{PY_TORCH} src/validation/explain/perturb_decoy.py confidence "
         "--run-dir {params.rd} --ranking {input.ranking} "
-        "--top-n {params.top_n} --out {output.decoy} &> {log}"
+        "--top-n {params.top_n} --n-rewires {params.rewires} {params.frozen} "
+        "--out {output.decoy} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────

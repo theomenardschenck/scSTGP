@@ -27,6 +27,10 @@ paths:
 
 # ── Calcul
 compute:
+  # V6.2 (2026-07-21, LOG §27) : OBLIGATOIRE. Sans lui, deux runs de config
+  # IDENTIQUE a seed fixe donnent rho=0.556-0.687 sur driver_score (ecart median
+  # 942 rangs) -> aucune ablation n'est interpretable. Cout : threads=1.
+  deterministic: true
   device: "cpu"            # perturbation : cpu | cuda | auto
   python: "python"         # interpréteur principal (pandas/scipy)
   python_torch: "python"   # interpréteur torch+umap (interpret_embedding / decoy)
@@ -105,10 +109,25 @@ validation:
                             #   par edge_type, partenaires+signes aléatoires ;
                             #   rule perturb_decoy → decoy_confidence.tsv). torch.
     top_n: 40
-    random_axis: 0          # decoy d'AXE : N axes unitaires aléatoires comparés à
+    n_rewires: 50           # >= 50 OBLIGATOIRE (LOG §25bis) : à n=5 les écarts-types
+                            #   sont sous-estimés ~10x (HMGB2 0.3->4.4) et 3 des 4
+                            #   « passages » s'évaporent à n=50. L'ancien défaut
+                            #   était 3 ⇒ toute colonne decoy_confidence produite
+                            #   avant 2026-07-21 est NON FIABLE.
+    frozen_axis: false      # projette la nulle sur l'axe du graphe RÉEL au lieu de
+                            #   re-dériver un axe par rewiring. Testé : ne change
+                            #   rien (LOG §26ter) — gardé comme contrôle, off.
+    random_axis: 20         # decoy d'AXE : N axes unitaires aléatoires comparés à
                             #   l'axe réel (spécificité ; 0 = off). Écrit pendant
                             #   perturb : perturbation_*_random_axis_<mode>.tsv.
-    random_axis_seed: 0
+                            #   ON PAR DÉFAUT (2026-07-21) : coût quasi nul — N
+                            #   reprojections du cache Δz déjà calculé, dans le run
+                            #   perturb existant. Contrairement à `enabled` (N2)
+                            #   qui coûte ~4000 encodages (40 gènes x 50 x 2) et
+                            #   reste donc opt-in. Les deux nulles sont
+                            #   COMPLÉMENTAIRES : N2 teste le VOISINAGE, random_axis
+                            #   teste l'AXE.
+    random_axis_seed: 0     # fixe => mêmes directions d'une ablation à l'autre
   cluster_annotation:
     enabled: true
 

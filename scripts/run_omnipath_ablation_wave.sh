@@ -118,26 +118,37 @@ for g in grid:
     tag   = f"{p['root_tag']}.{g['name']}"
     extra = (p["base_extra_flags"] + " " + g.get("add_flags", "")).split()
     extra = " ".join(extra)  # normalise les espaces
+    # V6.2 (LOG §27) : `seeds` (liste) prioritaire sur `seed` (scalaire, legacy).
+    # >=3 seeds sont OBLIGATOIRES : a seed fixe, deux runs de config IDENTIQUE
+    # donnent rho=0.556-0.687 (ecart median 942 rangs) => un single-seed ne
+    # distingue pas un effet d'ablation du bruit d'execution.
+    seeds = p.get("seeds") or [p.get("seed", 1)]
+    seeds = [int(s) for s in (seeds if isinstance(seeds, list) else [seeds])]
     cfg = {
         "models": {"vgae": {"enabled": True, "run_tag": tag,
-                            "seeds": [int(p.get("seed", 1))],
+                            "seeds": seeds,
                             "extra_flags": extra}},
-        # 1 seed/ablation → cluster_annotation (cross-seed, exige ≥2 runs)
-        # planterait et stopperait tout le pipeline. On le désactive ici.
+        # cluster_annotation exige >=2 runs : on ne l'active que si le profil
+        # fournit assez de seeds (sinon la regle plante et stoppe le pipeline).
         # decoy_random_axis : N axes aléatoires (nulle de SPÉCIFICITÉ d'axe),
         # écrits en perturbation_*_random_axis_<mode>.tsv. 0 = off. Distinct du
         # décoy N2/N4 (nulle de STRUCTURE, `decoy: true`) — les deux sont
         # complémentaires : N2 teste le voisinage, random_axis teste l'axe.
         "validation": {"decoy": {"enabled": bool(p.get("decoy", True)),
-                                 "random_axis": int(p.get("decoy_random_axis", 0)),
+                                 # n>=50 obligatoire (LOG §25bis)
+                                 "n_rewires": int(p.get("decoy_n_rewires", 50)),
+                                 "frozen_axis": bool(p.get("decoy_frozen_axis", False)),
+                                 "random_axis": int(p.get("decoy_random_axis", 20)),
                                  "random_axis_seed": int(
                                      p.get("decoy_random_axis_seed", 0))},
-                       "cluster_annotation": {"enabled": False}},
+                       "cluster_annotation": {"enabled": len(seeds) >= 2}},
     }
+    if p.get("deterministic") is not None:
+        cfg["compute"] = {"deterministic": bool(p["deterministic"])}
     fp = os.path.join(tmpd, tag.replace("/", "_") + ".yaml")
     with open(fp, "w") as fh:
         yaml.safe_dump(cfg, fh, sort_keys=False)
-    lines.append(f"{tag}\t{fp}\t{extra}")
+    lines.append(f"{tag}\t{fp}\tseeds={seeds}  {extra}")
 with open(os.path.join(tmpd, "_grid.tsv"), "w") as fh:
     fh.write("\n".join(lines) + "\n")
 print(f"[wave] {len(grid)} ablation(s) à lancer :")

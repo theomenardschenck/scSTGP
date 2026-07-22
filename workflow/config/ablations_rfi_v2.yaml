@@ -1,0 +1,76 @@
+# ===========================================================================
+# ablations_rfi_v2.yaml — V6.2 : RELANCE de la vague FI, déterministe × 3 seeds.
+#
+# POURQUOI UNE RELANCE (LOG §27). La vague `ablations_rfi.yaml` (1 seed, non
+# déterministe) est ININTERPRÉTABLE. Mesuré sur deux paires de runs de
+# configuration STRICTEMENT identique (run_config.json : 27 clés, seul `run_tag`
+# diffère), même seed :
+#     plancher de bruit   rich  rho = 0.556   |   pure  rho = 0.687
+#     effet FI mesuré     rich  rho = 0.550   |   pure  rho = 0.527
+# Sur le graphe riche, corriger la direction de reactome_fi réorganise le
+# classement EXACTEMENT autant que relancer deux fois la même config. Écart
+# médian de rang sur 11 cibles : 942 places entre deux runs identiques, contre
+# 693 entre legacy et la correction FI.
+#
+# Cause : `compute.deterministic` absent de config.yaml => GNN_DETERMINISTIC
+# jamais injecté (Snakefile:149-151). Corrigé dans config.yaml ET forcé ici.
+#
+# DEUX VERROUS, tous deux nécessaires :
+#   * deterministic: true  -> supprime le bruit d'EXÉCUTION (bit-exact à seed
+#                             fixe). Coût : threads=1, donc plus lent.
+#   * seeds: [1, 2, 3]     -> mesure la STABILITÉ. Le déterminisme seul rendrait
+#                             la vague reproductible mais toujours pas
+#                             généralisable : un single-seed reste un tirage.
+# Le jugement se fait sur la MÉDIANE cross-seed, jamais sur un seed isolé.
+#
+# LES DEUX PREMIÈRES LIGNES SONT LES CONTRÔLES : `rich-legacy` et `pure-legacy`
+# reproduisent respectivement op.base et op.all. Elles servent (a) de référence
+# apples-to-apples pour chaque delta, (b) de mesure du plancher de bruit
+# résiduel une fois le déterminisme actif — qui doit tomber à rho ~ 1.0 entre
+# deux exécutions, et dont l'écart cross-seed devient la vraie barre d'erreur.
+#
+# Usage (détaché ! l'orchestrateur doit survivre pour soumettre l'aval) :
+#   tmux new -s rfi2
+#   scripts/run_omnipath_ablation_wave.sh workflow/config/ablations_rfi_v2.yaml \
+#       --profile workflow/profiles/slurm -j 8 --parallel 2
+#   # puis, une fois fini :
+#   python src/validation/qc/pipeline_qc.py all --wave output/gnn_vgae/V6.2/output_fi
+# ===========================================================================
+
+root_tag: "rfi2"
+seeds: [1, 2, 3]         # >=3 obligatoire (LOG §27) — jugement sur la médiane
+deterministic: true      # force compute.deterministic (LOG §27)
+
+# Décoy : n>=50 OBLIGATOIRE (LOG §25bis). À n=3-5 les écarts-types sont
+# sous-estimés ~10x (HMGB2 0.3->4.4) et 3 "passages" sur 4 s'évaporent à n=50 :
+# toute colonne `decoy_confidence` produite à n=3 est non fiable.
+decoy: true
+decoy_n_rewires: 50
+decoy_frozen_axis: false   # l'axe figé ne change rien (LOG §26ter) ; laissé off
+decoy_random_axis: 20      # nulle de SPÉCIFICITÉ D'AXE (distincte de N2)
+decoy_random_axis_seed: 0
+
+base_extra_flags: >-
+  --signed-message --signed-decoder --use-reactome-fi
+  --use-omnipath-signaling --use-omnipath-tf-curated
+  --use-omnipath-node-features
+  --omnipath-edges transcriptional,enzyme_substrate,ligand_receptor
+
+_pure_flags: &pure >-
+  --dedup-ppi-signed remove --no-ppi
+  --exclude-features ppi_degree,reg_degree
+  --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges
+
+ablation_grid:
+  # ── CONTRÔLES (= op.base / op.all, à reproduire) ──────────────────────────
+  - {name: rich-legacy,      add_flags: ""}
+  - {name: pure-legacy,      add_flags: *pure}
+
+  # ── Contexte A : graphe riche ─────────────────────────────────────────────
+  - {name: rich-dir,         add_flags: "--reactome-fi-directed"}
+  - {name: rich-dir-noundir, add_flags: "--reactome-fi-directed --no-reactome-fi-undirected"}
+  - {name: rich-dir-pred,    add_flags: "--reactome-fi-directed --reactome-fi-predicted"}
+
+  # ── Contexte B : graphe pur (FI = 63 % des arêtes, effet attendu max) ─────
+  - {name: pure-dir,         add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --reactome-fi-directed"}
+  - {name: pure-dir-noundir, add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --reactome-fi-directed --no-reactome-fi-undirected"}

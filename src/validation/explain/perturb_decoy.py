@@ -29,6 +29,13 @@ voisinage réelle). D'où la **colonne de confiance décoy** (mode confidence) :
     nulle : il était calculé par `_project` puis jeté (`[0]`). Colonnes
     `n2_cos_mean/n2_p_cos` (per-gene) et `decoy_confidence_cos/decoy_p_cos`
     (confidence). Coût nul — même forward.
+ 3. **`--frozen-axis`** (LOG §26bis). Par défaut la nulle re-dérive un axe sur
+    CHAQUE graphe rewiré → l'axe suit partiellement le rewiring, et la nulle
+    mélange spécificité de voisinage et dérive d'axe. Symptôme : nulle cosinus
+    à 0.15-0.50 alors que le hasard en dim 64 donne E[|cos|] ≈ 1/√64 ≈ 0.125.
+    Avec le flag, la nulle est projetée sur l'axe du graphe RÉEL (le mu de base
+    reste celui du graphe rewiré : Δz doit mesurer la PERTURBATION dans ce
+    graphe, pas le rewiring lui-même). Isole la spécificité de voisinage.
 ⚠️ N4 est non informatif sur un graphe SANS canal expression (op.all) :
    neutraliser les features y supprime l'objet même de la perturbation.
 
@@ -170,13 +177,26 @@ def run_per_gene(args):
             # The cosine is the statistic that actually separates the targets
             # (SYNJ2 |cos|=0.85 vs TP53 0.05), and it had NO null at all. Both
             # values are produced by the same forward pass, so this is free.
-            _n = [_project(model, dr, idx, mode, mb, agr, acr, gx, gs)
+            # --frozen-axis (V6.2, 2026-07-21) : project the null onto the axis
+            # of the REAL graph instead of re-deriving one per rewiring. The
+            # baseline mu stays that of the rewired graph -- Delta z must measure
+            # the PERTURBATION inside that graph, not the rewiring itself -- but
+            # the direction it is read against is held fixed. Rationale: with a
+            # re-derived axis the null cosine sat at 0.15-0.50 where chance in
+            # dim 64 is E[|cos|] ~ 1/sqrt(64) = 0.125, i.e. the axis partly
+            # FOLLOWED the rewiring, conflating neighbourhood specificity with
+            # axis drift. Freezing it isolates the former (LOG §26bis).
+            _n = [_project(model, dr, idx, mode, mb,
+                           ag if args.frozen_axis else agr,
+                           ac if args.frozen_axis else acr, gx, gs)
                   for dr, (mb, agr, acr) in zip(rew_d, rew)]
             nd = np.array([v[0] for v in _n])
             nc = np.array([v[1] for v in _n])
             p = float((np.abs(nd) >= abs(rd)).mean())
             p_cos = float((np.abs(nc) >= abs(rc)).mean())
-            n4d, n4c = _project(model, dn, idx, mode, mb4, ag4, ac4, gx, gs)
+            n4d, n4c = _project(model, dn, idx, mode, mb4,
+                                ag if args.frozen_axis else ag4,
+                                ac if args.frozen_axis else ac4, gx, gs)
             print(f"{G:9s} {mode[:4]:4s} | {rd:8.1f} {rc:6.2f} | "
                   f"{nd.mean():8.1f}±{nd.std():4.1f} {p:4.2f} | "
                   f"{nc.mean():7.2f}±{nc.std():4.2f} {p_cos:5.2f} | "
@@ -184,7 +204,8 @@ def run_per_gene(args):
             rows.append(dict(gene=G, mode=mode, real=rd, cos=rc,
                              n2_mean=nd.mean(), n2_sd=nd.std(), n2_p=p,
                              n2_cos_mean=nc.mean(), n2_cos_sd=nc.std(),
-                             n2_p_cos=p_cos, n4=n4d, n4_cos=n4c))
+                             n2_p_cos=p_cos, n4=n4d, n4_cos=n4c,
+                             frozen_axis=bool(args.frozen_axis)))
     if args.out:
         pd.DataFrame(rows).to_csv(args.out, sep="\t", index=False)
         print(f"[wrote] {args.out}")
@@ -208,7 +229,9 @@ def run_confidence(args):
         for s in range(args.n_rewires):
             dr = rewire(data, idx, np.random.default_rng(4000 + s))
             mb, agr, acr = _base_axis(model, dr, gx, gs)
-            _v = _project(model, dr, idx, args.mode, mb, agr, acr, gx, gs)
+            _v = _project(model, dr, idx, args.mode, mb,
+                          ag if args.frozen_axis else agr,
+                          ac if args.frozen_axis else acr, gx, gs)
             nd.append(_v[0]); nc.append(_v[1])
         nm = float(np.mean(nd))
         conf = (1.0 - abs(nm) / (abs(rd) + 1e-9)) if abs(rd) >= args.min_signal else np.nan
@@ -243,6 +266,11 @@ def main():
     g.add_argument("--modes", nargs="+", default=["knockout", "knockdown", "overexpress"])
     g.add_argument("--n-rewires", type=int, default=5)
     g.add_argument("--out", type=Path, default=None)
+    g.add_argument("--frozen-axis", action="store_true",
+                   help="project the null onto the REAL graph's axis instead "
+                        "of re-deriving one per rewiring (isolates neighbourhood "
+                        "specificity from axis drift, LOG §26bis)")
+
     g.set_defaults(func=run_per_gene)
 
     c = sub.add_parser("confidence", help="colonne de confiance décoy sur top-N")
@@ -254,6 +282,11 @@ def main():
     c.add_argument("--min-signal", type=float, default=5.0,
                    help="|proj_réel| min pour calculer la confiance (sinon NaN).")
     c.add_argument("--out", type=Path, required=True)
+    c.add_argument("--frozen-axis", action="store_true",
+                   help="project the null onto the REAL graph's axis instead "
+                        "of re-deriving one per rewiring (isolates neighbourhood "
+                        "specificity from axis drift, LOG §26bis)")
+
     c.set_defaults(func=run_confidence)
 
     args = ap.parse_args()
