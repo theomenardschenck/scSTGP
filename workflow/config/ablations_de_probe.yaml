@@ -38,7 +38,11 @@
 # ===========================================================================
 
 root_tag: "deprobe"
-seed: 1                  # probe = 1 seed; no cross-seed claim is made from it
+seeds: [1, 2, 3]          # 3 seeds MANDATORY: at fixed seed, two runs of an
+                         # IDENTICAL config give rho=0.556-0.687 (median gap
+                         # 942 ranks). The first pass of this probe ran at 1
+                         # seed and gave rho(control, expr)=0.693 -- inside
+                         # that noise floor, so nothing was interpretable.
 
 decoy: true
 decoy_random_axis: 20

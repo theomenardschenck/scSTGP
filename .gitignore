@@ -1,6 +1,11 @@
 # ── Outputs et données (jamais versionnés) ──────────────────────────
 output/
-data/
+# `data/` ancré à la racine, MÊME RAISON que `/figures/` ci-dessous : non ancré,
+# il ignorait aussi `src/data/` — donc 6 fichiers SOURCE (les 4 loaders V6 +
+# build_supervised_labels.py + matrix_to_de.R) n'étaient pas versionnés, donc
+# absents du cluster. Le bras --de-features de la vague deprobe a crashé là-dessus
+# (ModuleNotFoundError: build_supervised_labels). Corrigé 2026-07-22.
+/data/
 # `figures/` ancré à la racine : sinon il ignore aussi le code source
 # src/validation/figures/ (les figures de sortie vivent sous output/).
 /figures/
