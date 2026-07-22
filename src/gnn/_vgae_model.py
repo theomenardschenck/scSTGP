@@ -82,10 +82,15 @@ class HeteroEncoder(nn.Module):
         (("gene", "tf_curated_by", "gene"), 2),
         (("gene", "reactome_fi", "gene"), 2),  # V4.2
         (("gene", "reactome_fi_undirected", "gene"), 2),  # V6.2 (orientation inconnue)
+        # V6.3 hypernœuds : le complexe devient un NŒUD, pas une clique. Une
+        # arête par membre (étoile) au lieu de n(n-1)/2 arêtes deux-à-deux.
+        (("gene", "member_of", "complex"), 1),
+        (("complex", "has_member", "gene"), 1),
     ] + [(("gene", _et, "gene"), 2) for _et in OMNIPATH_EXTRA_EDGE_TYPES]  # V6
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
                  n_heads=4, dropout=0.2, available_edge_types=None,
+                 complex_in=None,
                  edge_dim_overrides=None, edge_type_weights=None,
                  signed_message=False, signed_edge_types=None):
         super().__init__()
@@ -100,6 +105,11 @@ class HeteroEncoder(nn.Module):
 
         self.gene_proj = nn.Linear(gene_in, hidden)
         self.cell_proj = nn.Linear(cell_in, hidden)
+        # V6.3 : projection du type `complex`, créée SEULEMENT si le graphe en
+        # contient -> aucun paramètre supplémentaire dans un run legacy, donc
+        # les checkpoints existants restent chargeables en strict=True.
+        self.complex_proj = (nn.Linear(complex_in, hidden)
+                             if complex_in is not None else None)
 
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -153,20 +163,24 @@ class HeteroEncoder(nn.Module):
                 _g = self.edge_gammas.get(et, 1.0)
                 conv_dict[et] = (_ScaledConv(_gat, _g) if _g != 1.0 else _gat)
             self.convs.append(HeteroConv(conv_dict, aggr="sum"))
-            self.norms.append(nn.ModuleDict({
-                "gene": nn.BatchNorm1d(hidden),
-                "cell_group": nn.BatchNorm1d(hidden),
-            }))
+            _norms = {"gene": nn.BatchNorm1d(hidden),
+                      "cell_group": nn.BatchNorm1d(hidden)}
+            if self.complex_proj is not None:
+                _norms["complex"] = nn.BatchNorm1d(hidden)
+            self.norms.append(nn.ModuleDict(_norms))
 
         self.dropout = nn.Dropout(dropout)
         self.mu_head = nn.Linear(hidden, latent)
         self.logvar_head = nn.Linear(hidden, latent)
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict=None):
-        x_dict = {
+        _x = {
             "gene": F.relu(self.gene_proj(x_dict["gene"])),
             "cell_group": F.relu(self.cell_proj(x_dict["cell_group"])),
         }
+        if self.complex_proj is not None and "complex" in x_dict:
+            _x["complex"] = F.relu(self.complex_proj(x_dict["complex"]))
+        x_dict = _x
 
         for i in range(self.n_layers):
             x_prev = {k: v.clone() for k, v in x_dict.items()}

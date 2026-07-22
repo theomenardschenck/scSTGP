@@ -94,6 +94,10 @@ if getattr(CLI_ARGS, "de_features", False) or getattr(CLI_ARGS, "supervised", Fa
 encoder = HeteroEncoder(
     gene_in=gene_features.shape[1],       # n features actives (modulaire)
     cell_in=cell_group_features.shape[1],  # 3 features de groupe
+    # V6.3 : None si le graphe n'a pas de complexes -> aucun paramètre créé,
+    # donc un run legacy reste bit-identique et strict=True continue de passer.
+    complex_in=(data["complex"].x.shape[1]
+                if "complex" in data.node_types else None),
     hidden=HIDDEN_DIM,                     # 128 (dimension cachée)
     latent=LATENT_DIM,                     # 64 (dimension de l'espace latent)
     n_layers=N_LAYERS,                     # 3 couches de message passing
@@ -339,6 +343,8 @@ optimizer = torch.optim.Adam(_opt_params, lr=LR, weight_decay=1e-4)
 # des VGAE : l'encoder a accès au graphe complet pour le message passing,
 # mais la supervision (loss) est calculée uniquement sur les arêtes train/test.
 x_dict = {"gene": data["gene"].x, "cell_group": data["cell_group"].x}
+if "complex" in data.node_types:                      # V6.3
+    x_dict["complex"] = data["complex"].x
 edge_index_dict = {}
 edge_attr_dict = {}   # features d'arête passées aux GATConv via edge_dim
 # Boucle dynamique sur tous les edge_types présents dans le graphe (modularité

@@ -240,10 +240,15 @@ class HeteroEncoder(nn.Module):
         (("gene", "tf_curated_by", "gene"), 2),
         (("gene", "reactome_fi", "gene"), 2),  # V4.2
         (("gene", "reactome_fi_undirected", "gene"), 2),  # V6.2 (orientation inconnue)
+        # V6.3 hypernœuds : le complexe devient un NŒUD, pas une clique. Une
+        # arête par membre (étoile) au lieu de n(n-1)/2 arêtes deux-à-deux.
+        (("gene", "member_of", "complex"), 1),
+        (("complex", "has_member", "gene"), 1),
     ] + [(("gene", _et, "gene"), 2) for _et in OMNIPATH_EXTRA_EDGE_TYPES]  # V6
 
     def __init__(self, gene_in, cell_in, hidden, latent, n_layers,
                  n_heads=4, dropout=0.2, available_edge_types=None,
+                 complex_in=None,
                  edge_dim_overrides=None,
                  signed_message=False, signed_edge_types=None):
         super().__init__()
@@ -251,6 +256,11 @@ class HeteroEncoder(nn.Module):
         head_dim = hidden // n_heads
         self.gene_proj = nn.Linear(gene_in, hidden)
         self.cell_proj = nn.Linear(cell_in, hidden)
+        # V6.3 : projection du type `complex`, créée SEULEMENT si le graphe en
+        # contient -> aucun paramètre supplémentaire dans un run legacy, donc
+        # les checkpoints existants restent chargeables en strict=True.
+        self.complex_proj = (nn.Linear(complex_in, hidden)
+                             if complex_in is not None else None)
         # V5 (TIER 1c.2) : flag SignedGATConv pour edge_types signés.
         self._signed_message = bool(signed_message)
         self._signed_edge_types = set(
@@ -304,10 +314,11 @@ class HeteroEncoder(nn.Module):
                 else:
                     conv_dict[et] = GATConv(hidden, head_dim, **conv_kwargs)
             self.convs.append(HeteroConv(conv_dict, aggr="sum"))
-            self.norms.append(nn.ModuleDict({
-                "gene": nn.BatchNorm1d(hidden),
-                "cell_group": nn.BatchNorm1d(hidden),
-            }))
+            _norms = {"gene": nn.BatchNorm1d(hidden),
+                      "cell_group": nn.BatchNorm1d(hidden)}
+            if self.complex_proj is not None:
+                _norms["complex"] = nn.BatchNorm1d(hidden)
+            self.norms.append(nn.ModuleDict(_norms))
         self.dropout = nn.Dropout(dropout)
         self.mu_head = nn.Linear(hidden, latent)
         self.logvar_head = nn.Linear(hidden, latent)
@@ -317,10 +328,13 @@ class HeteroEncoder(nn.Module):
         self.last_cell_group_h: torch.Tensor | None = None
 
     def forward(self, x_dict, edge_index_dict, edge_attr_dict=None):
-        x_dict = {
+        _x = {
             "gene": F.relu(self.gene_proj(x_dict["gene"])),
             "cell_group": F.relu(self.cell_proj(x_dict["cell_group"])),
         }
+        if self.complex_proj is not None and "complex" in x_dict:
+            _x["complex"] = F.relu(self.complex_proj(x_dict["complex"]))
+        x_dict = _x
         for i in range(self.n_layers):
             x_prev = {k: v.clone() for k, v in x_dict.items()}
             active = {k: v for k, v in edge_index_dict.items() if v.numel() > 0}
@@ -392,6 +406,8 @@ class VGAE(nn.Module):
 def compute_importance(model, data, baseline_specificity):
     model.eval()
     x_dict = {"gene": data["gene"].x, "cell_group": data["cell_group"].x}
+    if "complex" in data.node_types:                    # V6.3
+        x_dict["complex"] = data["complex"].x
     edge_index_dict = {k: data[k].edge_index for k in data.edge_types}
     edge_attr_dict = {
         k: data[k].edge_attr
@@ -760,6 +776,153 @@ def cell_group_shift_gene_weighted(mu_base: np.ndarray,
 
 
 # --------------------------------------------------------------------------- #
+# Alternative axis definitions (FUT §2.8 family F1 / BIB §21.13).
+#
+# The default axis is a difference of expression-weighted centroids
+# `unit(c_sene - c_prolif)`. That estimator is the Fisher discriminant ONLY when
+# the within-class covariance is isotropic; otherwise the direction is biased,
+# which is the suspected mechanism behind the floating-axis case (ASNS, FUT
+# §7.8). These variants re-derive the SAME pole contrast with a different
+# estimator, so `driver_score` stays comparable:
+#   * "lda"  whitened direction  Sw^-1 (c_sene - c_prolif)   (Fisher 1936 ;
+#            Park et al. 2024 causal inner product / whitening)
+#   * "cav"  normal of a logistic probe separating the two poles, i.e. a
+#            Concept Activation Vector (Kim et al. 2018, TCAV)
+#   * "pca"  dominant principal component of the latent (unsupervised NULL:
+#            "is the senescence axis merely PC1?"), sign-oriented on the diff axis
+# Scope: these apply to `axis_global` ONLY (like `effector_axis_genes`);
+# `axes_cluster` / `axes_transition` stay difference-based.
+# --------------------------------------------------------------------------- #
+AXIS_METHODS = ("diff", "lda", "cav", "pca")
+
+
+def _weighted_mean_scatter(X: np.ndarray, w: np.ndarray):
+    """Weighted mean and weighted (centred) scatter matrix of one class.
+
+    Returns (mean, scatter, weight_sum). Weights must be non-negative; they are
+    the per-gene expression in the pole's cell groups, so the mean reproduces
+    the existing `centers[g]` exactly.
+    """
+    ws = float(w.sum()) + 1e-8
+    m = (w[:, None] * X).sum(axis=0) / ws
+    Xc = X - m
+    S = (Xc * w[:, None]).T @ Xc / ws
+    return m.astype(np.float32), S.astype(np.float64), ws
+
+
+def _axis_lda(mu: np.ndarray, w_anti: np.ndarray, w_pro: np.ndarray,
+              shrinkage: float = 0.05):
+    """Whitened (Fisher) direction Sw^-1 (c_pro - c_anti) with ridge shrinkage.
+
+    `shrinkage` blends the pooled within-class scatter towards a scaled
+    identity: Sw_reg = (1-a)*Sw + a*(tr(Sw)/d)*I. a=0 is plain LDA, a=1 gives
+    back the difference-of-means direction — so the parameter interpolates
+    between the current estimator and full whitening.
+    """
+    m_anti, S_anti, n_anti = _weighted_mean_scatter(mu, w_anti)
+    m_pro, S_pro, n_pro = _weighted_mean_scatter(mu, w_pro)
+    Sw = (n_pro * S_pro + n_anti * S_anti) / (n_pro + n_anti)
+    d = Sw.shape[0]
+    a = float(np.clip(shrinkage, 0.0, 1.0))
+    Sw_reg = (1.0 - a) * Sw + a * (np.trace(Sw) / d) * np.eye(d)
+    delta = (m_pro - m_anti).astype(np.float64)
+    try:
+        v = np.linalg.solve(Sw_reg, delta)
+    except np.linalg.LinAlgError:
+        print("[warn] axis lda: singular within-class scatter — "
+              "falling back to pseudo-inverse.")
+        v = np.linalg.pinv(Sw_reg) @ delta
+    return v.astype(np.float32), {"lda_shrinkage": a,
+                                  "lda_cond": float(np.linalg.cond(Sw_reg))}
+
+
+def _hard_poles(w_anti: np.ndarray, w_pro: np.ndarray, top_n: int):
+    """Turn soft expression weights into two disjoint labelled gene sets.
+
+    Genes are ranked by their DIFFERENTIAL weight (pole weight minus the mean
+    over both poles) — the same contrast the readout uses through `w_diff` —
+    and the top-N of each side are taken. Overlaps are impossible by
+    construction (the two differentials are opposite in sign).
+    """
+    ref = 0.5 * (w_anti + w_pro)
+    d_pro, d_anti = w_pro - ref, w_anti - ref
+    n = int(min(top_n, len(d_pro)))
+    pro_idx = np.argsort(-d_pro)[:n]
+    anti_idx = np.argsort(-d_anti)[:n]
+    return anti_idx, pro_idx
+
+
+def _axis_cav(mu: np.ndarray, anti_idx: np.ndarray, pro_idx: np.ndarray,
+              seed: int = 0, permutations: int = 0):
+    """Concept Activation Vector: normal of a logistic probe pro-vs-anti.
+
+    The direction is the classifier's weight vector (label 1 = pro-senescent),
+    so it already points anti -> pro. `permutations` > 0 adds a TCAV-style
+    significance test: refit on shuffled labels and compare balanced accuracy.
+    Falls back to the LDA-free difference of means if scikit-learn is absent.
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import cross_val_score
+    except ImportError:
+        print("[warn] axis cav: scikit-learn indisponible → fallback 'diff'.")
+        return None, {"cav_error": "sklearn_missing"}
+
+    X = np.concatenate([mu[anti_idx], mu[pro_idx]]).astype(np.float64)
+    y = np.concatenate([np.zeros(len(anti_idx)), np.ones(len(pro_idx))])
+    clf = LogisticRegression(max_iter=5000, C=1.0, random_state=seed)
+    # Cross-validated accuracy first: a CAV whose probe cannot separate the
+    # poles is a direction fitted to noise, so this number gates the axis.
+    try:
+        cv = float(np.mean(cross_val_score(clf, X, y, cv=5, scoring="accuracy")))
+    except Exception as exc:                                # pragma: no cover
+        print(f"[warn] axis cav: cross_val_score failed ({exc}) — cv=nan.")
+        cv = float("nan")
+    clf.fit(X, y)
+    v = clf.coef_[0].astype(np.float32)
+    info = {"cav_n_per_pole": int(len(pro_idx)), "cav_cv_accuracy": cv}
+
+    if permutations > 0:
+        rng = np.random.default_rng(seed)
+        null = []
+        for _ in range(int(permutations)):
+            yp = rng.permutation(y)
+            try:
+                null.append(float(np.mean(cross_val_score(
+                    LogisticRegression(max_iter=5000, C=1.0, random_state=seed),
+                    X, yp, cv=5, scoring="accuracy"))))
+            except Exception:                               # pragma: no cover
+                continue
+        if null:
+            null = np.asarray(null)
+            info["cav_perm_p"] = float((np.sum(null >= cv) + 1) / (len(null) + 1))
+            info["cav_perm_mean"] = float(null.mean())
+    return v, info
+
+
+def _axis_pca(mu: np.ndarray, orient_on: np.ndarray | None = None):
+    """Dominant principal component of the gene embeddings (unsupervised null).
+
+    PCA directions are defined up to sign, so the component is oriented to make
+    a positive angle with the reference (difference) axis; without a reference
+    the raw sign is kept and the pro/anti convention is NOT meaningful.
+    """
+    Xc = mu.astype(np.float64) - mu.mean(axis=0, keepdims=True)
+    # Economy SVD on (n_genes, latent) — latent is small (64), so this is cheap.
+    _u, s, vt = np.linalg.svd(Xc, full_matrices=False)
+    pc1 = vt[0]
+    var_ratio = float((s[0] ** 2) / (np.sum(s ** 2) + 1e-12))
+    info = {"pca_explained_var_ratio": var_ratio}
+    if orient_on is not None:
+        if float(np.dot(pc1, orient_on)) < 0:
+            pc1 = -pc1
+    else:
+        print("[warn] axis pca: no reference axis to orient the sign — "
+              "the pro/anti convention is arbitrary.")
+    return pc1.astype(np.float32), info
+
+
+# --------------------------------------------------------------------------- #
 # Axes sénescence (option 2 : projection signée P4 -> P16).
 # --------------------------------------------------------------------------- #
 def compute_senescence_axes(mu_base: np.ndarray,
@@ -771,8 +934,35 @@ def compute_senescence_axes(mu_base: np.ndarray,
                              quiescent_groups=None,
                              effector_axis_genes=None,
                              cluster_anchors=None,
-                             transition_pairs=None):
+                             transition_pairs=None,
+                             axis_method="diff",
+                             axis_lda_shrinkage=0.05,
+                             axis_cav_top_n=500,
+                             axis_cav_seed=0,
+                             axis_cav_permutations=0,
+                             axis_info=None):
     """Axes quiescent -> sénescent dans l'espace latent des gènes.
+
+    axis_method : {"diff","lda","cav","pca"} — estimateur de `axis_global`
+        (famille F1, FUT §2.8 / BIB §21.13). "diff" (défaut) = comportement
+        historique, strictement inchangé. Les autres re-dérivent le MÊME
+        contraste de pôles avec un estimateur différent :
+          * "lda" : direction blanchie Sw⁻¹(c_pro − c_anti) — corrige la
+            covariance intra-classe ignorée par la différence de moyennes
+            (Fisher 1936 ; Park et al. 2024). Test direct de l'axe flottant.
+          * "cav" : normale d'un probe logistique pro-vs-anti = Concept
+            Activation Vector (Kim et al. 2018) + accuracy CV (+ p-value de
+            permutation si axis_cav_permutations>0).
+          * "pca" : composante principale dominante du latent — NULL non
+            supervisé (« l'axe sénescence n'est-il que la PC1 ? »), signe
+            orienté sur l'axe diff.
+        ⚠️ S'applique à `axis_global` UNIQUEMENT ; `axes_cluster` et
+        `axes_transition` restent en différence de centroïdes.
+        Les pôles sont ceux en vigueur : listes de gènes si
+        `effector_axis_genes` est fourni, sinon les poids d'expression
+        quiescent/sénescent (mêmes centroïdes que "diff").
+    axis_info : dict optionnel rempli en place avec les diagnostics de la
+        méthode (cos_to_diff, accuracy CV, variance expliquée, …).
 
     effector_axis_genes : optionnel (pro_list, anti_list) de symboles. Si
         fourni, **axis_global est ANCRÉ sur les effecteurs** :
@@ -901,6 +1091,7 @@ def compute_senescence_axes(mu_base: np.ndarray,
 
     # Override effecteur-ancré (gnn_futur §2.2/§4b) : remplace l'axe global
     # corrélationnel par un axe causal défini sur des effecteurs canoniques.
+    hard_poles = None          # (anti_idx, pro_idx) si les pôles sont des listes
     if effector_axis_genes is not None:
         pro, anti = effector_axis_genes
         s2i = {g: i for i, g in enumerate(gene_symbols)}
@@ -910,12 +1101,72 @@ def compute_senescence_axes(mu_base: np.ndarray,
             pro_c = mu_base[pro_i].mean(axis=0)
             anti_c = mu_base[anti_i].mean(axis=0)
             axis_global = unit(pro_c - anti_c, "effector")
+            hard_poles = (np.asarray(anti_i, dtype=int),
+                          np.asarray(pro_i, dtype=int))
             print(f"  [axes] EFFECTOR-anchored axis_global : "
                   f"pro={len(pro_i)}/{len(pro)} anti={len(anti_i)}/{len(anti)} gènes "
                   f"(remplace le contraste d'expression).")
         else:
             print(f"[warn] effector axis : pro={len(pro_i)} anti={len(anti_i)} "
                   "gènes trouvés — fallback axe expression.")
+
+    # ── Estimateur alternatif de axis_global (famille F1, FUT §2.8) ──────────
+    # Le contraste de pôles est IDENTIQUE ; seule la façon de le transformer en
+    # direction change. "diff" court-circuite tout ce bloc (rétro-compat exacte).
+    if axis_method and axis_method != "diff":
+        if axis_method not in AXIS_METHODS:
+            raise ValueError(f"axis_method inconnu : {axis_method!r} "
+                             f"(attendu {AXIS_METHODS})")
+        diff_axis = axis_global.copy()
+        # Poids de pôle : indicatrices si listes de gènes, sinon expression.
+        if hard_poles is not None:
+            anti_idx, pro_idx = hard_poles
+            w_anti = np.zeros(len(gene_symbols), dtype=np.float32)
+            w_pro = np.zeros(len(gene_symbols), dtype=np.float32)
+            w_anti[anti_idx] = 1.0
+            w_pro[pro_idx] = 1.0
+        else:
+            def _pole_weight(groups):
+                cols = [f"mean_{g}" for g in groups
+                        if f"mean_{g}" in expr_by_gene.columns]
+                if not cols:
+                    return np.zeros(len(gene_symbols), dtype=np.float32)
+                return (expr_by_gene[cols].to_numpy().astype(np.float32)
+                        .mean(axis=1))
+            w_anti = _pole_weight(quiescent_list)
+            w_pro = _pole_weight(p16_list)
+            anti_idx, pro_idx = _hard_poles(w_anti, w_pro, axis_cav_top_n)
+
+        info: dict = {"axis_method": axis_method}
+        raw = None
+        if axis_method == "lda":
+            raw, _i = _axis_lda(mu_base, w_anti, w_pro, axis_lda_shrinkage)
+            info.update(_i)
+        elif axis_method == "cav":
+            raw, _i = _axis_cav(mu_base, anti_idx, pro_idx,
+                                seed=axis_cav_seed,
+                                permutations=axis_cav_permutations)
+            info.update(_i)
+        elif axis_method == "pca":
+            raw, _i = _axis_pca(mu_base, orient_on=diff_axis)
+            info.update(_i)
+
+        if raw is None or not np.isfinite(raw).all() or \
+                float(np.linalg.norm(raw)) < 1e-8:
+            print(f"[warn] axis_method='{axis_method}' n'a pas produit de "
+                  "direction exploitable — fallback 'diff'.")
+            info["fallback"] = "diff"
+        else:
+            axis_global = unit(raw, axis_method)
+            info["cos_to_diff"] = float(np.dot(axis_global, diff_axis))
+            print(f"  [axes] axis_global via '{axis_method}' : "
+                  f"cos(vs diff) = {info['cos_to_diff']:+.3f}"
+                  + (f", CV acc = {info['cav_cv_accuracy']:.3f}"
+                     if "cav_cv_accuracy" in info else "")
+                  + (f", var PC1 = {info['pca_explained_var_ratio']:.3f}"
+                     if "pca_explained_var_ratio" in info else ""))
+        if axis_info is not None:
+            axis_info.update(info)
 
     # Axes de transition inter-cluster (src -> dst). On complète `centers` pour
     # tout groupe référencé par une paire mais absent des listes quiescent/p16.
@@ -1401,6 +1652,8 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads, device="cpu"):
     encoder = HeteroEncoder(
         gene_in=data["gene"].x.shape[1],
         cell_in=data["cell_group"].x.shape[1],
+        complex_in=(data["complex"].x.shape[1]          # V6.3
+                    if "complex" in data.node_types else None),
         hidden=hidden, latent=latent, n_layers=n_layers, n_heads=n_heads,
         # V3.6 : ne créer que les GATConv pour les edge_types réellement
         # présents dans le graphe entraîné — sinon le state_dict refuse
@@ -1469,10 +1722,15 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads, device="cpu"):
 def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None,
                      quiescent_groups=None, p16_groups=None,
                      effector_axis_genes=None, cluster_anchors=None,
-                     transition_pairs=None):
+                     transition_pairs=None, axis_method="diff",
+                     axis_opts=None, axis_info=None):
     """Compute the baseline once; reused across many perturbations.
 
     Args:
+        axis_method : {"diff","lda","cav","pca"} — estimateur de `axis_global`
+            (famille F1, FUT §2.8). "diff" = historique. `axis_opts` = dict
+            optionnel (axis_lda_shrinkage / axis_cav_top_n / axis_cav_seed /
+            axis_cav_permutations) ; `axis_info` = dict rempli en place.
         quiescent_groups : optionnel. Liste de groupes côté quiescent pour
             l'axe de sénescence (V4 : ("P4", "P16_cluster_0")). Si None,
             défaut historique = ("P4",).
@@ -1528,7 +1786,9 @@ def prepare_baseline(model, data, baseline_df, gene_symbols, group_expr=None,
                               if quiescent_groups is not None else None),
             effector_axis_genes=effector_axis_genes,
             cluster_anchors=cluster_anchors,
-            transition_pairs=transition_pairs)
+            transition_pairs=transition_pairs,
+            axis_method=axis_method, axis_info=axis_info,
+            **(axis_opts or {}))
         print(f"  axis_global ‖·‖ pre-unit = {np.linalg.norm(axis_global):.4f} "
               f"(1.0 attendu post-normalisation)")
     else:

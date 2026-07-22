@@ -25,6 +25,7 @@ MODULES = {
     "omnipath_hgnc_alias":       CLI_ARGS.omnipath_hgnc_alias,
     "use_omnipath_node_features": CLI_ARGS.use_omnipath_node_features,
     "use_reactome_fi":           CLI_ARGS.use_reactome_fi,
+    "use_complex_nodes":         getattr(CLI_ARGS, "use_complex_nodes", False),  # V6.3
 }
 
 # V4.2 : mode coexpression (p16_only = V4.1 ; differential = option A).
@@ -180,9 +181,23 @@ def _build_run_tag():
         parts.append(f"q{int(CLI_ARGS.coexpr_top_quantile*1000):04d}")
     if CLI_ARGS.reactome_max_pathway != 20:
         parts.append(f"rxmax{CLI_ARGS.reactome_max_pathway}")
+    # V6.3 : les hypernœuds changent la TOPOLOGIE -> doivent entrer dans le
+    # run_tag ET dans la signature du cache de graphe, sinon un run avec
+    # complexes réutiliserait silencieusement le graphe d'un run sans.
+    if getattr(CLI_ARGS, "use_complex_nodes", False):
+        parts.append(f"cplx{getattr(CLI_ARGS, 'complex_max_size', 200)}")
+        if getattr(CLI_ARGS, "drop_fi_within_complex", False):
+            parts.append("nofi-incplx")
     base = "full" if not parts else ".".join(parts)
     # Toujours suffixer par le seed pour différencier les runs multi-seed.
     return f"{base}.s{CLI_ARGS.seed}"
 
 
 RUN_TAG = _build_run_tag()
+
+# V6.3 : hypernœuds complexes
+USE_COMPLEX_NODES     = bool(getattr(CLI_ARGS, "use_complex_nodes", False))
+COMPLEX_MAX_SIZE      = int(getattr(CLI_ARGS, "complex_max_size", 200))
+COMPLEX_MIN_SIZE      = int(getattr(CLI_ARGS, "complex_min_size", 3))
+COMPLEX_EXCLUDE_PAT   = str(getattr(CLI_ARGS, "complex_exclude_pattern", "HT_SC_Cluster"))
+DROP_FI_WITHIN_CPLX   = bool(getattr(CLI_ARGS, "drop_fi_within_complex", False))

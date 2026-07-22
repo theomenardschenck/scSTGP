@@ -279,6 +279,42 @@ def parse_cli_args(argv=None):
     # --- Exclusion fine de features de noeud gene ---
     # Liste possible : is_tf, variance, ppi_degree, reg_degree,
     #                  imp_P4, imp_P16, imp_delta, has_humess
+    # ── V6.3 : hypernœuds complexes (OmniPath `complexes`) ──────────────────
+    # Un complexe = un NŒUD relié à chacun de ses membres (étoile), au lieu de
+    # la clique n(n-1)/2 que produisent reactome_fi/same_pathway. Motivation
+    # (LOG §25) : cinq discriminants statistiques ont échoué à séparer une vraie
+    # cible d'un membre de clique (COPI/ribosome) — l'effet d'un membre est réel
+    # mais INATTRIBUABLE. Le filtre doit être structurel : on supprime la cause
+    # (le sur-comptage) au lieu de la corriger a posteriori.
+    p.add_argument("--use-complex-nodes", dest="use_complex_nodes",
+                   action="store_true", default=False,
+                   help="V6.3 : ajoute le type de nœud `complex` + arêtes "
+                        "member_of/has_member depuis OmniPath. Défaut OFF.")
+    p.add_argument("--complex-max-size", dest="complex_max_size", type=int,
+                   default=200,
+                   help="taille max d'un complexe retenu (défaut 200). Écarte "
+                        "COMPLEX:Nucleosome (11 628 membres = agrégat, pas un "
+                        "complexe) tout en GARDANT le ribosome cytoplasmique "
+                        "(161) — précisément la clique à effondrer. Un cap à 20 "
+                        "(p95) raterait la cible principale.")
+    p.add_argument("--complex-min-size", dest="complex_min_size", type=int,
+                   default=3,
+                   help="taille min (défaut 3) : à 2 membres l'étoile n'apporte "
+                        "rien de plus que l'arête directe.")
+    p.add_argument("--complex-exclude-pattern", dest="complex_exclude_pattern",
+                   default="HT_SC_Cluster",
+                   help="motifs (séparés par des virgules) exclus des noms de "
+                        "complexes. Défaut HT_SC_Cluster : 252 entrées issues de "
+                        "CLUSTERS single-cell haut-débit, pas de complexes "
+                        "biochimiques — c'est exactement l'artefact de "
+                        "co-expression que l'on cherche à retirer (l'un d'eux "
+                        "regroupe OCRL+SYNJ2 avec 39 actines/calmodulines).")
+    p.add_argument("--drop-fi-within-complex", dest="drop_fi_within_complex",
+                   action="store_true", default=False,
+                   help="supprime les arêtes reactome_fi dont les DEUX extrémités "
+                        "sont dans un même complexe actif. Sans ce flag on ajoute "
+                        "l'hypernœud SANS retirer la clique qu'il doit remplacer, "
+                        "et le sur-comptage demeure.")
     p.add_argument("--exclude-features", default="",
                    help="liste séparée par des virgules de gene_features à exclure "
                         "(parmi : is_tf, variance, ppi_degree, reg_degree, "
@@ -437,5 +473,13 @@ def derive_config(args):
         USE_EXPR_NODE_FEATURES=ns["USE_EXPR_NODE_FEATURES"],
         EXPR_NODE_FEATURE_PREFIX=ns["EXPR_NODE_FEATURE_PREFIX"],
         OMNIPATH_EXTRA_EDGES=ns["OMNIPATH_EXTRA_EDGES"],
+        # V6.3 : hypernœuds complexes. Le namespace exporté est une LISTE
+        # BLANCHE — un nom seulement défini dans _config_derive.py n'atteint
+        # jamais le corps de build (NameError à l'exécution, pas à l'import).
+        USE_COMPLEX_NODES=ns["USE_COMPLEX_NODES"],
+        COMPLEX_MAX_SIZE=ns["COMPLEX_MAX_SIZE"],
+        COMPLEX_MIN_SIZE=ns["COMPLEX_MIN_SIZE"],
+        COMPLEX_EXCLUDE_PAT=ns["COMPLEX_EXCLUDE_PAT"],
+        DROP_FI_WITHIN_CPLX=ns["DROP_FI_WITHIN_CPLX"],
         RUN_TAG=ns["RUN_TAG"],
     )

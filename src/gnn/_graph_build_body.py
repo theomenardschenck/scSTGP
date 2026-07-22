@@ -1490,6 +1490,111 @@ print("7. Assemblage du graphe hétérogène")
 print("=" * 70)
 
 # HeteroData stocke les features et arêtes indexées par type
+
+# ── 6z. V6.3 — HYPERNŒUDS COMPLEXES (opt-in, --use-complex-nodes) ───────────
+# POURQUOI. Un complexe protéique est aujourd'hui représenté par une CLIQUE :
+# reactome_fi et same_pathway relient deux-à-deux ses n membres, soit n(n-1)/2
+# arêtes. Perturber un membre déplace tous les autres de façon très cohérente —
+# l'effet est RÉEL mais INATTRIBUABLE au membre plutôt qu'au module. Cinq
+# discriminants statistiques ont échoué à trancher (clustering_coeff, off_axis,
+# concentration, z-score intra-module, décoy N2 — LOG §25/§26bis) : le rewiring
+# détruit la clique DANS la nulle, donc il la récompense dans le réel.
+# Le remède est structurel : le complexe devient UN NŒUD, relié à chacun de ses
+# membres (étoile, n arêtes). L'information de co-appartenance est conservée,
+# le sur-comptage disparaît. Les gènes restent des nœuds distincts et donc
+# classables — on ne perd aucune cible.
+#
+# Trois filtres, chacun motivé par une mesure sur l'artefact OmniPath :
+#   * COMPLEX:None      -> 149 017 des 201 610 arêtes (74 %) : fourre-tout non
+#                          nommé, exclu inconditionnellement.
+#   * taille [min, max] -> COMPLEX:Nucleosome compte 11 628 membres (agrégat, pas
+#                          un complexe). Le cap par défaut (200) l'écarte tout en
+#                          GARDANT le ribosome cytoplasmique (161) — la clique
+#                          que l'on veut précisément effondrer. Un cap au p95
+#                          (16) raterait la cible principale. min=3 car à 2
+#                          membres l'étoile n'apporte rien de plus que l'arête.
+#   * motif exclu       -> HT_SC_Cluster* (252 entrées) sont des CLUSTERS
+#                          single-cell haut-débit, pas des complexes : c'est
+#                          l'artefact de co-expression que l'on combat. L'un
+#                          d'eux (HT_SC_Cluster49) réunit OCRL + SYNJ2 avec 39
+#                          actines/calmodulines.
+complex_names, cplx_src, cplx_dst = [], [], []
+complex_features = None
+_cplx_members: dict = {}
+if MODULES.get("use_complex_nodes", False):
+    _cx_raw: dict = {}
+    try:
+        import gzip as _gz, csv as _csv
+        _cx_path = os.path.join(OMNIPATH_CACHE_DIR, "graph", "edges.tsv.gz")
+        if os.path.exists(_cx_path):
+            with _gz.open(_cx_path, "rt") as _fh:
+                for _row in _csv.DictReader(_fh, delimiter="\t"):
+                    if _row.get("edge_type") != "complex_membership":
+                        continue
+                    _cn = _row.get("source_symbol", "")
+                    if not _cn or _cn == "COMPLEX:None":
+                        continue
+                    _cx_raw.setdefault(_cn, set()).add(_row.get("target_symbol", ""))
+        else:
+            print(f"  [complex] artefact absent ({_cx_path}) — 0 hypernœud")
+    except Exception as _e:                                  # offline-safe
+        print(f"  [complex] lecture impossible ({_e}) — 0 hypernœud")
+
+    _pats = [s.strip() for s in str(COMPLEX_EXCLUDE_PAT).split(",") if s.strip()]
+    _n_pat = _n_size = 0
+    for _cn, _mem in _cx_raw.items():
+        if any(_p in _cn for _p in _pats):
+            _n_pat += 1
+            continue
+        # On projette AVANT de filtrer sur la taille : seuls les membres
+        # présents dans notre univers de gènes comptent (un complexe dont 2
+        # membres sur 40 sont dans le graphe n'est pas une clique chez nous).
+        _idx = sorted({gene_to_idx[_s] for _s in _mem
+                       if _s in gene_to_idx})
+        if not (COMPLEX_MIN_SIZE <= len(_idx) <= COMPLEX_MAX_SIZE):
+            _n_size += 1
+            continue
+        _cplx_members[_cn] = _idx
+    complex_names = sorted(_cplx_members)
+    for _ci, _cn in enumerate(complex_names):
+        for _gi in _cplx_members[_cn]:
+            cplx_src.append(_gi); cplx_dst.append(_ci)
+    print(f"  complexes : {len(complex_names)} hypernœuds, {len(cplx_src)} arêtes "
+          f"member_of (écartés : {_n_pat} par motif, {_n_size} hors "
+          f"[{COMPLEX_MIN_SIZE},{COMPLEX_MAX_SIZE}] après projection)")
+
+# Feature du nœud complexe : log10(taille) — la seule information intrinsèque
+# disponible. Son rôle est topologique (relais), pas informationnel.
+if complex_names:
+    complex_features = torch.tensor(
+        [[float(np.log10(len(_cplx_members[_cn]) + 1.0))] for _cn in complex_names],
+        dtype=torch.float)
+
+edge_index_member_of = (torch.tensor([cplx_src, cplx_dst], dtype=torch.long)
+                        if cplx_src else torch.zeros((2, 0), dtype=torch.long))
+edge_attr_member_of = (torch.ones((len(cplx_src), 1), dtype=torch.float)
+                       if cplx_src else torch.zeros((0, 1), dtype=torch.float))
+
+# ── Élagage des arêtes FI internes à un complexe (--drop-fi-within-complex) ──
+# Sans cet élagage on AJOUTE l'hypernœud sans RETIRER la clique qu'il remplace :
+# le sur-comptage demeure et l'expérience ne teste rien.
+if cplx_src and DROP_FI_WITHIN_CPLX and edge_index_reactome_fi.numel() > 0:
+    _co = set()
+    for _cn, _idx in _cplx_members.items():
+        for _a in range(len(_idx)):
+            for _b in range(_a + 1, len(_idx)):
+                _co.add((_idx[_a], _idx[_b]))
+    _ei = edge_index_reactome_fi.numpy()
+    _keep = [i for i in range(_ei.shape[1])
+             if (min(_ei[0][i], _ei[1][i]), max(_ei[0][i], _ei[1][i])) not in _co]
+    _before = _ei.shape[1]
+    edge_index_reactome_fi = edge_index_reactome_fi[:, _keep]
+    if edge_attr_reactome_fi.numel() > 0:
+        edge_attr_reactome_fi = edge_attr_reactome_fi[_keep]
+    print(f"  [complex] reactome_fi élagué intra-complexe : {_before} → "
+          f"{edge_index_reactome_fi.shape[1]} ({_before - len(_keep)} retirées)")
+
+
 data = HeteroData()
 
 # --- Noeuds ---
@@ -1513,6 +1618,16 @@ if edge_index_expresses.numel() > 0:
         edge_index_expresses[1], edge_index_expresses[0]  # Inverse src/dst
     ])
     data["gene", "expressed_in", "cell_group"].edge_attr = edge_attr_expresses
+
+# --- V6.3 : nœuds `complex` + arêtes bipartites (opt-in) ---
+if complex_features is not None and edge_index_member_of.numel() > 0:
+    data["complex"].x = complex_features
+    data["complex"].num_nodes = len(complex_names)
+    data["gene", "member_of", "complex"].edge_index = edge_index_member_of
+    data["gene", "member_of", "complex"].edge_attr = edge_attr_member_of
+    data["complex", "has_member", "gene"].edge_index = torch.stack([
+        edge_index_member_of[1], edge_index_member_of[0]])
+    data["complex", "has_member", "gene"].edge_attr = edge_attr_member_of
 
 # --- Arêtes gene ↔ gene (toutes conditionnelles V3.5+) ---
 if edge_index_ppi.numel() > 0:

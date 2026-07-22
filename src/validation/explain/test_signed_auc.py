@@ -237,6 +237,8 @@ def collect_signed_edges(data, symbols: list[str]) -> pd.DataFrame:
 def encode_full(model: VGAE, data) -> torch.Tensor:
     """Forward de l'encoder en eval mode → z (= μ, pas d'échantillonnage)."""
     x_dict = {"gene": data["gene"].x, "cell_group": data["cell_group"].x}
+    if "complex" in data.node_types:                    # V6.3 hypernœuds
+        x_dict["complex"] = data["complex"].x
     edge_index_dict = {et: data[et].edge_index for et in data.edge_types
                        if data[et].edge_index.numel() > 0}
     edge_attr_dict = {et: data[et].edge_attr for et in data.edge_types

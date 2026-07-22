@@ -56,6 +56,8 @@ from gnn_perturbation import apply_perturbation      # noqa: E402
 def _head_probs(model, head, data):
     """Forward encode + head → sigmoid probs (n_genes, n_labels). No grad."""
     x_dict = {"gene": data["gene"].x, "cell_group": data["cell_group"].x}
+    if "complex" in data.node_types:                    # V6.3 hypernœuds
+        x_dict["complex"] = data["complex"].x
     eid, ead = {}, {}
     for et in data.edge_types:
         eid[et] = data[et].edge_index

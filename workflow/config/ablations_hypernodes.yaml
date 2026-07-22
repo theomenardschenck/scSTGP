@@ -1,0 +1,97 @@
+# ===========================================================================
+# ablations_hypernodes.yaml — V6.3 : le confondant de CLIQUE se traite-t-il
+# structurellement ?
+#
+# LE PROBLÈME (LOG §25/§26bis). Un complexe protéique est représenté par une
+# CLIQUE : reactome_fi et same_pathway relient deux-à-deux ses n membres, soit
+# n(n-1)/2 arêtes. Perturber un membre déplace tous les autres de façon très
+# cohérente. L'effet est RÉEL — le KO de COPB2 déplace bien le manteau COPI —
+# mais il est INATTRIBUABLE à COPB2 plutôt qu'au module.
+#
+# CINQ discriminants statistiques ont échoué à séparer une vraie cible
+# (OCRL/SYNJ2/SMPD1) d'un membre de clique (COPI/Golgi/ribosome) :
+#   clustering_coeff (métabolique 0.651 > ribosome 0.572) · off_axis
+#   (rho degré +0.898, PIRE que la référence) · concentration (+0.466) ·
+#   z-score intra-module (clique 1.72 > métabolique 1.17) · décoy N2
+#   (RPS19/COPB2/GOLGA2 passent la nulle cosinus comme les cibles).
+# Motif commun : toutes demandent « l'effet est-il cohérent ? », or une clique
+# EST le maximum de cohérence. Le décoy N2 la récompense même, puisque le
+# rewiring la détruit DANS la nulle.
+#
+# L'HYPOTHÈSE TESTÉE ICI. Le filtre doit être structurel, pas statistique : le
+# complexe devient UN NŒUD relié à chacun de ses membres (étoile, n arêtes) et
+# les arêtes FI internes au complexe sont retirées. L'information de
+# co-appartenance est conservée, le sur-comptage disparaît. Les gènes restent
+# des nœuds distincts, donc classables — aucune cible n'est perdue.
+#
+# PRÉDICTION FALSIFIABLE, à écrire AVANT de lire les résultats :
+#   si l'effet de clique est bien la cause, `pure-dir-cplx-nofi` doit
+#   DÉCLASSER RPS19 / COPB2 / GOLGA2 / TUBA1C (membres de complexes) SANS
+#   déclasser OCRL / SYNJ2 / SMPD1 (SMPD1 n'appartient à aucun complexe ;
+#   OCRL et SYNJ2 ne partagent qu'un pseudo-complexe HT_SC_Cluster, exclu par
+#   défaut). Si les deux groupes bougent ensemble, l'hypothèse est fausse et
+#   la clique n'était pas le mécanisme.
+#
+# FILTRES (chacun mesuré sur l'artefact OmniPath, cf. --help des flags) :
+#   COMPLEX:None        149 017 / 201 610 arêtes (74 %) — exclu d'office
+#   taille [3, 200]     écarte COMPLEX:Nucleosome (11 628 membres = agrégat)
+#                       mais GARDE le ribosome cytoplasmique (161) — la clique
+#                       que l'on veut justement effondrer. Un cap au p95 (16)
+#                       raterait la cible principale.
+#   HT_SC_Cluster*      252 entrées = clusters single-cell haut-débit, pas des
+#                       complexes : c'est l'artefact de co-expression que l'on
+#                       combat (HT_SC_Cluster49 = OCRL + SYNJ2 + 39 actines).
+#
+# VERROUS (LOG §27/§28) — identiques à ablations_rfi_v2.yaml, non négociables :
+# sans déterminisme ET 3 seeds, le plancher de bruit (rho 0.556-0.687, écart
+# médian 942 rangs) noierait tout effet des hypernœuds, exactement comme il a
+# noyé l'effet FI dans la première vague.
+#
+# Usage (détaché !) :
+#   tmux new -s cplx
+#   scripts/run_omnipath_ablation_wave.sh workflow/config/ablations_hypernodes.yaml \
+#       --profile workflow/profiles/slurm -j 8 --parallel 2
+#   python src/validation/qc/pipeline_qc.py all --wave output/.../output_cplx
+# ===========================================================================
+
+root_tag: "cplx"
+seeds: [1, 2, 3]
+deterministic: true
+
+decoy: true
+decoy_n_rewires: 50
+decoy_random_axis: 20
+decoy_random_axis_seed: 0
+
+base_extra_flags: >-
+  --signed-message --signed-decoder --use-reactome-fi
+  --use-omnipath-signaling --use-omnipath-tf-curated
+  --use-omnipath-node-features
+  --omnipath-edges transcriptional,enzyme_substrate,ligand_receptor
+  --reactome-fi-directed
+
+_pure_flags: &pure >-
+  --dedup-ppi-signed remove --no-ppi
+  --exclude-features ppi_degree,reg_degree
+  --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges
+
+ablation_grid:
+  # ── CONTRÔLES (pas d'hypernœud) — référence + plancher de bruit ───────────
+  - {name: rich-ctrl, add_flags: ""}
+  - {name: pure-ctrl, add_flags: *pure}
+
+  # ── Hypernœuds SEULS : on ajoute le nœud sans retirer la clique. ──────────
+  # Contrôle indispensable : isole l'effet du RELAIS de celui de l'ÉLAGAGE.
+  # Attendu faible — sans élagage le sur-comptage demeure.
+  - {name: rich-cplx, add_flags: "--use-complex-nodes"}
+  - {name: pure-cplx, add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --use-complex-nodes"}
+
+  # ── Hypernœuds + élagage FI intra-complexe = LE BRAS QUI TESTE L'HYPOTHÈSE ─
+  - {name: rich-cplx-nofi, add_flags: "--use-complex-nodes --drop-fi-within-complex"}
+  - {name: pure-cplx-nofi, add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --use-complex-nodes --drop-fi-within-complex"}
+
+  # ── Sensibilité au cap de taille : le ribosome (161) entre-t-il ou non ? ──
+  # cap 50 EXCLUT le ribosome, cap 200 (défaut) l'inclut. Si le déclassement du
+  # ribosome n'apparaît qu'à 200, il est bien porté par l'hypernœud ribosomal
+  # et non par un effet diffus.
+  - {name: pure-cplx-nofi-cap50, add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --use-complex-nodes --drop-fi-within-complex --complex-max-size 50"}

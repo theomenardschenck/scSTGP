@@ -80,6 +80,8 @@ HP = dict(hidden=128, latent=64, n_layers=3, n_heads=4)
 # --------------------------------------------------------------------------- #
 def _encode_mu(model, d):
     xd = {"gene": d["gene"].x, "cell_group": d["cell_group"].x}
+    if "complex" in d.node_types:                    # V6.3 hypernœuds
+        xd["complex"] = d["complex"].x
     ei = {k: d[k].edge_index for k in d.edge_types}
     ea = {k: d[k].edge_attr for k in d.edge_types
           if getattr(d[k], "edge_attr", None) is not None}

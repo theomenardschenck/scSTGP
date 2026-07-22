@@ -27,6 +27,16 @@ present]) but omits the hub down-weight (`is_hub_inflated`), which needs the PPI
 degree from the graph. Rankings are otherwise identical to the report's per-axis
 driver_score. For the headline global axis, use the normal `perturb_report`.
 
+F1 axis estimators (2026-07-22, FUT §2.8 / BIB §21.13)
+------------------------------------------------------
+`--axis-method diff,lda,cav,pca` registers the GLOBAL axis once per estimator on
+the SAME poles, so one pass yields the robustness table "N axis definitions x
+same drivers" — still with zero re-perturbation. Extra outputs:
+`axis_method_diagnostics.tsv`, `axis_method_comparison.tsv` (Spearman + top-50
+overlap per pair) and `axis_method_gene_ranks.tsv` (`rank_spread` = per-gene
+axis instability). `--axis-lda-shrinkage 1.0` provably collapses back onto
+`diff` (cos = 1.000), which is the analytic check of the implementation.
+
 Usage
 -----
     python src/perturbation/reproject_axes.py \\
@@ -34,6 +44,13 @@ Usage
         --quiescent-groups P4,P16_cluster_0 \\
         --transition-axes default --cluster-anchor-mode manual \\
         --out output/gnn_vgae/V5.4.1/reproject_baseline
+
+    # F1 robustness pass
+    python src/perturbation/reproject_axes.py \\
+        --run-dirs 'output/gnn_vgae/V5.4.1/v5.4.baseline.s*' \\
+        --quiescent-groups P4,P16_cluster_0 \\
+        --axis-method diff,lda,cav,pca --axis-cav-permutations 100 \\
+        --out output/gnn_vgae/V5.4.1/reproject_axisF1
 """
 from __future__ import annotations
 
@@ -60,7 +77,8 @@ from perturb_report import (_canon_axis, _compute_driver_score,        # noqa: E
 
 def _compute_axes(run_dir: Path, quiescent, p16, cluster_anchors, transition_pairs,
                   n_random=0, random_seed=0, effector_genes=None,
-                  global_axis_name=None):
+                  global_axis_name=None, axis_methods=(), axis_opts=None,
+                  axis_diag=None):
     """Rebuild axis vectors from the run's μ + group_expression (no torch).
 
     Si n_random>0, ajoute N axes UNITAIRES ALÉATOIRES (decoy de spécificité
@@ -95,9 +113,27 @@ def _compute_axes(run_dir: Path, quiescent, p16, cluster_anchors, transition_pai
     # (DE poles or effector gene lists). Weighted by the most senescent group,
     # like the random decoys. Un-anchored global stays implicit (the headline
     # ranking already carries it) to keep the axis registry unambiguous.
+    _wref = p16_list[-1] if p16_list else "P4"
     if global_axis_name is not None:
-        _wref = p16_list[-1] if p16_list else "P4"
         axes[global_axis_name] = (np.asarray(_ag, np.float32), _wref)
+    # F1 (FUT §2.8): alternative estimators of the SAME pole contrast. Each is
+    # registered as its own named axis so one pass yields the robustness figure
+    # "N axis definitions x same drivers" — no re-perturbation, the Δz cache is
+    # axis-independent. `axis_diff` is the historical centroid-difference axis.
+    _opts = axis_opts or {}
+    for _m in axis_methods:
+        _info: dict = {}
+        _ag_m, _c, _t, _ = compute_senescence_axes(
+            mu, group_expr, gene_symbols,
+            quiescent_groups=(tuple(quiescent) if quiescent else None),
+            p16_groups=tuple(p16_list),
+            effector_axis_genes=effector_genes,
+            cluster_anchors=cluster_anchors, transition_pairs=transition_pairs,
+            axis_method=_m, axis_info=_info, **_opts)
+        _name = f"{global_axis_name}_{_m}" if global_axis_name else f"axis_{_m}"
+        axes[_name] = (np.asarray(_ag_m, np.float32), _wref)
+        if axis_diag is not None:
+            axis_diag.append({"run": run_dir.name, "axis": _name, **_info})
     for grp, u in axes_cluster.items():
         axes[grp] = (np.asarray(u, np.float32), grp)             # weight = ck
     for (src, dst), u in axes_transition.items():
@@ -193,7 +229,33 @@ def main():
                     help="comma-separated pro-senescent effector symbols.")
     ap.add_argument("--effector-anti", default="",
                     help="comma-separated anti-senescent effector symbols.")
+    # ── F1 (FUT §2.8 / BIB §21.13): alternative estimators of the global axis.
+    #    Same poles, different direction estimator -> robustness control.
+    ap.add_argument("--axis-method", default="",
+                    help="comma list among diff,lda,cav,pca — register the "
+                         "GLOBAL axis once per estimator (ex. 'diff,lda,cav,pca') "
+                         "to get the 'N axis definitions x same drivers' table. "
+                         "Empty = off (historical behaviour).")
+    ap.add_argument("--axis-lda-shrinkage", type=float, default=0.05,
+                    help="ridge blend of the within-class scatter towards a "
+                         "scaled identity (0 = plain LDA, 1 = back to 'diff').")
+    ap.add_argument("--axis-cav-top-n", type=int, default=500,
+                    help="genes per pole for the logistic probe (CAV).")
+    ap.add_argument("--axis-cav-seed", type=int, default=0)
+    ap.add_argument("--axis-cav-permutations", type=int, default=0,
+                    help="TCAV-style label-permutation null on probe accuracy "
+                         "(0 = off). 100 is cheap and gives a p-value.")
     args = ap.parse_args()
+
+    axis_methods = [s.strip() for s in args.axis_method.split(",") if s.strip()]
+    _bad = [m for m in axis_methods if m not in ("diff", "lda", "cav", "pca")]
+    if _bad:
+        sys.exit(f"[reproject] --axis-method inconnu(s) : {_bad} "
+                 "(attendu diff,lda,cav,pca)")
+    axis_opts = dict(axis_lda_shrinkage=args.axis_lda_shrinkage,
+                     axis_cav_top_n=args.axis_cav_top_n,
+                     axis_cav_seed=args.axis_cav_seed,
+                     axis_cav_permutations=args.axis_cav_permutations)
 
     if args.de_axis_file and args.effector_axis:
         sys.exit("[reproject] --de-axis-file et --effector-axis sont exclusifs.")
@@ -234,7 +296,8 @@ def main():
     # Accumulate per (gene, mode, axis) across all runs/caches: mean cos + diff.
     acc: dict[tuple, dict[str, list]] = {}
     axis_names: set[str] = set()
-    n_cache = 0
+    axis_diag: list[dict] = []
+    n_cache = n_no_wsum = 0
     for rd in run_dirs:
         caches = _load_caches(rd, args.cache_filter)
         if not caches:
@@ -244,10 +307,13 @@ def main():
                              n_random=args.random_axis,
                              random_seed=args.random_axis_seed,
                              effector_genes=effector_genes,
-                             global_axis_name=global_axis_name)
+                             global_axis_name=global_axis_name,
+                             axis_methods=axis_methods, axis_opts=axis_opts,
+                             axis_diag=axis_diag)
         axis_names |= set(axes)
         for c in caches:
             n_cache += 1
+            n_no_wsum += (c["wsum"] is None)
             gidx = {g: i for i, g in enumerate(c["group_names"])}
             for name, (u, wgrp) in axes.items():
                 if wgrp not in gidx:
@@ -265,6 +331,11 @@ def main():
                     d.setdefault(f"{name}::diff", []).append(float(diff[j]))
     if not acc:
         sys.exit("[reproject] rien à projeter (pas de cache exploitable).")
+    if n_no_wsum:
+        print(f"[warn] {n_no_wsum}/{n_cache} cache(s) SANS 'w_diff_sum' (produits "
+              "avant 2026-07) : leur `diff` est NaN, or `_canon_axis` exige diff "
+              "→ driver_score ET canon_cos retombent à 0 pour TOUS les axes. "
+              "Re-perturber avec --cache-delta-z pour exploiter ces runs.")
     axis_names = sorted(axis_names)
     print(f"[reproject] {len(run_dirs)} run(s), {n_cache} cache(s), "
           f"{len(axis_names)} axe(s) : {', '.join(axis_names)}")
@@ -298,8 +369,65 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     gene_rank.to_csv(args.out / "reproject_gene_ranking.tsv", sep="\t", index=False)
     write_per_axis_rankings(gene_rank, args.out)
+
+    # ── F1 deliverable: are the drivers stable across axis definitions? ──────
+    if axis_diag:
+        pd.DataFrame(axis_diag).to_csv(args.out / "axis_method_diagnostics.tsv",
+                                       sep="\t", index=False)
+    if len(axis_methods) >= 2:
+        _write_axis_method_comparison(gene_rank, axis_methods, global_axis_name,
+                                      args.out)
+
     print(f"[reproject] écrit dans {args.out} "
           f"({len(gene_rank)} gènes, {len(axis_names)} axes) — aucune re-perturbation.")
+
+
+def _write_axis_method_comparison(gene_rank: pd.DataFrame, axis_methods,
+                                  global_axis_name, out: Path, top_n: int = 50):
+    """Pairwise agreement between the F1 axis estimators (FUT §2.8).
+
+    Spearman on the full driver_score plus top-N overlap: a driver set that
+    survives whitening (lda), a logistic probe (cav) and the unsupervised PC1
+    (pca) is not an artefact of the difference-of-means estimator. Low
+    agreement is itself the result — it localises the floating-axis problem.
+    """
+    from itertools import combinations
+    from scipy.stats import spearmanr
+
+    def _col(m):
+        name = f"{global_axis_name}_{m}" if global_axis_name else f"axis_{m}"
+        return f"driver_score_{name}"
+
+    present = [m for m in axis_methods if _col(m) in gene_rank.columns]
+    if len(present) < 2:
+        return
+    rows = []
+    for a, b in combinations(present, 2):
+        ca, cb = gene_rank[_col(a)], gene_rank[_col(b)]
+        ok = ca.notna() & cb.notna()
+        rho = spearmanr(ca[ok], cb[ok]).statistic if ok.sum() > 2 else float("nan")
+        ta = set(gene_rank.loc[ok].nlargest(top_n, _col(a))["target"])
+        tb = set(gene_rank.loc[ok].nlargest(top_n, _col(b))["target"])
+        rows.append({"axis_a": a, "axis_b": b, "n_genes": int(ok.sum()),
+                     "spearman_driver_score": round(float(rho), 4),
+                     f"top{top_n}_overlap": len(ta & tb),
+                     f"top{top_n}_jaccard": round(len(ta & tb) / len(ta | tb), 4)
+                     if (ta | tb) else float("nan")})
+    cmp_df = pd.DataFrame(rows)
+    cmp_df.to_csv(out / "axis_method_comparison.tsv", sep="\t", index=False)
+
+    # Per-gene rank across estimators: max rank spread = instability flag.
+    rk = pd.DataFrame({"target": gene_rank["target"]})
+    for m in present:
+        rk[m] = gene_rank[_col(m)].rank(ascending=False, method="min")
+    rk["rank_min"] = rk[present].min(axis=1)
+    rk["rank_max"] = rk[present].max(axis=1)
+    rk["rank_spread"] = rk["rank_max"] - rk["rank_min"]
+    rk.sort_values("rank_min").to_csv(out / "axis_method_gene_ranks.tsv",
+                                      sep="\t", index=False)
+    print(f"[reproject] F1 comparaison ({', '.join(present)}) → "
+          f"axis_method_comparison.tsv + axis_method_gene_ranks.tsv")
+    print(cmp_df.to_string(index=False))
 
 
 if __name__ == "__main__":

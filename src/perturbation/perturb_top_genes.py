@@ -534,7 +534,8 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
                              de_file: Path | None = None, de_sign: int = 1,
                              effector_axis_genes=None, device: str = "cpu",
                              cluster_anchors=None, transition_pairs=None,
-                             perturb_features=None):
+                             perturb_features=None, axis_method="diff",
+                             axis_opts=None):
     """Load the VGAE run + compute the shared baseline once.
 
     Imports gnn_perturbation lazily so the subprocess TOP-N mode doesn't
@@ -567,7 +568,8 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
         model, data, baseline, gene_symbols, group_expr,
         quiescent_groups=quiescent_groups, p16_groups=p16_groups,
         effector_axis_genes=effector_axis_genes,
-        cluster_anchors=cluster_anchors, transition_pairs=transition_pairs)
+        cluster_anchors=cluster_anchors, transition_pairs=transition_pairs,
+        axis_method=axis_method, axis_opts=axis_opts)
     # V6.3 : restrict the perturbation to a subset of feature columns (e.g.
     # expression only). Resolved ONCE against the graph's feature_names; an
     # unmatched spec raises here rather than silently perturbing everything.
@@ -1123,6 +1125,27 @@ def main():
                          "robuste ; fallback log_fc).")
     ap.add_argument("--de-axis-padj", type=float, default=0.1,
                     help="seuil padj des ancres (défaut 0.1 ; NaN gardés).")
+    # ── F1 (FUT §2.8 / BIB §21.13) : estimateur de axis_global. Mêmes pôles,
+    #    direction dérivée autrement -> contrôle de robustesse de l'axe.
+    ap.add_argument("--axis-method", choices=["diff", "lda", "cav", "pca"],
+                    default="diff",
+                    help="estimateur de axis_global : 'diff' (défaut, historique) "
+                         "= différence de centroïdes ; 'lda' = direction blanchie "
+                         "Sw⁻¹Δμ (corrige la covariance ignorée, teste l'axe "
+                         "flottant ASNS) ; 'cav' = normale d'un probe logistique "
+                         "(Kim 2018 TCAV) ; 'pca' = PC1 du latent (null non "
+                         "supervisé). N'affecte QUE axis_global. Pour comparer "
+                         "plusieurs estimateurs sans re-perturber, utiliser "
+                         "reproject_axes.py --axis-method diff,lda,cav,pca.")
+    ap.add_argument("--axis-lda-shrinkage", type=float, default=0.05,
+                    help="mélange ridge du scatter intra-classe vers l'identité "
+                         "(0 = LDA pur, 1 = retour à 'diff'). Défaut 0.05.")
+    ap.add_argument("--axis-cav-top-n", type=int, default=500,
+                    help="nb de gènes par pôle pour le probe logistique (CAV).")
+    ap.add_argument("--axis-cav-seed", type=int, default=0)
+    ap.add_argument("--axis-cav-permutations", type=int, default=0,
+                    help="null de permutation des labels (TCAV) sur l'accuracy "
+                         "du probe ; 0 = off.")
     # Multi-axe P4->cluster + transitions inter-cluster (ancrage centroïdes).
     ap.add_argument("--cluster-anchor-mode",
                     choices=["none", "de-markers", "manual"], default="none",
@@ -1211,7 +1234,13 @@ def main():
                                        effector_axis_genes=_eff, device=args.device,
                                        cluster_anchors=_anchors,
                                        transition_pairs=_trans,
-                                       perturb_features=args.perturb_features)
+                                       perturb_features=args.perturb_features,
+                                       axis_method=args.axis_method,
+                                       axis_opts=dict(
+                                           axis_lda_shrinkage=args.axis_lda_shrinkage,
+                                           axis_cav_top_n=args.axis_cav_top_n,
+                                           axis_cav_seed=args.axis_cav_seed,
+                                           axis_cav_permutations=args.axis_cav_permutations))
         _suffix = args.out_suffix  # "" si non fourni → comportement V3 inchangé
         # Subset in-process (--genes-file/--extra-genes) : perturbe une liste
         # choisie AVEC l'axe DE (test concordance). Sinon None → tous les gènes.
