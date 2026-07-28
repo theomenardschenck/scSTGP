@@ -111,6 +111,11 @@ optuna/
 tests/golden/reference/
 tests/golden/_*/
 
+# ── Jeu de données jouet (généré par tests/fixtures/make_tiny_dataset.py) ──
+# Le GÉNÉRATEUR est versionné, pas sa sortie : elle se recrée en une seconde
+# et n'a aucune valeur d'archive.
+/data_tiny/
+
 # ── Exploration locale ──────────────────────────────────────────────
 scripts/explore_omnipath_graph.py
 

@@ -98,3 +98,42 @@ jobs:
         run: pytest tests/test_cli_contract.py -q
         env:
           GNN_ALLOW_DOWNLOADS: "0"
+
+  end-to-end:
+    name: Pipeline complet (jeu jouet)
+    runs-on: ubuntu-latest
+    # Le seul job qui EXÉCUTE la science : construction du graphe, entraînement,
+    # perturbation, agrégation, QC, ORA, rapport — sur ~65 gènes générés,
+    # hors ligne, en ~2 min. Il a trouvé quatre défauts réels le jour de sa
+    # création, tous invisibles à un contrôle purement structurel.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer la pile d'exécution
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install torch-geometric
+          pip install 'snakemake-minimal==7.32.4' pulp==2.7.0
+
+      - name: Générer le jeu jouet et lancer le pipeline
+        run: pytest tests/test_end_to_end_tiny.py -q -m slow
+        env:
+          GNN_ALLOW_DOWNLOADS: "0"   # aucun accès réseau : tout est pré-généré
+          MPLBACKEND: Agg
+
+      - name: Conserver les sorties en cas d'échec
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiny-run-logs
+          path: |
+            output/tiny/**/logs/**
+            output/tiny/**/analysis/**
+          retention-days: 7

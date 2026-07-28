@@ -84,8 +84,27 @@ L'assistant demande le contraste **A vs B** (pro/sen, sain/malade, WT/mutant…)
 les chemins, le backend, le nombre de seeds, la portée de la perturbation et les
 ablations.
 
-Test fonctionnel rapide : `--configfile workflow/config/config.smoke.yaml`
-(1 seed, epochs courts, perturbation restreinte).
+### Essayer sans les données
+
+Le pipeline tourne de bout en bout sur un jeu jouet auto-généré — aucune donnée
+à demander, aucun réseau, environ deux minutes sur un portable :
+
+```bash
+python tests/fixtures/make_tiny_dataset.py --out data_tiny
+bash workflow/run.sh --backend local --configfile workflow/config/config.tiny.yaml
+```
+
+Vous obtenez un `cross_seed_gene_ranking.tsv` complet (43 colonnes), un rapport
+QC, l'ORA et le SUMMARY — la chaîne réelle, sur ~65 gènes et 8 échantillons.
+
+> **Ce n'est pas de la biologie.** Les valeurs d'expression sortent d'un
+> générateur et l'écart entre les deux « états » est injecté à la main. Le
+> classement produit ne veut rien dire. Ce jeu démontre une seule chose : que la
+> mécanique est branchée. Il sert à vérifier qu'un refactor n'a rien cassé, et à
+> voir l'outil bouger avant de réclamer les vraies données.
+
+Deux autres configs de vérification : `config.smoke.yaml` (résolution du DAG sur
+les vraies données, sans rien exécuter) et `config.yaml` (production).
 
 Sur cluster, lancer dans `tmux`/`nohup` : Snakemake a besoin d'un processus
 contrôleur vivant pendant tout le DAG. Détail des règles et des chemins dans
@@ -162,12 +181,18 @@ l'amplitude n'excède pas le bruit n'a rien trouvé.
 ## Tests
 
 ```bash
+pytest                                # tout sauf le end-to-end (~5 min)
 pytest tests/test_package_layout.py   # le paquet s'importe, pas de nom racine
 pytest tests/test_de_schema.py        # unitaires sur la définition de l'axe DE
 pytest tests/test_workflow.py         # le DAG se résout, validations comprises
 pytest tests/test_optim.py            # plomberie de la recherche
-pytest tests/test_cli_contract.py     # chaque point d'entrée répond à --help (~4 min)
+pytest tests/test_cli_contract.py     # chaque point d'entrée répond à --help
+pytest -m slow                        # pipeline complet sur jeu jouet (~2 min)
 ```
+
+Le test `slow` est le seul qui exécute réellement la chaîne scientifique ; les
+autres vérifient la structure. Il est désélectionné par défaut et tourne dans
+son propre job de CI.
 
 `tests/golden/` est un comparateur bit-exact conservé pour les refactors lourds.
 Il n'est **pas exécutable en l'état** : il dépend d'un cache de graphe absent du

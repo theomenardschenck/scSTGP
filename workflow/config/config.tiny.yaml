@@ -1,0 +1,117 @@
+# ──────────────────────────────────────────────────────────────────
+# config.tiny.yaml — le pipeline qui TOURNE VRAIMENT, sur un jeu jouet.
+#
+# `config.smoke.yaml` vérifie que le DAG se RÉSOUT ; il ne peut rien exécuter
+# sans les 17 Go de data/. Celui-ci exécute la chaîne complète — construction
+# du graphe, entraînement VGAE, perturbation in silico, agrégation cross-seed,
+# validations, rapport — sur ~65 gènes et 8 échantillons, en quelques minutes,
+# hors ligne, sur un portable.
+#
+# ⚠️ CE N'EST PAS DE LA BIOLOGIE. Les valeurs d'expression sont tirées d'un
+#    générateur et l'effet entre les deux « états » est injecté à la main. Le
+#    classement produit ne veut rien dire. La seule chose démontrée est que la
+#    mécanique est branchée de bout en bout.
+#
+#   python tests/fixtures/make_tiny_dataset.py --out data_tiny
+#   bash workflow/run.sh --backend local --configfile workflow/config/config.tiny.yaml
+# ──────────────────────────────────────────────────────────────────
+run:
+  name: "tiny"
+  description: "Jeu jouet auto-généré — vérification fonctionnelle réelle"
+
+paths:
+  data_root: "data_tiny"
+  out_base: "output/tiny"
+  # Non utilisés (HuMess et pySCENIC sont désactivés plus bas), mais les clés
+  # doivent exister : le Snakefile les résout au chargement.
+  humess_dir: "data_tiny/humess"
+  scenic_dir: "data_tiny/scenic"
+  de_magnitude_csv: "data_tiny/gnn_data/DE_tiny_sen_vs_pro.csv"
+  coexpr_file: "data_tiny/gnn_data/coexpr_unused.tsv"
+
+# ── Description du dataset — indépendante de `build` ────────────────────────
+# C'est ce bloc qui rend ce jeu possible : décrire un dataset bulk déjà prêt
+# sans déclencher la reconstruction coexpr/HuMess (cf. Snakefile, « DÉCRIRE son
+# dataset ≠ RECONSTRUIRE ses features »).
+dataset:
+  cell_groups: "pro,sen"                              # les deux états contrastés
+  expr_matrix: "gnn_data/expr_tiny.csv"               # relatif à data_root/gnn_data
+  group_meta:  "gnn_data/samplesheet_tiny.tsv"        # sans en-tête : sample, group
+
+compute:
+  device: "cpu"
+  python: "python"
+  python_torch: "python"
+  backend: "local"
+  # Reproductible : sur un graphe de cette taille le coût du mode déterministe
+  # est nul, et cela rend le test end-to-end comparable d'une exécution à l'autre.
+  deterministic: true
+
+input:
+  rna_type: bulk
+  degs_path: "data_tiny/gnn_data/DE_tiny_sen_vs_pro.csv"
+
+build:
+  enabled: false            # aucune reconstruction : tout est pré-généré
+
+models:
+  vgae:
+    enabled: true
+    run_tag: "tiny"
+    seeds: [1, 2]           # 2 seeds : l'agrégation cross-seed exige >= 2
+    # Sources désactivées faute de fixtures : co-expression (GRNBoost2),
+    # régulons pySCENIC, métabolisme HuMess. Restent PPI + Reactome, qui
+    # suffisent à peupler le graphe.
+    extra_flags: >-
+      --no-coexpr --no-humess --no-scenic-regulons
+      --n-epochs 30 --patience 30 --latent-dim 16 --no-baselines
+  gnn_lite:
+    enabled: false
+
+perturbation:
+  enabled: true
+  modes: [knockout, overexpress]
+  scope: all_genes
+  axis: phenotypic          # contraste pro -> sen des cell_groups
+  axis_tag: ""
+  out_suffix: ""
+  genes_file: "data_tiny/gene_sets/tiny_targets.txt"
+  cache_delta_z: true
+
+scoring:
+  de_significance: "pvalue"
+  de_padj_max: 0.05
+  de_abs_lfc_min: 0.5
+
+validation:
+  ora_top_n: 10
+  decoy:
+    enabled: false
+    top_n: 5
+    n_rewires: 50
+    frozen_axis: false
+    random_axis: 0
+    random_axis_seed: 0
+  cluster_annotation:
+    enabled: false
+  qc:
+    enabled: true           # les 5 contrôles tournent aussi sur le jeu jouet
+    blocking: false
+    repro_a: ""
+    repro_b: ""
+  purity_source:
+    enabled: false
+    targets: ""
+    n_random: 20
+  head_to_head:
+    enabled: false
+  readout_specificity:
+    enabled: false
+  ora_de_baseline:
+    enabled: false
+
+comparison:
+  enabled: false
+
+output:
+  generate_html_report: false

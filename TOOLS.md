@@ -89,9 +89,27 @@ de sens.
 # le DAG complet, sans rien exécuter
 bash workflow/run.sh --dry-run --configfile workflow/config/config.smoke.yaml
 
-# le contrat CLI de chaque point d'entrée (~4 min)
+# le contrat CLI de chaque point d'entrée
 pytest tests/test_cli_contract.py
 
 # le câblage des validations
 pytest tests/test_workflow.py
+
+# la chaîne RÉELLEMENT exécutée, sur jeu jouet (~2 min, hors ligne)
+python tests/fixtures/make_tiny_dataset.py --out data_tiny
+bash workflow/run.sh --backend local --configfile workflow/config/config.tiny.yaml
 ```
+
+## Les trois configurations de vérification
+
+| Config | Ce qu'elle prouve | Données requises | Durée |
+|---|---|---|---|
+| `config.tiny.yaml` | la chaîne **s'exécute** de bout en bout | aucune (générées) | ~2 min |
+| `config.smoke.yaml` | le DAG **se résout** sur les vraies entrées | `data/` complet | secondes |
+| `config.yaml` | production | `data/` complet | heures |
+
+`config.tiny.yaml` est le seul exécutable par un tiers. Il a fait remonter
+quatre défauts réels le jour de son écriture — `latent_dim` non relu depuis le
+checkpoint, `CELL_GROUPS` figé sur HUVEC côté perturbation, description du
+dataset couplée à `build.enabled`, et `--no-baselines` qui faisait tomber
+l'agrégation via une figure. Aucun n'était atteignable sans exécuter la chaîne.

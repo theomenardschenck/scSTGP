@@ -92,7 +92,10 @@ packages = [
 testpaths = ["tests"]
 # Les modules « script » (gnn_vgae.py) parsent la CLI à l'import : les tests qui
 # les touchent passent par des sous-processus, jamais par un import direct.
-addopts = "-ra --strict-markers"
+# `not slow` par défaut : le run end-to-end sur jeu jouet prend ~2 min et
+# exécute vraiment le pipeline. Il est opt-in (`pytest -m slow`) et tourne
+# dans son propre job de CI, pour que la suite ordinaire reste immédiate.
+addopts = "-ra --strict-markers -m 'not slow'"
 markers = [
     "slow: test lent (run réel, cluster ou plusieurs minutes)",
     "needs_data: exige les données d'entrée non versionnées (data/)",
