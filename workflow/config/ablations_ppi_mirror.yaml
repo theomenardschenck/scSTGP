@@ -1,0 +1,98 @@
+# ===========================================================================
+# ablations_ppi_mirror.yaml — A/B du correctif de duplication miroir STRING.
+#
+# CE QU'ON MESURE. STRING liste chaque interaction non orientée DEUX fois,
+# (A,B) et (B,A) ; le builder ajoutait à son tour les deux sens par ligne, d'où
+# un stockage 4x au lieu de 2x (ratio mesuré 4.00 : 73 030 paires uniques →
+# 292 120 arêtes). `--dedup-ppi-mirror` (défaut ON depuis 2026-07-28) corrige.
+# Cette vague répond à UNE question : de combien le classement bouge-t-il, et
+# est-ce plus que le bruit ?
+#
+# CE QUE LE CORRECTIF NE CHANGE PAS — vérifié, pas supposé :
+#   * les features de nœud sont BIT-IDENTIQUES (`ppi_degree` est normalisé par
+#     le max, donc diviser tous les degrés par 2 s'annule : max|Δ| = 0.0) ;
+#   * le pool de reconstruction est identique (n_train_edges/n_test_edges
+#     inchangés — les paires PPI y étaient déjà canonicalisées).
+# L'effet passe donc UNIQUEMENT par le message-passing. C'est ce qui rend cette
+# vague nécessaire : on ne peut pas le déduire, il faut le mesurer.
+#
+# ⚠️ root_tag NEUF, et c'est le point important. Le mode corrigé est le DÉFAUT
+# et n'émet AUCUN composant de run_tag ; sans root_tag neuf, ces runs
+# atterriraient dans les dossiers des runs pré-correctif de même config et les
+# mélangeraient EN SILENCE. Ne pas réutiliser `rfi2`, `op`, ni `V6.1.3`.
+#
+# LES DEUX VERROUS (LOG §27), non négociables :
+#   * deterministic: true → supprime le bruit d'exécution (bit-exact à seed fixe)
+#   * seeds: [1, 2, 3]    → mesure la stabilité ; le jugement se fait sur la
+#                           MÉDIANE cross-seed, jamais sur un seed isolé.
+# Rappel du plancher : entre deux runs de config STRICTEMENT identique et non
+# déterministes, rho valait 0.556 (rich) / 0.687 (pure), soit 942 places d'écart
+# médian. Tout Δ inférieur à ça ne veut rien dire.
+#
+# LECTURE. Le premier livrable n'est PAS le Δrang, c'est `pipeline_qc` :
+#   * bras `*-legacy`    → ppi dup_factor ≈ 2.0 dans la table `duplicates`
+#   * bras `*-fixed`     → ppi dup_factor = 1.0
+# S'ils ne montrent pas ça, on ne compare pas ce qu'on croit et le reste est
+# sans objet. Ensuite seulement : compare_runs, réf = `rich-legacy`.
+#
+# COÛT. 4 configs × 3 seeds = 12 entraînements + perturbations. Le graphe est
+# bâti 1x par config (cache seed-indépendant), soit 4 builds.
+#
+# Usage (DÉTACHÉ — l'orchestrateur Snakemake doit survivre pour soumettre
+# l'aval ; une session coupée fige la vague) :
+#   tmux new -s mirror
+#   scripts/run_omnipath_ablation_wave.sh workflow/config/ablations_ppi_mirror.yaml \
+#       --profile workflow/profiles/slurm -j 8 --parallel 2
+#   # détacher : Ctrl-b d       # revenir : tmux attach -t mirror
+#
+#   # une fois terminé — les sorties vivent sous <paths.out_base>/mirror.<nom>/
+#   # (out_base = output/snakemake dans config.yaml ; sur cluster, l'env
+#   #  GNN_OUT_DIR_BASE prime, typiquement le scratch) :
+#   python src/validation/qc/pipeline_qc.py all --wave output/snakemake \
+#       --run-dir output/snakemake/mirror.rich-fixed/s1 --out qc_mirror.md
+#   python src/validation/reports/compare_runs.py \
+#       --runs-glob 'output/snakemake/mirror.*' --baseline mirror.rich-legacy
+# ===========================================================================
+
+root_tag: "mirror"
+seeds: [1, 2, 3]
+deterministic: true
+
+# Décoy N2 coupé : le livrable ici est un Δrang entre deux graphes, pas une
+# nulle de structure — et N2 coûte ~4000 encodages par config. random_axis
+# reste (re-projection du cache Δz, quasi gratuit) pour garder la nulle de
+# spécificité d'axe dans chaque bras.
+decoy: false
+decoy_random_axis: 20
+decoy_random_axis_seed: 0
+
+axis_method: diff
+# Pas de comparaison d'estimateurs ici : elle brouillerait la lecture d'un A/B
+# à variable unique. C'est le rôle de la vague rfi2.
+axis_method_compare: ""
+
+base_extra_flags: >-
+  --signed-message --signed-decoder --use-reactome-fi
+  --use-omnipath-signaling --use-omnipath-tf-curated
+  --use-omnipath-node-features
+  --omnipath-edges transcriptional,enzyme_substrate,ligand_receptor
+
+_pure_flags: &pure >-
+  --dedup-ppi-signed remove --no-ppi
+  --exclude-features ppi_degree,reg_degree
+  --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges
+
+ablation_grid:
+  # ── Contexte RICHE : PPI présent, c'est là que le correctif agit ──────────
+  # Seule variable entre ces deux lignes : la duplication miroir.
+  - {name: rich-legacy, add_flags: "--no-dedup-ppi-mirror"}
+  - {name: rich-fixed,  add_flags: ""}
+
+  # ── Contexte PUR : PPI ABSENT (--no-ppi) ─────────────────────────────────
+  # CONTRÔLE NÉGATIF, et c'est la ligne la plus informative de la vague. Sans
+  # PPI, le correctif ne peut RIEN changer : ces deux bras doivent être
+  # identiques à rho ~ 1.0 (déterminisme actif). S'ils diffèrent, l'écart
+  # observé en contexte riche n'est pas attribuable au correctif et la vague
+  # entière est à jeter — c'est le garde-fou contre une conclusion en trompe-l'œil.
+  - {name: pure-legacy, add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --no-dedup-ppi-mirror"}
+  - {name: pure-fixed,  add_flags: *pure}
