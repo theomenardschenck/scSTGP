@@ -151,6 +151,40 @@ RANDOM_AXIS      = int(config["validation"]["decoy"].get("random_axis", 0))
 RANDOM_AXIS_SEED = int(config["validation"]["decoy"].get("random_axis_seed", 0))
 CLUSTER_ANNOT  = config["validation"]["cluster_annotation"]["enabled"]
 
+# ── Validations branchées le 2026-07-27 (cf. Stage 10) ─────────────────────
+# Toutes opt-in, défaut OFF sauf le QC : le DAG historique est inchangé tant
+# qu'on ne les active pas. `_v(nom, clé, défaut)` évite de casser les configs
+# existantes, qui ne déclarent aucune de ces sections.
+def _v(name, key="enabled", default=False):
+    return (config["validation"].get(name) or {}).get(key, default)
+
+# QC : les 5 contrôles préalables à toute lecture d'ablation. Défaut ON — ils
+# coûtent quelques secondes et leur absence a laissé passer chaque vague
+# précédente sans plancher de bruit.
+QC_ON        = _v("qc", "enabled", True)
+QC_BLOCKING  = _v("qc", "blocking", False)
+# `repro` mesure le bruit entre deux runs de la MÊME config. Passer deux seeds
+# différents mesurerait la variance de seed, ce qui n'est pas la même chose et
+# donnerait un plancher faussement élevé — donc pas de valeur par défaut : les
+# deux runs doivent être désignés explicitement, sinon le contrôle est sauté.
+_QC_A = str(_v("qc", "repro_a", "") or "").strip()
+_QC_B = str(_v("qc", "repro_b", "") or "").strip()
+_QC_REPRO_FLAGS = ("--a " + _QC_A + " --b " + _QC_B) if (_QC_A and _QC_B) else ""
+
+PURITY_ON       = _v("purity_source")
+PURITY_TARGETS  = " ".join(str(_v("purity_source", "targets", "")).split())
+PURITY_N_RANDOM = int(_v("purity_source", "n_random", 200))
+
+H2H_ON      = _v("head_to_head")
+H2H_TARGETS = str(_v("head_to_head", "targets", "") or "").strip()
+
+READOUT_SPEC_ON = _v("readout_specificity")
+ORA_DE_BASE_ON  = _v("ora_de_baseline")
+
+if PURITY_ON and not PURITY_TARGETS:
+    raise ValueError("validation.purity_source.enabled: true exige "
+                     "validation.purity_source.targets (liste de gènes).")
+
 # Racine des runs entraînés (= GNN_OUT_DIR_BASE pour gnn_vgae) et des analyses.
 RUNS_DIR     = OUT_BASE
 # RÉORG 2026-07-15 : tout ce qui concerne UNE config vit sous OUT_BASE/<run_tag>/
@@ -209,11 +243,40 @@ def build_inputs():
     Si les fichiers existent → build_features sauté (start-from-assembly)."""
     return ([COEXPR] + humess_importance_files()) if BUILD_ON else []
 
-# Mode BULK (généralisation V6) : injecte l'env dataset-agnostique à gnn_vgae
-# (conditions + matrice/group-meta = sorties prep dans dirname(coexpr_file)) et
-# force la coexpr différentielle. Sans build.enabled → chemin HUVEC inchangé.
+# ── DÉCRIRE son dataset ≠ RECONSTRUIRE ses features ────────────────────────
+# Jusqu'au 2026-07-27 les variables d'env qui DÉCRIVENT le dataset (groupes,
+# matrice, samplesheet) n'étaient injectées que sous `build.enabled: true`, qui
+# déclenche AUSSI la reconstruction lourde coexpr+HuMess. Conséquence : aucun
+# moyen de faire tourner un dataset bulk déjà préparé — ni un jeu minuscule.
+# Les deux sont désormais séparés. Le bloc `dataset:` prime ; sans lui,
+# `build.enabled` garde son comportement historique (rétro-compatible).
+_DS = config.get("dataset", {}) or {}
+_DS_GROUPS = str(_DS.get("cell_groups", "") or "").strip()
+_DS_MATRIX = str(_DS.get("expr_matrix", "") or "").strip()
+_DS_META   = str(_DS.get("group_meta", "") or "").strip()
+
+def _abs_to_data_root(p):
+    """Chemin relatif → relatif à data_root (comme le reste de la config)."""
+    return p if (not p or os.path.isabs(p)) else str(DATA_ROOT / p)
+
 TRAIN_COEXPR_FLAGS = ""
-if BUILD_ON:
+if _DS_GROUPS or _DS_MATRIX or _DS_META:
+    if not (_DS_GROUPS and _DS_MATRIX and _DS_META):
+        raise ValueError(
+            "dataset: exige les TROIS clés ensemble — cell_groups, expr_matrix, "
+            "group_meta. Une seule manquante et gnn_vgae repart en mode scRNA "
+            "HUVEC, qui cherchera merged_P4_P16_metadata.csv.")
+    # GNN_EXPR_MATRIX est résolu par le code RELATIVEMENT à data_root/gnn_data
+    # (os.path.join(GNN_DATA_DIR, EXPR_MATRIX)) → on ne passe QUE le nom de
+    # fichier. GNN_GROUP_META, lui, est ouvert tel quel → chemin complet.
+    GNN_ENV += " " + " ".join([
+        "GNN_CELL_GROUPS=" + _DS_GROUPS,
+        "GNN_HUMESS_CONDITIONS=" + _DS_GROUPS,
+        "GNN_EXPR_MATRIX=" + os.path.basename(_DS_MATRIX),
+        "GNN_GROUP_META=" + _abs_to_data_root(_DS_META),
+    ])
+elif BUILD_ON:
+    # Mode BULK historique : les sorties de prep vivent à côté du coexpr_file.
     _coex_dir = str(Path(COEXPR).parent)
     _conds = ",".join(HUMESS_CONDS)
     GNN_ENV += " " + " ".join([
@@ -222,7 +285,34 @@ if BUILD_ON:
         "GNN_EXPR_MATRIX=" + _coex_dir + "/expr_all.csv",
         "GNN_GROUP_META=" + _coex_dir + "/samplesheet.tsv",
     ])
+
+if BUILD_ON:
     TRAIN_COEXPR_FLAGS = "--coexpr-mode differential --diff-coexpr-file " + str(COEXPR)
+
+# ── Pôles de l'axe d'état ───────────────────────────────────────────────────
+# `perturb_top_genes` a pour défauts --quiescent-groups P4 et des cibles
+# P16_cluster_0..3 : la structure HUVEC à 5 groupes, codée en dur. Sur tout
+# autre dataset l'axe échouait en KeyError('mean_P16_cluster_1'). Ces deux
+# drapeaux existaient mais n'étaient exposés nulle part dans le workflow.
+# `dataset.pole_a` = origine (état de départ), `pole_b` = destination.
+_POLE_A = str(_DS.get("pole_a", "") or "").strip()
+_POLE_B = str(_DS.get("pole_b", "") or "").strip()
+if (_POLE_A or _POLE_B) and not (_POLE_A and _POLE_B):
+    raise ValueError("dataset.pole_a et dataset.pole_b vont par paire "
+                     "(origine et destination de la transition).")
+# Défaut : les deux premiers cell_groups déclarés, dans l'ordre. Sur un dataset
+# à deux états c'est la seule lecture sensée, et cela évite d'imposer une
+# redite. Au-delà de deux groupes, mieux vaut être explicite.
+if not _POLE_A and _DS_GROUPS:
+    _g = [g.strip() for g in _DS_GROUPS.split(",") if g.strip()]
+    if len(_g) == 2:
+        _POLE_A, _POLE_B = _g[0], _g[1]
+POLE_FLAGS = (("--quiescent-groups " + _POLE_A + " --p16-groups " + _POLE_B)
+              if (_POLE_A and _POLE_B) else "")
+
+# Sous-ensemble de GNN_ENV utile aux étapes AVAL (perturbation) : elles ne
+# reconstruisent pas le graphe mais doivent en partager la description.
+DATASET_ENV = ("GNN_CELL_GROUPS=" + _DS_GROUPS) if _DS_GROUPS else ""
 
 # ──────────────────────────────────────────────────────────────────
 # Split build ↔ train (depuis le refactor modulaire de gnn_vgae) :
@@ -252,6 +342,17 @@ def final_targets():
         t.append(ANALYSIS_DIR / "interpret" / "decoy_confidence.tsv")
     if CLUSTER_ANNOT:
         t.append(ANALYSIS_DIR / "cluster_annotation" / "cluster_annotation_cross_seed.tsv")
+    # Validations branchées (Stage 10). Le QC est le seul actif par défaut.
+    if QC_ON:
+        t.append(ANALYSIS_DIR / "qc" / "qc_report.md")
+    if PURITY_ON:
+        t.append(ANALYSIS_DIR / "interpret" / "purity" / "mediate.tsv")
+    if H2H_ON:
+        t.append(ANALYSIS_DIR / "interpret" / "head_to_head_baselines.tsv")
+    if READOUT_SPEC_ON:
+        t.append(ANALYSIS_DIR / "interpret" / "readout_specificity.tsv")
+    if ORA_DE_BASE_ON:
+        t.append(ANALYSIS_DIR / "interpret" / "ora" / "de_baseline.tsv")
     return t
 
 rule all:
@@ -373,10 +474,14 @@ rule perturb:
         mem_mb=32000,
         runtime=1200,   # 20 h : all-genes ×11k gènes frôle/dépasse 8 h (mur qos short=24 h)
     shell:
-        "{PY} src/perturbation/perturb_top_genes.py "
+        # GNN_CELL_GROUPS doit être injecté ICI aussi : gnn_perturbation lit
+        # la même variable pour ordonner les noeuds cell_group. Sans elle, la
+        # perturbation retombe sur les 5 groupes HUVEC et échoue en KeyError
+        # sur tout autre dataset, alors que le graphe, lui, était correct.
+        "{DATASET_ENV} {PY} src/perturbation/perturb_top_genes.py "
         "--run-dir {params.rd} --all-genes --modes {wildcards.mode} "
         "--device {DEVICE} {params.suffix} {params.genes} {params.multi} "
-        "{params.axis} {params.rndaxis} &> {log}"
+        "{params.axis} {params.rndaxis} {POLE_FLAGS} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -543,6 +648,148 @@ rule cluster_annotation:
     shell:
         "{PY} src/validation/cluster/cluster_annotation.py "
         "--cross-seed-runs {input.ge} --out-dir {params.out_dir} &> {log}"
+
+
+# ══════════════════════════════════════════════════════════════════
+# Stage 10 — VALIDATIONS BRANCHÉES (2026-07-27)
+#
+# Cinq modules de validation existaient mais n'étaient appelés de NULLE PART —
+# ni ici, ni dans un run_*.sh. Ils tournaient à la main, donc pas du tout :
+# `pipeline_qc.py` le dit lui-même dans sa docstring (« None of them was part
+# of the pipeline, so every wave shipped without them »). Les voici câblés.
+#
+# Tous sont pilotés par `validation.<nom>.enabled` et n'entrent dans
+# `final_targets()` que si activés — le DAG par défaut est donc inchangé.
+# ══════════════════════════════════════════════════════════════════
+
+rule pipeline_qc:
+    """Les 5 contrôles qui doivent passer AVANT de lire une ablation.
+
+    plancher de bruit · multiplicité d'arêtes · recouvrement de sources ·
+    confusion degré↔readout · spécificité d'axe.
+
+    Chacun a attrapé un défaut réel (PPI stocké 2×, tf_curated ⊂
+    transcriptional à 99.9 %, ρ 0.556 entre runs identiques). Le script sort
+    en 1 si un contrôle BLOQUANT échoue ; `validation.qc.blocking` décide si
+    cela fait tomber la règle ou seulement le rapport.
+    """
+    input:
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+    output:
+        report=ANALYSIS_DIR / "qc" / "qc_report.md",
+    params:
+        wave=CONFIG_DIR,
+        rd=run_dir(SEEDS[0]),
+        repro=_QC_REPRO_FLAGS,
+        # Non bloquant par défaut : le rapport doit exister même quand un
+        # contrôle échoue, sinon on perd précisément le diagnostic qu'on
+        # cherchait. Passer validation.qc.blocking: true pour barrer une vague.
+        guard=("" if QC_BLOCKING else " || true"),
+    log:
+        LOG_DIR / "pipeline_qc.log",
+    shell:
+        'mkdir -p "$(dirname {output.report})" "$(dirname {log})" && '
+        "{PY} src/validation/qc/pipeline_qc.py all "
+        "--wave {params.wave} --run-dir {params.rd} {params.repro} "
+        "--out {output.report} &> {log}{params.guard}"
+
+
+rule purity_source_attribution:
+    """D'OÙ vient la purity qui classe une cible, et quelle SOURCE la porte ?
+
+    Encodeur gelé, post-hoc sur Δz. `decompose` = contribution alignée par
+    distance 1/2-hop ; `mediate` = ablation ciblée des arêtes incidentes par
+    source + nulle d'axe aléatoire. C'est la réponse à l'objection « ces cibles
+    tiennent sur une seule source ».
+    """
+    input:
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+        model=run_dir(SEEDS[0]) / "best_vgae.pt",
+    output:
+        decompose=ANALYSIS_DIR / "interpret" / "purity" / "decompose.tsv",
+        mediate=ANALYSIS_DIR / "interpret" / "purity" / "mediate.tsv",
+    params:
+        rd=run_dir(SEEDS[0]),
+        targets=PURITY_TARGETS,
+        n_random=PURITY_N_RANDOM,
+    log:
+        LOG_DIR / "purity_source_attribution.log",
+    shell:
+        'mkdir -p "$(dirname {output.decompose})" "$(dirname {log})" && '
+        "{PY_TORCH} src/validation/explain/purity_source_attribution.py decompose "
+        "--run-dir {params.rd} --ranking {input.ranking} "
+        "--targets {params.targets} --device {DEVICE} "
+        "--out {output.decompose} &> {log} && "
+        "{PY_TORCH} src/validation/explain/purity_source_attribution.py mediate "
+        "--run-dir {params.rd} --ranking {input.ranking} "
+        "--targets {params.targets} --device {DEVICE} "
+        "--n-random {params.n_random} --out {output.mediate} &>> {log}"
+
+
+rule head_to_head_baselines:
+    """Un outil PLUS SIMPLE sort-il les mêmes cibles que le GNN ?
+
+    Reconstruit sans GNN les baselines de chaque source (feature d'importance,
+    betweenness par source et combinée) et les confronte au driver_score.
+    C'est la preuve que le ranking n'est pas re-dérivable trivialement.
+    """
+    input:
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+    output:
+        h2h=ANALYSIS_DIR / "interpret" / "head_to_head_baselines.tsv",
+    params:
+        humess=HUMESS_DIR,
+        coexpr=COEXPR,
+        targets=(" --targets " + str(H2H_TARGETS)) if H2H_TARGETS else "",
+    log:
+        LOG_DIR / "head_to_head_baselines.log",
+    shell:
+        'mkdir -p "$(dirname {output.h2h})" "$(dirname {log})" && '
+        "{PY} src/validation/reports/head_to_head_baselines.py "
+        "--ranking {input.ranking} --humess-dir {params.humess} "
+        "--coexpr-file {params.coexpr}{params.targets} "
+        "--out {output.h2h} &> {log}"
+
+
+rule readout_specificity:
+    """Diagnostics de readout SANS confusion de degré, depuis le cache Δz.
+
+    Sur graphe dépouillé le signal décroît avec le degré ; ces métriques
+    séparent l'effet réel de l'artefact structurel.
+    """
+    input:
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+        model=run_dir(SEEDS[0]) / "best_vgae.pt",
+    output:
+        spec=ANALYSIS_DIR / "interpret" / "readout_specificity.tsv",
+    params:
+        rd=run_dir(SEEDS[0]),
+        mode=MODES[0],
+    log:
+        LOG_DIR / "readout_specificity.log",
+    shell:
+        'mkdir -p "$(dirname {output.spec})" "$(dirname {log})" && '
+        "{PY_TORCH} src/validation/explain/readout_specificity.py "
+        "--run-dir {params.rd} --ranking {input.ranking} "
+        "--mode {params.mode} --out {output.spec} &> {log}"
+
+
+rule ora_de_baseline:
+    """ORA sur le DE seul — le comparateur obligatoire du GNN.
+
+    Sans lui, rien ne dit que l'enrichissement du top-drivers apporte quoi que
+    ce soit au-dessus d'un simple tri par statistique DE.
+    """
+    output:
+        ora=ANALYSIS_DIR / "interpret" / "ora" / "de_baseline.tsv",
+    params:
+        top_n=ORA_TOP_N,
+    log:
+        LOG_DIR / "ora_de_baseline.log",
+    shell:
+        'mkdir -p "$(dirname {output.ora})" "$(dirname {log})" && '
+        "{PY} src/validation/ora/ora_de_baseline.py "
+        "--top-k {params.top_n} > {output.ora} 2> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────

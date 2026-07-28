@@ -154,6 +154,47 @@ validation:
   cluster_annotation:
     enabled: true
 
+  # ── Validations branchées le 2026-07-27 ─────────────────────────────────
+  # Ces cinq modules existaient depuis des semaines mais n'étaient appelés de
+  # NULLE PART (ni Snakefile, ni run_*.sh) : ils ne tournaient donc jamais.
+  # Cf. Stage 10 du Snakefile.
+
+  qc:
+    # Les 5 contrôles à passer AVANT de lire une ablation : plancher de bruit,
+    # multiplicité d'arêtes, recouvrement de sources, confusion degré↔readout,
+    # spécificité d'axe. Chacun a déjà attrapé un défaut réel.
+    enabled: true
+    # blocking: true fait ÉCHOUER la règle si un contrôle bloquant tombe (à
+    # activer pour barrer une vague). Par défaut le rapport est écrit quoi
+    # qu'il arrive — c'est justement quand un contrôle échoue qu'on le veut.
+    blocking: false
+    # `repro` = plancher de bruit entre DEUX RUNS DE LA MÊME CONFIG. Laisser
+    # vide sauf à disposer réellement de ces deux runs : deux seeds différents
+    # mesureraient la variance de seed, pas le bruit de reproductibilité.
+    repro_a: ""
+    repro_b: ""
+
+  purity_source:
+    # D'où vient la purity qui classe une cible, et quelle source la porte ?
+    # (encodeur gelé, post-hoc sur Δz ; `decompose` + `mediate` + nulle d'axe)
+    enabled: false
+    targets: ""             # OBLIGATOIRE si enabled — ex. "OCRL SYNJ2 SMPD1"
+    n_random: 200           # axes aléatoires pour la nulle de spécificité
+
+  head_to_head:
+    # Un outil plus simple (feature d'importance, betweenness) sort-il les
+    # mêmes cibles que le GNN ?
+    enabled: false
+    targets: ""             # fichier de cibles ; vide = défaut du script
+
+  readout_specificity:
+    # Métriques de readout affranchies du degré, depuis le cache Δz.
+    enabled: false
+
+  ora_de_baseline:
+    # ORA sur le DE seul = le comparateur obligatoire de l'ORA top-drivers.
+    enabled: false
+
 # ── Stage 10 : cross-method (opt-in, non câblé end-to-end)
 comparison:
   enabled: false
