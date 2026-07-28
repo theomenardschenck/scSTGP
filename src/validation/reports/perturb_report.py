@@ -2554,17 +2554,33 @@ def fig_cross_seed_training_curves(metrics: list[dict], out: Path,
     # Panel 4 — bar: VGAE best AUC per seed vs MLP
     ax = axes[1, 1]
     labels = [m.get("seed_dir", f"seed{i}") for i, m in enumerate(metrics)]
-    vgae = [m.get("best_auc", 0.0) for m in metrics]
-    mlp = [m.get("mlp_auc", 0.0) for m in metrics]
+
+    # `.get(key, default)` ne suffit PAS ici : avec `--no-baselines` la clé
+    # existe et vaut null, donc le défaut ne s'applique jamais et matplotlib
+    # reçoit None. La règle d'agrégation entière tombait alors — y compris
+    # cross_seed_gene_ranking.tsv, jamais écrit — pour une simple figure.
+    # Un drapeau d'entraînement supporté ne doit pas casser le rapport aval.
+    def _num(m, key):
+        v = m.get(key)
+        return float(v) if v is not None else None
+
+    vgae = [_num(m, "best_auc") or 0.0 for m in metrics]
+    mlp = [_num(m, "mlp_auc") for m in metrics]
+    has_mlp = any(v is not None for v in mlp)
+    mlp = [v if v is not None else 0.0 for v in mlp]
+
     x = np.arange(len(labels))
-    w = 0.4
-    ax.bar(x - w / 2, vgae, w, label="VGAE", color="#3498DB")
-    ax.bar(x + w / 2, mlp, w, label="MLP", color="#2ECC71")
+    w = 0.4 if has_mlp else 0.6
+    ax.bar(x - (w / 2 if has_mlp else 0), vgae, w, label="VGAE", color="#3498DB")
+    if has_mlp:
+        ax.bar(x + w / 2, mlp, w, label="MLP", color="#2ECC71")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("test AUC")
-    ax.set_ylim(min(min(vgae + mlp) - 0.05, 0.5), 1.0)
-    ax.set_title("Best test AUC per seed vs MLP")
+    _floor = min(vgae + (mlp if has_mlp else [])) - 0.05
+    ax.set_ylim(min(_floor, 0.5), 1.0)
+    ax.set_title("Best test AUC per seed vs MLP" if has_mlp
+                 else "Best test AUC per seed (baselines désactivées)")
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3, axis="y")
     if vgae:

@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -93,10 +94,19 @@ DEFAULT_LATENT = 64
 DEFAULT_LAYERS = 3
 DEFAULT_HEADS = 4
 
-# Ordre FIXE des 5 noeuds cell_group, tel que construit dans gnn_vgae.py:468.
-# L'index dans ce tuple = l'index du noeud cell_group dans le HeteroData.
-CELL_GROUPS = ("P4", "P16_cluster_0", "P16_cluster_1",
-               "P16_cluster_2", "P16_cluster_3")
+# Ordre FIXE des noeuds cell_group, tel que construit à la construction du
+# graphe. L'index dans ce tuple = l'index du noeud cell_group dans le HeteroData
+# — il DOIT donc coïncider avec l'ordre utilisé par `_graph_build_body.py`.
+#
+# Configurable par GNN_CELL_GROUPS, exactement comme côté construction. Cette
+# constante était figée sur les 5 groupes HUVEC alors que `_graph_build_body`
+# lisait déjà l'env : les deux moitiés du pipeline avaient divergé, si bien que
+# tout dataset non-HUVEC construisait un graphe correct puis échouait à la
+# perturbation en KeyError('mean_P4'). Relevé par le jeu jouet, 2026-07-28.
+CELL_GROUPS = tuple(g.strip() for g in os.environ.get(
+    "GNN_CELL_GROUPS",
+    "P4,P16_cluster_0,P16_cluster_1,P16_cluster_2,P16_cluster_3").split(",")
+    if g.strip())
 
 
 # --------------------------------------------------------------------------- #
@@ -1645,6 +1655,19 @@ def load_run(run_dir: Path, hidden, latent, n_layers, n_heads, device="cpu"):
             _hp = _m.get("hyperparams", {}) if isinstance(_m, dict) else {}
             signed_message = bool(_hp.get("signed_message", False))
             signed_decoder = bool(_hp.get("signed_decoder", False))
+            # `latent_dim` est persisté depuis --latent-dim (V4.3-tune). C'est
+            # une PROPRIÉTÉ DU CHECKPOINT, pas une préférence de l'appelant :
+            # un modèle entraîné en 16 ne se charge pas dans une architecture
+            # en 64, quoi que demande la CLI. On fait donc primer la valeur
+            # persistée. Sans cela, TOUT run entraîné avec un --latent-dim
+            # non défaut était imperturbable (RuntimeError size mismatch sur
+            # encoder.mu_head) — et c'est précisément ce que balaie la
+            # recherche d'hyperparamètres. Relevé par le jeu jouet, 2026-07-28.
+            _persisted_latent = _hp.get("latent_dim")
+            if _persisted_latent is not None and int(_persisted_latent) != int(latent):
+                print(f"[load_run] latent {latent} → {_persisted_latent} "
+                      f"(valeur du checkpoint, lue dans {metrics_path.name})")
+                latent = int(_persisted_latent)
         except Exception as _e:
             print(f"[warn] lecture {metrics_path.name} échouée : {_e} — "
                   f"V5 flags supposés False (backward-compat V4.x).")
