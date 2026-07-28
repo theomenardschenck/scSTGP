@@ -1,0 +1,83 @@
+# ===========================================================================
+# ablations_supervised.yaml — V6.4 : tête de prédiction de sous-état (V-sup)
+#
+# CE QUE FAIT LA TÊTE (_supervised.py). Une tête MLP multi-label branchée sur le
+# latent μ PAR GÈNE, prédisant l'appartenance aux labels {P4_vs_P16,
+# cluster_0..3} (le gène est-il DEG/marqueur de chaque sous-état). Co-entraînée
+# DANS la boucle VGAE (la reconstruction n'est JAMAIS interrompue → run
+# perturbation-ready) : loss = recon + β·KL + λ_signed·aux + λ_sup·weighted_bce.
+# `finalize_supervised` (_train_body.py) écrit, après entraînement :
+#   - un SCORE D'IMPORTANCE PAR GÈNE ET PAR SOUS-CLUSTER (saliency grad×input,
+#     `cluster_importance`) = « quels gènes portent l'appartenance à cluster_k »,
+#   - l'éval de la tête (AUC/AP par label) + le checkpoint de tête.
+# Complémentaire (pas redondant) du driver_score par axe : la saliency dit « μ
+# encode l'appartenance à k », la perturbation dit « perturber g déplace le long
+# de l'axe k ».
+#
+# CIRCULARITÉ — l'axe orthogonal du projet. La tête est propre TANT QU'ON NE LUI
+# DONNE PAS la DE en feature. `--de-features` (flag de BUILD) injecterait les
+# stats DE comme features de nœud → la tête prédirait la DE qu'on lui a donnée
+# (circulaire). Les deux bras `*-sup` ci-dessous sont SANS de-features (test
+# propre : « ce que la topologie + features non-DE savent du sous-état »). Le
+# bras `rich-sup-defeat` AJOUTE `--de-features` = PLAFOND circulaire de référence
+# (tag `de-feat`) : borne haute que la saliency propre ne devrait pas atteindre.
+#
+# PRÉDICTION. Si μ encode réellement les sous-états sans DE en feature, la tête
+# propre a AUC(label) nettement > 0.5 et la saliency par cluster sort des
+# marqueurs plausibles ; l'écart au bras `de-feat` mesure la part non-circulaire.
+#
+# VERROUS (LOG §27/§28) : deterministic + 3 seeds, non négociables (plancher de
+# bruit rho 0.556-0.687 sinon).
+#
+# ⚠️ DÉPENDANCE LABELS. --supervised reconstruit les 5 labels DEG dans le train
+# (_train_body.py). Les caches DEGs_P16_cluster_*.csv ont disparu de data/gnn_data
+# (cf. CLAUDE.md) → --supervised-recompute-labels force le recalcul scanpy
+# Wilcoxon, qui a besoin de la MATRICE d'expression scRNA sur le nœud d'exécution.
+# À vérifier AVANT de lancer sur le cluster (sinon le train plante à l'étape tête).
+#
+# ⚠️ PPI mirror-dedup (LOG §32) est ON par défaut → ces runs tournent sur le
+# graphe PPI CORRIGÉ (2x), pas le 4x legacy. Bonus, mais les rend non
+# directement comparables aux rankings V6.1.3 rich (graphe 4x).
+#
+# Usage (détaché !) :
+#   tmux new -s sup
+#   scripts/run_omnipath_ablation_wave.sh workflow/config/ablations_supervised.yaml \
+#       --profile workflow/profiles/slurm -j 8 --parallel 2
+#   # saliency par cluster : <config>/s*/  (sorties finalize_supervised)
+# ===========================================================================
+
+root_tag: "sup"
+seeds: [1, 2, 3]
+deterministic: true
+
+# Pas de décoy N2/N4 ici : le livrable est la saliency par cluster, pas la nulle
+# de structure. random_axis reste utile (nulle de spécificité d'axe, ~gratuit).
+decoy: false
+decoy_random_axis: 20
+decoy_random_axis_seed: 0
+
+axis_method: diff
+axis_method_compare: ""
+
+base_extra_flags: >-
+  --signed-message --signed-decoder --use-reactome-fi
+  --use-omnipath-signaling --use-omnipath-tf-curated
+  --use-omnipath-node-features
+  --omnipath-edges transcriptional,enzyme_substrate,ligand_receptor
+  --reactome-fi-directed
+  --supervised --supervised-loss-weight 1.0 --supervised-recompute-labels
+
+_pure_flags: &pure >-
+  --dedup-ppi-signed remove --no-ppi
+  --exclude-features ppi_degree,reg_degree
+  --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges
+
+ablation_grid:
+  # ── Tête propre (SANS de-features) : saliency par sous-cluster non circulaire ─
+  - {name: pure-sup, add_flags: *pure}
+  - {name: rich-sup, add_flags: ""}
+
+  # ── Plafond circulaire de référence : la MÊME tête AVEC la DE en feature. ────
+  # Tag `de-feat`. Borne haute ; l'écart rich-sup ↔ rich-sup-defeat = part non
+  # circulaire de ce que μ sait des sous-états.
+  - {name: rich-sup-defeat, add_flags: "--de-features"}

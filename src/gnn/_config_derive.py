@@ -149,6 +149,9 @@ def _build_run_tag():
                  or MODULES["use_omnipath_tf_curated"])):
         parts.append("no-hgnc-alias")
     if MODULES["use_omnipath_node_features"]: parts.append("op-nodefeat")
+    # PPI mirror-dedup ON by default (bug fix) → tag ONLY the legacy 4x mode.
+    if MODULES["use_ppi"] and not getattr(CLI_ARGS, "dedup_ppi_mirror", True):
+        parts.append("ppi-mirror-dup")
     # V-sup : circularity must be visible in the run name — a run WITH DE
     # features never shares a directory with an anti-circular one.
     if USE_EXPR_NODE_FEATURES:                   parts.append("expr-feat")

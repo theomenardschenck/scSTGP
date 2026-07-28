@@ -691,28 +691,43 @@ print(f"  expresses : {edge_index_expresses.shape[1]} arêtes, "
 
 # ── 6b. PPI STRING ──────────────────────────────────────────────────────────
 # Arêtes protéine-protéine de STRING (>= 900, highest confidence).
-# Chaque interaction est BIDIRECTIONNELLE (i→j ET j→i).
+# Chaque interaction est BIDIRECTIONNELLE (i→j ET j→i). STRING liste chaque
+# paire deux fois (A,B et B,A) : --dedup-ppi-mirror (défaut ON) la canonicalise
+# pour ne stocker qu'un vrai 2x bidirectionnel (cf. bloc ci-dessous, LOG 2026-07-28).
 # Feature = combined_score / 1000 (normalisé dans [0, 1]).
 # Rôle biologique : encode les interactions physiques entre protéines.
 # Les hubs PPI (gènes avec beaucoup de partenaires) reçoivent plus de
 # messages et tendent à avoir des embeddings plus informatifs.
 ppi_src, ppi_dst, ppi_w = [], [], []
+# STRING lists each undirected interaction TWICE — as (A,B) AND (B,A). Adding
+# both directions per row therefore stores every directed edge 4x (measured
+# ratio 4.00). --dedup-ppi-mirror (default ON, bug fix 2026-07-28) canonicalises
+# the pair (min,max) and emits each undirected edge once as a true 2x
+# bidirectional edge; --no-dedup-ppi-mirror keeps the legacy 4x duplication.
+_ppi_mirror_dedup = getattr(CLI_ARGS, "dedup_ppi_mirror", True)
+_ppi_seen = set()
 if MODULES["use_ppi"]:
     for _, row in ppi_hc.iterrows():
         s1, s2 = string2sym.get(row["protein1"]), string2sym.get(row["protein2"])
         if s1 and s2 and s1 in gene_to_idx and s2 in gene_to_idx:
             i, j = gene_to_idx[s1], gene_to_idx[s2]
-            # Bidirectionnel : on ajoute les deux directions
+            if _ppi_mirror_dedup:
+                key = (i, j) if i < j else (j, i)
+                if i == j or key in _ppi_seen:  # skip STRING mirror + self-loops
+                    continue
+                _ppi_seen.add(key)
+            # Bidirectional: add both directions once per undirected pair.
             ppi_src.extend([i, j])
             ppi_dst.extend([j, i])
-            ppi_w.extend([row["combined_score"] / 1000.0] * 2)  # Même poids dans les deux sens
+            ppi_w.extend([row["combined_score"] / 1000.0] * 2)  # same weight both ways
 
 edge_index_ppi = (torch.tensor([ppi_src, ppi_dst], dtype=torch.long)
                   if ppi_src else torch.zeros((2, 0), dtype=torch.long))
 edge_attr_ppi = (torch.tensor(ppi_w, dtype=torch.float).unsqueeze(1)
                  if ppi_w else torch.zeros((0, 1), dtype=torch.float))
-print(f"  ppi : {len(ppi_src)//2} interactions ({len(ppi_src)} arêtes)"
-      + ("" if MODULES["use_ppi"] else " [SKIP --no-ppi]"))
+print(f"  ppi : {len(ppi_src)//2} interactions ({len(ppi_src)} arêtes"
+      + (", mirror-dedup ON" if _ppi_mirror_dedup else ", mirror-dedup OFF [legacy 4x]")
+      + ")" + ("" if MODULES["use_ppi"] else " [SKIP --no-ppi]"))
 
 # ── 6c. REACTOME (same_pathway) ─────────────────────────────────────────────
 # Pour chaque pathway REACTOME (2 à 20 gènes), on crée une arête entre

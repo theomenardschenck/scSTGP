@@ -213,6 +213,22 @@ def parse_cli_args(argv=None):
                         "colonne flag has_signed_counterpart (edge_dim "
                         "1→2). Cf. §14bis.6quaterdecies. Bénéfice plein "
                         "avec V5 (message/decodeur signés).")
+    # --- STRING PPI mirror-duplication fix (2026-07-28) ------------------
+    # STRING's protein.links file lists every undirected interaction TWICE
+    # — as (A,B) AND (B,A). The builder ALSO adds both directions per row,
+    # so each directed edge is stored 4x instead of 2x (measured ratio 4.00
+    # on rich-dir: 73030 unique pairs -> 292120 stored edges). This inflates
+    # ppi_degree and ||h_PPI|| (~13x, cf. LOG). ON by default = correct 2x
+    # bidirectional; --no-dedup-ppi-mirror reproduces the legacy 4x bug.
+    p.add_argument("--dedup-ppi-mirror", dest="dedup_ppi_mirror",
+                   action="store_true", default=True,
+                   help="Collapse STRING mirror rows (A,B)+(B,A) so each "
+                        "undirected PPI is stored once as a true 2x "
+                        "bidirectional edge. DEFAULT ON (bug fix).")
+    p.add_argument("--no-dedup-ppi-mirror", dest="dedup_ppi_mirror",
+                   action="store_false",
+                   help="Legacy behaviour: keep STRING mirror duplication "
+                        "(each PPI stored 4x). Tag 'ppi-mirror-dup'.")
 
     # --- V5 : message-passing signé + décodeur bilinéaire signé (TIER 1c) ---
     # Tous opt-in, défaut OFF → backward-compat V4.x. Cf. §14bis.6septies
