@@ -30,6 +30,7 @@ MATRIX="data/pyscenic/GSE163251/expr_all.csv"
 GROUP_META="data/pyscenic/GSE163251/samplesheet.tsv"
 COEXPR="data/pyscenic/GSE163251/coexpr_diff.tsv"
 HUMESS_DIR_REL="data/humess/GSE163251"
+SCENIC_DIR_REL=""   # si non-vide → export GNN_SCENIC_DIR (regulons pySCENIC externes)
 CELL_GROUPS="pro,sen"; HUMESS_CONDS="pro,sen"
 DATA_DIR="data"
 N_EPOCHS=1200; PATIENCE=150; CPUS=8; MEM="16G"; USE_GPU=1; DRY=0
@@ -49,6 +50,7 @@ while [[ $# -gt 0 ]]; do case "$1" in
   --group-meta) GROUP_META="$2"; shift 2;;
   --coexpr-file) COEXPR="$2"; shift 2;;
   --humess-dir) HUMESS_DIR_REL="$2"; shift 2;;
+  --scenic-dir) SCENIC_DIR_REL="$2"; shift 2;;
   --cell-groups) CELL_GROUPS="$2"; shift 2;;
   --humess-conditions) HUMESS_CONDS="$2"; shift 2;;
   --data-dir) DATA_DIR="$2"; shift 2;;
@@ -88,6 +90,7 @@ export GNN_GROUP_META="\$(readlink -f "$GROUP_META")"
 export GNN_CELL_GROUPS="$CELL_GROUPS"
 export GNN_HUMESS_CONDITIONS="$HUMESS_CONDS"
 export GNN_HUMESS_DIR="\$(readlink -f "$HUMESS_DIR_REL")"
+$( [[ -n "$SCENIC_DIR_REL" ]] && printf 'export GNN_SCENIC_DIR="$(readlink -f %q)"' "$SCENIC_DIR_REL" )
 \$PY src/gnn/gnn_vgae.py --seed ${seed} --run-tag ${RUN_TAG}.s${seed} \\
     --n-epochs $N_EPOCHS --patience $PATIENCE \\
     --diff-coexpr-file "\$(readlink -f "$COEXPR")" $FLAGS

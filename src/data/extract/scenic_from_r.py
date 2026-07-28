@@ -43,6 +43,14 @@ import glob
 import pickle
 import pandas as pd
 import numpy as np
+# Shim compat numpy≥1.24 : pySCENIC 0.12.1 (et ctxcore/loompy) référencent
+# encore np.object/np.bool/np.int/np.float/np.str, retirés depuis numpy 1.24.
+# L'env `arboreto` tourne en numpy 1.26 (requis par arboreto/scanpy) ; on
+# restaure les alias builtins AVANT tout import pySCENIC (paresseux, dans main()).
+for _np_alias, _np_builtin in {"object": object, "bool": bool, "int": int,
+                               "float": float, "str": str}.items():
+    if not hasattr(np, _np_alias):
+        setattr(np, _np_alias, _np_builtin)
 # scanpy / matplotlib / seaborn — imports paresseux dans main() (UMAP
 # legacy). La sous-commande grnboost2-diff n'en a pas besoin et l'env
 # `arboreto` GLiCID ne les installe pas (fail au top-level cassait
@@ -58,15 +66,18 @@ def main():
     from dask.distributed import Client, LocalCluster
     import os
     
-    # Option recommandée : limiter le nombre de workers pour éviter les problèmes de mémoire
-    n_workers = min(6, os.cpu_count() or 4)   # adapte selon ta machine
-    
+    # Workers/mémoire dask paramétrables par env (STGP_SCENIC_WORKERS /
+    # STGP_SCENIC_MEM_LIMIT) : box 7 Go → "2"/"2GB" ; cluster → défauts larges.
+    n_workers = int(os.environ.get("STGP_SCENIC_WORKERS",
+                                   min(6, os.cpu_count() or 4)))
+    _mem_limit = os.environ.get("STGP_SCENIC_MEM_LIMIT", "8GB")
+
     cluster = LocalCluster(
         n_workers=n_workers,
         threads_per_worker=1,          # 1 thread : évite race condition dans ctxcore
         dashboard_address=None,
         silence_logs=True,             # réduit le bruit
-        memory_limit="8GB"             # adapte selon ta RAM
+        memory_limit=_mem_limit        # adapte selon ta RAM
     )
     client = Client(cluster)
 
@@ -83,12 +94,18 @@ def main():
     _root = os.environ.get("STGP_ROOT") or os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     WORK_DIR = os.path.join(_root, "data", "pyscenic")
-    RESULTS_DIR = os.path.join(_root, "output", "pyscenic")
+    # Surcharges env pour tourner sur un dataset externe (ex. GSE252921 endo)
+    # sans toucher aux chemins P16 par défaut : STGP_SCENIC_{RESULTS,EXPR,META,
+    # CLUSTER_COL}. Les feathers/TF-list/motif TBL restent partagés (scenic_refs).
+    RESULTS_DIR = os.environ.get("STGP_SCENIC_RESULTS",
+                                 os.path.join(_root, "output", "pyscenic"))
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    # Fichier d'expression exporté depuis R
-    EXPR_MATRIX = os.path.join(WORK_DIR, "expr_matrix_P16.csv")
-    CELL_METADATA = os.path.join(WORK_DIR, "cell_metadata_P16.csv")
+    # Fichier d'expression exporté depuis R (cellules × gènes)
+    EXPR_MATRIX = os.environ.get("STGP_SCENIC_EXPR",
+                                 os.path.join(WORK_DIR, "expr_matrix_P16.csv"))
+    CELL_METADATA = os.environ.get("STGP_SCENIC_META",
+                                   os.path.join(WORK_DIR, "cell_metadata_P16.csv"))
 
     # Fichiers de référence SCENIC (à télécharger, voir ci-dessus)
     REFS_DIR = os.path.join(WORK_DIR, "scenic_refs")
@@ -271,7 +288,8 @@ def main():
 
     # Ajouter les clusters aux données AUCell
     auc_with_clusters = auc_matrix.copy()
-    auc_with_clusters["cluster"] = metadata.loc[auc_matrix.index, "seurat_clusters"]
+    _cluster_col = os.environ.get("STGP_SCENIC_CLUSTER_COL", "seurat_clusters")
+    auc_with_clusters["cluster"] = metadata.loc[auc_matrix.index, _cluster_col]
 
     # --- 6a. Top 25 TFs les plus variables (comme dans l'article) ---
     tf_variance = auc_matrix.var(axis=0).sort_values(ascending=False)
