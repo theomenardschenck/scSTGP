@@ -1,19 +1,55 @@
-# ── Outputs et données (jamais versionnés) ──────────────────────────
+# =============================================================================
+# .gitignore — (sc)STGP
+#
+# Règle de lecture : ce dépôt versionne l'OUTIL (code, workflow, caches de bases
+# publiques légers) et RIEN des données d'entrée, des sorties, ni du cahier de
+# labo. Deux pièges ont déjà coûté un run cluster ; ils sont annotés ci-dessous.
+# =============================================================================
+
+# ── Sorties (jamais versionnées) ─────────────────────────────────────
 output/
-# `data/` ancré à la racine, MÊME RAISON que `/figures/` ci-dessous : non ancré,
-# il ignorait aussi `src/data/` — donc 6 fichiers SOURCE (les 4 loaders V6 +
-# build_supervised_labels.py + matrix_to_de.R) n'étaient pas versionnés, donc
-# absents du cluster. Le bras --de-features de la vague deprobe a crashé là-dessus
-# (ModuleNotFoundError: build_supervised_labels). Corrigé 2026-07-22.
-/data/
-# `figures/` ancré à la racine : sinon il ignore aussi le code source
+
+# ── Données d'entrée ─────────────────────────────────────────────────
+# `/data/` ANCRÉ à la racine. Non ancré, il ignorait aussi `src/data/` : 6 fichiers
+# SOURCE (les 4 loaders V6 + build_supervised_labels.py + matrix_to_de.R) n'étaient
+# pas versionnés, donc absents du cluster → le bras --de-features de la vague
+# deprobe a crashé en ModuleNotFoundError. Corrigé 2026-07-22. NE PAS désancrer.
+/data/*
+
+# EXCEPTION VOLONTAIRE — caches OmniPath/HGNC (~7 Mo, bases publiques).
+# Ils sont versionnés parce que le pipeline est INERTE sans eux (features à 0,
+# 0 arête extra) et que l'échec V6.1.3 venait précisément de leur absence sur le
+# cluster. Les re-inclusions doivent être écrites niveau par niveau : git ne sait
+# pas ré-inclure un fichier dont un répertoire parent est exclu.
+!/data/omnipath/
+/data/omnipath/*
+!/data/omnipath/*.tsv.gz
+!/data/omnipath/graph/
+/data/omnipath/graph/*
+!/data/omnipath/graph/*.tsv.gz
+!/data/omnipath/graph_raw/
+/data/omnipath/graph_raw/*
+!/data/omnipath/graph_raw/*.tsv.gz
+
+# `figures/` ANCRÉ pour la même raison : sinon il ignore le code source
 # src/validation/figures/ (les figures de sortie vivent sous output/).
 /figures/
+
+# ── Cahier de labo : local, non publié (décision 2026-07-27) ─────────
 docs/
+CLAUDE.md
+TODO
 to_ignore/
+memoire/
+TOM/
+axis_idea.md
+*.pdf
+
 # ── Python ──────────────────────────────────────────────────────────
+# ⚠️ NE PAS ré-ajouter `__init__.py` ici. Il y a figuré jusqu'au 2026-07-27 et
+# rendait tout fichier de paquet silencieusement non-suivi — même famille de
+# piège que le `/data/` non ancré ci-dessus.
 __pycache__/
-__init__.py
 *.py[cod]
 *$py.class
 *.egg-info/
@@ -24,6 +60,7 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .coverage
+coverage.xml
 htmlcov/
 .tox/
 
@@ -33,7 +70,6 @@ venv/
 env/
 ENV/
 .venv-local/
-.venv-local/*
 
 # ── Notebooks ───────────────────────────────────────────────────────
 .ipynb_checkpoints/
@@ -56,28 +92,27 @@ scripts/logs/
 
 # ── Snakemake ───────────────────────────────────────────────────────
 .snakemake/
-.ablwave.*/          # configs d'ablation générés sur FS partagé (run_omnipath_ablation_wave)
+.ablwave.*/
 
 # ── Modèles entraînés (gros, recalculables) ─────────────────────────
 *.pt
 *.pth
 *.ckpt
 
-# ── Other ──────────────────────────
-CLAUDE.md
-.gitignore
-*.pdf
+# ── Optimisation automatique (études Optuna : état local, recalculable) ──
+optuna/
+*.db-journal
 
-# ── OmniPath full-graph sub-project ───────────────────────────────────
-#    hgnc_alias.py + omnipath_graph.py + build_omnipath_graph.py sont CÂBLÉS/
-#    requis par le pipeline (alias + features + arêtes extra V6) → suivis par git,
-#    pour que le cluster puisse RECONSTRUIRE l'artefact sur le frontal (sinon run
-#    INERTE : features à 0, 0 arête extra — cf. échec V6.1.3).
-#    Restent ignorés : l'exploration locale et les artefacts data (à STAGER via
-#    rsync, ou reconstruire avec build_omnipath_graph.py sur le frontal).
+# ── Golden test : le HARNAIS est versionné, pas la RÉFÉRENCE ────────
+# La référence (11 133 × 64 embeddings, ~9 Mo) est un artefact local lié à un
+# cache de graphe donné ; elle se régénère par `tests/golden/run_golden.sh
+# capture`. La versionner alourdirait le dépôt d'un blob que personne d'autre
+# ne peut reproduire.
+tests/golden/reference/
+tests/golden/_*/
+
+# ── Exploration locale ──────────────────────────────────────────────
 scripts/explore_omnipath_graph.py
-# generated artifacts (large, recalculable — pas via git ; rsync/rebuild frontal)
-data/omnipath/graph/
-data/omnipath/graph_raw/
-data/omnipath/hgnc_alias_map.tsv.gz
-data/omnipath/hgnc_biotype_map.tsv.gz
+
+# Note de travail (liste de gènes annotée à la main), pas un artefact du dépôt.
+liste.csv
