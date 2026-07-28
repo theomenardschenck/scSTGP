@@ -1,170 +1,221 @@
-# gnn_huvec — Priorisation de gènes de la sénescence cellulaire par VGAE
+# (sc)STGP — State Transition Gene Prediction
 
-Pipeline GNN (Graph Neural Network) pour identifier les gènes
-**drivers** de la transition prolifératif → sénescent dans les cellules
-endothéliales humaines (HUVEC), à partir de scRNA-seq P4 vs P16.
+Prioriser les gènes qui **pilotent** le passage d'un état cellulaire à un
+autre, à partir de données transcriptomiques (single-cell ou bulk) et de
+réseaux biologiques curés.
 
-L'approche combine :
+L'application de référence est la sénescence réplicative endothéliale
+(HUVEC P4 → P16, scRNA-seq Drop-seq GSE102090), mais la méthode ne lui est pas
+propre : une transition se définit au **readout**, pas dans le modèle. Voir
+[GENERALIZATION.md](GENERALIZATION.md).
 
-1. Un **VGAE** (Variational Graph AutoEncoder) sur graphe hétérogène
-   multi-source (PPI STRING, REACTOME, co-expression, régulons
-   pySCENIC, métabolisme HuMess).
-2. Une **perturbation in silico** (KO / KD / OE) propagée par le
-   modèle, projetée sur un axe sénescence P4 → P16.
-3. Un scoring multi-tier (`driver` / `validation` / `discovery`) avec
-   robustesse cross-seed et evidence_tier A–E.
+## Le principe, et pourquoi il tient
 
-**Statut** : projet de stage M2 — soutenance 16 septembre 2026. Outil
-**modularisé** (le monolithe `gnn_vgae.py` a été éclaté en modules
-importables, refactor validé **bit-exact** par un golden test) et
-**pipeline Snakemake fonctionnel** de bout en bout (local **ou** cluster
-SLURM), avec un **assistant de configuration** (`bash workflow/run.sh --init`).
+La difficulté n'est pas de trouver les gènes qui **changent** entre deux états —
+une analyse différentielle le fait. Elle est de trouver ceux qui **causent** le
+changement, et de le faire sans se contenter de redécouvir la liste dont on est
+parti.
 
-## Documentation
+L'architecture répond par une séparation stricte :
 
-- **Usage du pipeline** : ce README (§Quickstart) + [`workflow/README.md`](workflow/README.md)
-  — orchestration Snakemake, règles, backend local/cluster, assistant `init`.
-- **Backlog priorisé** : [`TODO`](TODO).
+1. **L'encodeur ne voit jamais le contraste.** Un VGAE hétérogène apprend une
+   représentation à partir de sources structurelles et condition-indépendantes
+   (PPI STRING, Reactome, OmniPath signé, co-expression, régulons pySCENIC,
+   métabolisme HuMess). Le logFC n'est jamais une feature.
+2. **La perturbation est in silico.** Chaque gène est éteint (KO), atténué (KD)
+   ou surexprimé (OE) ; l'encodeur gelé propage l'effet dans le graphe.
+3. **L'axe seul porte les deux états.** Le déplacement Δz est projeté sur un axe
+   défini par le contraste A→B. Changer de transition = changer d'axe.
 
-> Le **rapport scientifique** détaillé (méthodes, métriques, résultats par
-> version) et la doc technique par script vivent dans `docs/` — un **cahier
-> de labo local non versionné** (le dépôt ne contient que l'outil). Demander
-> à l'auteur pour y accéder.
+C'est cette séparation qui rend le résultat non trivialement re-dérivable du DE
+— et le dépôt fournit les outils pour le **vérifier** plutôt que l'affirmer
+(voir Validation ci-dessous).
 
-## Architecture
+## Statut
 
-Le VGAE, historiquement un monolithe de ~4800 lignes, est **éclaté en
-modules importables** (refactor validé bit-exact) :
+Travail de stage M2 (Université de Nantes, équipe Petry) — soutenance
+16 septembre 2026. Le pipeline tourne de bout en bout, en local comme sur SLURM.
+Le rapport scientifique (méthodes détaillées, résultats par version, cahier de
+conception) vit dans `docs/`, **non versionné** : demander à l'auteur.
 
-```
-gnn_huvec/
-├── src/gnn/
-│   ├── gnn_vgae.py            # ORCHESTRATEUR mince (parse → build → train → score)
-│   ├── _config.py            # parsing CLI + dérivations (modules/features/run_tag)
-│   ├── _paths.py             # résolution des chemins (env + racine repo, layout-robuste)
-│   ├── _graph_build.py       # §1-7 : construction du graphe hétérogène (+ cache)
-│   ├── _train.py             # §8-10 : modèle VGAE + boucle d'entraînement
-│   ├── _score.py             # §11-16 : embeddings + scoring + baselines + export
-│   ├── _vgae_model.py        # classes VGAE (HeteroEncoder, décodeur signé…)
-│   ├── gnn_perturbation.py   # perturbation core (KO/KD/OE + axes sénescence)
-│   └── omnipath_integration.py
-├── src/perturbation/perturb_top_genes.py   # perturbation batch (all-genes / cibles)
-├── src/validation/           # scoring cross-seed, ORA, baselines, annotation, figures
-├── workflow/                 # Snakemake FONCTIONNEL
-│   ├── Snakefile             # DAG : build_graph → train × seed → perturb → analyse → report
-│   ├── run.sh                # lanceur (backend local/cluster) + assistant --init
-│   ├── init.py               # assistant interactif de génération de config
-│   ├── config/config*.yaml   # config utilisateur (+ config.smoke.yaml = test rapide)
-│   └── profiles/slurm/       # profil SLURM (partition/QOS à adapter)
-├── scripts/                  # helpers SLURM (grilles d'ablation, etc.)
-└── tests/golden/             # test de non-régression bit-exact
-```
-
-Chaque module `_*.py` s'importe indépendamment (`from _graph_build import build_graph`).
-Le graphe est construit **une fois** (`build_graph`, `--build-only`) puis réutilisé
-par tous les seeds (`--reuse-graph`).
-
-## Quickstart
-
-### 1. Installation (environnement conda)
+## Installation
 
 ```bash
-git clone <repo> gnn_huvec && cd gnn_huvec
-micromamba create -n gnn -f environment.yml   # ou conda/mamba (contient snakemake)
+git clone <repo> && cd gnn_huvec
+
+# Environnement de référence (pile scientifique épinglée : torch, PyG,
+# pySCENIC, scanpy, snakemake 7.32)
+micromamba create -n gnn -f environment.yml     # ou conda / mamba
 micromamba activate gnn
+
+# Le paquet lui-même, en mode éditable
+pip install -e .
 ```
 
-### 2. Générer sa config (assistant interactif)
+`environment.yml` fait foi pour un vrai run ; les dépendances de
+`pyproject.toml` ne couvrent que l'import du paquet et les tests.
+
+### Deux modes d'import, par conception
+
+| Mode | Usage | Qui l'utilise |
+|---|---|---|
+| script | `python src/gnn/gnn_vgae.py …` | Snakefile, scripts SLURM |
+| paquet | `import stgp.data.loaders.bulk_rna` | tests, code nouveau |
+
+Les fichiers ne bougent pas : `src/` est monté comme paquet `stgp` via
+`package-dir`. Déplacer l'arborescence aurait cassé les 20 scripts cluster et le
+Snakefile sans rien apporter.
+
+## Utilisation
 
 ```bash
-bash workflow/run.sh --init          # pose des questions et écrit workflow/config/config.<nom>.yaml
-```
-L'assistant demande : préréglage (`quick`/`full`), type de données (`bulk`/`sc`),
-contraste **A vs B** (à ta discrétion : pro/sen, sain/malade, WT/mutant…), chemins,
-backend (local/cluster), nombre de seeds, **perturbation ciblée ou totale**, et
-**ablations** (sources du graphe à désactiver).
+# 1. générer une config (assistant interactif)
+bash workflow/run.sh --init
 
-### 3. Lancer le pipeline
+# 2. vérifier le DAG sans rien exécuter
+bash workflow/run.sh --dry-run --configfile workflow/config/config.<nom>.yaml
 
-```bash
-# dry-run (vérifie le DAG sans exécuter)
-bash workflow/run.sh --configfile workflow/config/config.<nom>.yaml --dry-run
-
-# local (CPU)
+# 3. lancer
 bash workflow/run.sh --backend local   --configfile workflow/config/config.<nom>.yaml
-
-# cluster SLURM (adapter la partition/QOS dans workflow/profiles/slurm/config.yaml ;
-#  export GNN_OUT_DIR_BASE=/scratch/.../output pour écrire les sorties sur scratch)
 bash workflow/run.sh --backend cluster --configfile workflow/config/config.<nom>.yaml
 ```
 
-Un **test fonctionnel rapide** (1 seed, peu d'epochs, perturbation sur cibles) est
-fourni : `--configfile workflow/config/config.smoke.yaml`.
+L'assistant demande le contraste **A vs B** (pro/sen, sain/malade, WT/mutant…),
+les chemins, le backend, le nombre de seeds, la portée de la perturbation et les
+ablations.
 
-Les prérequis (matrice scRNA/bulk, DE, pySCENIC, HuMess, bases aging, cache OmniPath)
-sont des entrées externes précalculées dans `data/` (gitignored). Voir
-[`workflow/README.md`](workflow/README.md) pour le détail des stages et des chemins.
+Test fonctionnel rapide : `--configfile workflow/config/config.smoke.yaml`
+(1 seed, epochs courts, perturbation restreinte).
+
+Sur cluster, lancer dans `tmux`/`nohup` : Snakemake a besoin d'un processus
+contrôleur vivant pendant tout le DAG. Détail des règles et des chemins dans
+[workflow/README.md](workflow/README.md).
+
+> **Entrées non versionnées.** Matrice d'expression, DE, pySCENIC, HuMess et
+> bases de vieillissement vivent dans `data/` et ne sont pas dans le dépôt. Les
+> caches OmniPath/HGNC, eux, **le sont** (~7 Mo) : sans eux le pipeline tourne
+> à vide (features à zéro, aucune arête supplémentaire).
 
 ## Sortie principale
 
-`cross_seed_gene_ranking.tsv` — un gène par ligne, trié par
-`driver_score` :
+`cross_seed_gene_ranking.tsv`, un gène par ligne, trié par `driver_score` :
 
 | Colonne | Sens |
 |---|---|
-| `gene_symbol` | HGNC |
-| `driver_score` ∈ [0,1] | composite multi-source post-perturbation |
-| `discovery_score` | + bonus non-DE (graph-only findings) |
-| `validation_score` | + bonus DE-sig + aging DBs |
-| `evidence_tier` ∈ {A,B,C,D,E} | A=confirmé, B=découverte, C=effecteur, D=hub, E=bruit |
-| `canon_diff`, `canon_cosine` | métriques signées (effet × directionalité) |
-| `interpretation` | tag biologique calibré (cf. §11 du rapport) |
+| `driver_score` | composite post-perturbation, agrégé cross-seed |
+| `discovery_score` | + bonus non-DE (trouvailles portées par le graphe) |
+| `validation_score` | + bonus DE-significatif et bases de vieillissement |
+| `evidence_tier` A–E | A confirmé · B découverte · C effecteur · D hub · E bruit |
+| `canon_diff`, `canon_cosine` | amplitude de l'effet × alignement sur l'axe |
+| `mean_stability` | accord des seeds sur le **signe** de l'effet |
 
-Top drivers V3.6 (10 seeds) : H2AFZ, HMGB1, FHL2 (anti-sénescence DE-sig),
-ASNS (pro-sénescence non-DE), CEBPB / NFE2L2 / MYC (TFs). Cf. §10.11
-et §13 du rapport pour l'interprétation biologique complète.
+## Validation — l'essentiel du dépôt
 
-## Reproductibilité
+Un score de driver est facile à produire et difficile à croire. Les contrôles
+sont donc de première classe, pas des extras.
 
-- **Seeds** : entraînement déterministe pour seed donné (10 seeds
-  V3.6 disponibles, 4/10 V3.3).
-- **Manifest** : chaque run écrit `run_config.json` (CLI args + version
-  Git + hash données) — cf. §V3.6 du rapport.
-- **Cross-ablation** : `compare_runs.py --cross-ablation` reproduit
-  les analyses V3.6.2 (club des 6 drivers universels).
+**Toujours actifs** : `pipeline_qc` (les cinq contrôles préalables à toute
+lecture d'ablation : plancher de bruit, multiplicité d'arêtes, recouvrement des
+sources, confusion degré↔readout, spécificité d'axe) et `driver_baselines` (le
+GNN bat-il une statistique triviale, à degré contrôlé ?).
+
+**Activables** dans `config.yaml` : `purity_source` (quelle source d'arête porte
+réellement une cible), `head_to_head` (un outil simple sort-il les mêmes
+cibles ?), `readout_specificity` (métriques affranchies du degré), `decoy`
+(nulles de voisinage et d'axe), `ora_de_baseline` (l'enrichissement dépasse-t-il
+un simple tri par DE ?).
+
+Le catalogue complet — ce qui est dans le DAG, ce qui est manuel, et pourquoi —
+est dans [TOOLS.md](TOOLS.md).
+
+> **Le plancher de bruit avant tout.** Deux runs d'une configuration
+> *identique* diffèrent de ρ 0.556–0.687 sur le ranking (écart médian : 942
+> rangs). C'est plus grand que la plupart des effets qu'on cherche à mesurer.
+> Trois seeds sont un minimum, et `compute.deterministic: true` réduit le
+> plancher au prix de la vitesse.
+
+## Optimisation automatique
+
+Optuna pilote Snakemake — jamais l'inverse : un DAG doit connaître ses jobs à
+l'avance, une recherche non.
+
+```bash
+# 1. MESURER LE BRUIT AVANT DE CHERCHER (obligatoire pour interpréter la suite)
+python src/optim/search.py calibrate --repeats 3 --objective cross_seed_stability
+
+# 2. chercher
+python src/optim/search.py search --n-trials 20 --seeds 3
+
+# sur cluster (job contrôleur qui survit à la session)
+bash scripts/run_optuna.sh calibrate --repeats 3
+bash scripts/run_optuna.sh search    --n-trials 20
+```
+
+Trois objectifs branchables (`src/optim/objectives.py`) :
+`cross_seed_stability` (recommandé — vise le plancher de bruit),
+`recon_auc` (pas cher, mais ne décide pas des drivers), `known_driver_recall`
+(le plus proche du but biologique, et le plus circulaire).
+
+`report` refuse de conclure si la calibration n'a pas été faite : une étude dont
+l'amplitude n'excède pas le bruit n'a rien trouvé.
+
+## Tests
+
+```bash
+pytest tests/test_package_layout.py   # le paquet s'importe, pas de nom racine
+pytest tests/test_de_schema.py        # unitaires sur la définition de l'axe DE
+pytest tests/test_workflow.py         # le DAG se résout, validations comprises
+pytest tests/test_optim.py            # plomberie de la recherche
+pytest tests/test_cli_contract.py     # chaque point d'entrée répond à --help (~4 min)
+```
+
+`tests/golden/` est un comparateur bit-exact conservé pour les refactors lourds.
+Il n'est **pas exécutable en l'état** : il dépend d'un cache de graphe absent du
+dépôt. Le régénérer avec `tests/golden/run_golden.sh capture`.
+
+## Structure
+
+```
+src/gnn/            encodeur : construction du graphe, entraînement, scoring
+src/perturbation/   KO / KD / OE et re-projection d'axes
+src/validation/     tout ce qui met le résultat à l'épreuve
+src/data/           loaders (bulk, protéomique, schéma DE) et préprocessing
+src/optim/          recherche d'hyperparamètres
+workflow/           Snakemake : DAG, configs, profil SLURM
+scripts/            lanceurs cluster (grilles d'ablation, vagues, Optuna)
+tests/              suite pytest + golden
+archive/            code historique gelé — voir archive/README.md
+```
 
 ## Citation
 
-Travail M2 (université de Nantes, équipe Petry) — papier à venir.
-En attendant :
-
 ```bibtex
-@unpublished{menard2026vgae_huvec,
-  author = {Menard, Théo and Maillasson, Mike},
-  title  = {VGAE-based gene prioritization in HUVEC cellular senescence},
+@unpublished{menard2026scstgp,
+  author = {Ménard, Théo and Maillasson, Mike},
+  title  = {(sc)STGP: State Transition Gene Prediction by heterogeneous VGAE
+            and in-silico perturbation},
   year   = {2026},
-  note   = {M2 internship, Université de Nantes}
+  note   = {Stage M2, Université de Nantes}
 }
 ```
 
+Voir aussi [CITATION.cff](CITATION.cff).
+
 ## Licence
 
-À définir (cf. TODO Tier 2.5). Vérifier compatibilité avec dépendances
-(PyG MIT, OmniPath GPL-3).
+MIT — voir [LICENSE](LICENSE). Les dépendances gardent la leur : PyTorch
+Geometric (MIT), OmniPath (GPL-3), pySCENIC (GPL-3). Redistribuer un travail
+dérivé incluant OmniPath ou pySCENIC impose leurs conditions.
 
-## Articles méthodologiques de référence
+## Références méthodologiques
 
 - Kipf & Welling 2016, *Variational Graph Auto-Encoders*, NeurIPS BDL.
 - Veličković et al. 2018, *Graph Attention Networks*, ICLR.
-- Aibar et al. 2017 ; Van de Sande et al. 2020, *SCENIC / pySCENIC*,
-  Nat Methods / Nat Protoc.
-- Saul et al. 2022, *SenMayo: a transcriptomic biomarker of cellular
-  senescence*, Nat Commun.
-- Hernandez-Segura et al. 2018, *Hallmarks of cellular senescence*,
-  Trends Cell Biol.
-
-Liste complète : §"Articles de référence" du rapport.
+- Aibar et al. 2017 ; Van de Sande et al. 2020, *SCENIC / pySCENIC*.
+- Türei et al. 2021, *OmniPath*, Mol Syst Biol.
+- Zirkel et al. 2018, *HMGB2 loss upon senescence entry*, Mol Cell.
+- Hernandez-Segura et al. 2018, *Hallmarks of cellular senescence*.
 
 ## Contact
 
-Théo Menard — `theo.menard@etu.univ-nantes.fr`
+Théo Ménard — `theo.menard@etu.univ-nantes.fr`

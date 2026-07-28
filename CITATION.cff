@@ -1,0 +1,61 @@
+cff-version: 1.2.0
+message: "Si vous utilisez ce logiciel, merci de le citer comme suit."
+title: "(sc)STGP — State Transition Gene Prediction"
+abstract: >-
+  Priorisation des gènes pilotant une transition d'état cellulaire, par
+  auto-encodeur variationnel de graphe hétérogène sur réseaux biologiques curés,
+  suivi d'une perturbation in silico (knock-out / knock-down / surexpression)
+  projetée sur un axe d'état. L'encodeur n'accède jamais au contraste entre
+  états : celui-ci n'intervient qu'au readout, ce qui distingue les gènes
+  moteurs des simples marqueurs différentiels. Application de référence :
+  sénescence réplicative endothéliale (HUVEC).
+type: software
+version: "0.1.0"
+date-released: "2026-07-27"
+license: MIT
+repository-code: "https://github.com/theomenardschenck/gnn_huvec"
+
+authors:
+  - family-names: "Ménard"
+    given-names: "Théo"
+    affiliation: "Université de Nantes, CRCI2NA"
+  - family-names: "Maillasson"
+    given-names: "Mike"
+    affiliation: "Université de Nantes, CRCI2NA"
+
+keywords:
+  - graph neural network
+  - variational graph autoencoder
+  - cell state transition
+  - gene prioritisation
+  - in-silico perturbation
+  - cellular senescence
+  - single-cell RNA-seq
+
+references:
+  - type: article
+    authors:
+      - family-names: "Kipf"
+        given-names: "Thomas N."
+      - family-names: "Welling"
+        given-names: "Max"
+    title: "Variational Graph Auto-Encoders"
+    year: 2016
+    collection-title: "NeurIPS Bayesian Deep Learning Workshop"
+  - type: article
+    authors:
+      - family-names: "Veličković"
+        given-names: "Petar"
+      - family-names: "Cucurull"
+        given-names: "Guillem"
+      - family-names: "Casanova"
+        given-names: "Arantxa"
+      - family-names: "Romero"
+        given-names: "Adriana"
+      - family-names: "Liò"
+        given-names: "Pietro"
+      - family-names: "Bengio"
+        given-names: "Yoshua"
+    title: "Graph Attention Networks"
+    year: 2018
+    collection-title: "International Conference on Learning Representations"
