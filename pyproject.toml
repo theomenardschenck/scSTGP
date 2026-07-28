@@ -1,0 +1,130 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scstgp"
+version = "0.1.0"
+description = "(sc)STGP — State Transition Gene Prediction: heterogeneous VGAE + in-silico perturbation for prioritising genes that drive a cell-state transition"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Théo Ménard" }]
+keywords = ["graph-neural-network", "vgae", "cell-state-transition", "gene-prioritisation", "senescence", "single-cell"]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+# NOTE — l'environnement de RÉFÉRENCE est `environment.yml` (conda), pas ce
+# bloc. La pile scientifique (torch 2.11 CPU, torch-geometric 2.7, pySCENIC,
+# scanpy) y est épinglée finement, et c'est elle qui tourne sur GLiCID. Les
+# dépendances ci-dessous sont le minimum pour IMPORTER le paquet et faire
+# tourner les tests ; elles ne remplacent pas l'env conda pour un vrai run.
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scipy>=1.14",
+    "scikit-learn>=1.5",
+    "networkx>=3.3",
+    "matplotlib>=3.9",
+    "seaborn>=0.13",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.11", "torch-geometric>=2.7"]
+omics = ["scanpy>=1.11", "anndata>=0.12", "omnipath>=1.0.7"]
+workflow = ["snakemake-minimal==7.32.4"]
+optim = ["optuna>=4.0"]
+dev = ["pytest>=8.0", "pytest-timeout>=2.3", "ruff>=0.6"]
+
+[project.urls]
+Repository = "https://github.com/theomenardschenck/gnn_huvec"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mise en paquet SANS DÉPLACER DE FICHIER.
+#
+# `package-dir = {"stgp" = "src"}` fait de src/ le paquet importable `stgp`,
+# ce qui laisse intacts tous les chemins en dur du Snakefile et des scripts
+# SLURM (`src/gnn/gnn_vgae.py`, …). Déplacer l'arborescence aurait cassé les
+# 20 scripts cluster et le Snakefile pour un bénéfice purement cosmétique.
+#
+# Conséquence assumée — DEUX modes d'import coexistent :
+#   • mode script   : `python src/gnn/gnn_vgae.py …` — imports plats
+#                     (`from _config import …`) via le bootstrap sys.path.
+#                     C'est le mode du cluster et du Snakefile. Inchangé.
+#   • mode paquet   : `import stgp.data.loaders.bulk_rna` — après
+#                     `pip install -e .`. C'est le mode des tests et de tout
+#                     code nouveau. Il RÉPARE les loaders V6 (bulk_rna /
+#                     proteomics), qui utilisent des imports relatifs et
+#                     étaient donc inutilisables faute de __init__.py.
+# ─────────────────────────────────────────────────────────────────────────────
+# La liste est EXPLICITE et non auto-découverte : avec `packages.find`,
+# setuptools installe src/gnn, src/data… comme paquets RACINE (un `import data`
+# global qui masquerait n'importe quoi). Vérifié le 2026-07-27.
+# src/coexpr_benchmark est volontairement absent : ses fichiers ont un nom
+# préfixé par un chiffre (03_compare.py), donc non importables par construction.
+[tool.setuptools]
+package-dir = { "stgp" = "src" }
+packages = [
+    "stgp",
+    "stgp.gnn",
+    "stgp.optim",
+    "stgp.data",
+    "stgp.data.extract",
+    "stgp.data.loaders",
+    "stgp.data.preprocess",
+    "stgp.perturbation",
+    "stgp.validation",
+    "stgp.validation.cluster",
+    "stgp.validation.explain",
+    "stgp.validation.ora",
+    "stgp.validation.probe",
+    "stgp.validation.qc",
+    "stgp.validation.reports",
+    "stgp.validation.schema",
+    "stgp.validation.viz",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Les modules « script » (gnn_vgae.py) parsent la CLI à l'import : les tests qui
+# les touchent passent par des sous-processus, jamais par un import direct.
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: test lent (run réel, cluster ou plusieurs minutes)",
+    "needs_data: exige les données d'entrée non versionnées (data/)",
+    "needs_torch: exige torch + torch-geometric",
+]
+timeout = 600
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["archive", "src/coexpr_benchmark"]
+
+[tool.ruff.lint]
+# Volontairement minimal : ce dépôt est du code scientifique existant, pas un
+# terrain de style. On ne retient que ce qui signale un vrai défaut : erreurs de
+# syntaxe/runtime (E9), comparaisons impossibles (F63), f-strings et asserts
+# malformés (F7), noms non définis (F82).
+#
+# F401 (import inutilisé) est DÉLIBÉRÉMENT EXCLU, et ce n'est pas de la
+# complaisance : `_graph_build_body.py`, `_train_body.py`, `_score_body.py` et
+# `_config_derive.py` sont des corps `exec` évalués dans l'espace de noms de
+# leur APPELANT. Un import que ruff voit inutilisé dans le parent est souvent
+# consommé par le corps. Les 40 occurrences relevées le 2026-07-27 ont été
+# examinées : aucune n'est un défaut, et les corriger automatiquement risquait
+# de casser des runs. À reprendre si les corps deviennent de vraies fonctions.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.ruff.lint.per-file-ignores]
+# Même raison, côté F821 : ces fichiers référencent des noms fournis par
+# l'appelant au moment de l'`exec`. Ils sont insensés lus isolément.
+"src/gnn/gnn_vgae.py" = ["F821"]
+"src/gnn/_config_derive.py" = ["F821"]
+"src/gnn/_graph_build_body.py" = ["F821"]
+"src/gnn/_score_body.py" = ["F821"]
+"src/gnn/_train_body.py" = ["F821"]
