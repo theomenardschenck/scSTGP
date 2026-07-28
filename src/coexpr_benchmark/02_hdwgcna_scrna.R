@@ -23,7 +23,7 @@ disableWGCNAThreads()   # CRITICAL: this host has only 7GB RAM; forking would OO
 N_VARGENES <- 3000      # pre-filter genes before building Seurat (memory)
 P4_SUBSAMPLE <- 3000    # cap the dominant P4 pool to balance groups + save RAM
 
-ROOT   <- "/home/USER/M2/S2/Stage/petry_project/gnn_huvec"
+ROOT   <- Sys.getenv("STGP_ROOT", unset = getwd())  # lancer depuis la racine du depot
 OUTDIR <- file.path(ROOT, "output/coexpr_benchmark/hdwgcna_scrna")
 dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
 

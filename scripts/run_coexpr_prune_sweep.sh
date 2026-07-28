@@ -32,7 +32,7 @@ set -euo pipefail
 
 DRY_RUN=0
 SKIP_BASELINE=0
-DIFF_DIR="/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/pyscenic/diff_coexpr"
+DIFF_DIR="/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data/pyscenic/diff_coexpr"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

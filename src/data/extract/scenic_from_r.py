@@ -77,8 +77,13 @@ def main():
     # =============================================================================
 
     # --- Adapte ces chemins à ton système ---
-    WORK_DIR = os.path.expanduser("/home/USER/M2/S2/Stage/Projet_Colin/huvec_gnn/data/pyscenic")
-    RESULTS_DIR = "/home/USER/M2/S2/Stage/Projet_Colin/huvec_gnn/output/pyscenic"
+    # Chemin LEGACY. Pointait en dur vers ~/M2/S2/Stage/Projet_Colin/huvec_gnn,
+    # dossier qui n'existe plus : le chemin par défaut est donc désormais relatif
+    # au dépôt, surchargeable par STGP_ROOT.
+    _root = os.environ.get("STGP_ROOT") or os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    WORK_DIR = os.path.join(_root, "data", "pyscenic")
+    RESULTS_DIR = os.path.join(_root, "output", "pyscenic")
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     # Fichier d'expression exporté depuis R
@@ -651,8 +656,30 @@ def run_grnboost2_diff(condition: str, merged_path: str, tf_list_path: str,
           f"--adj-{condition.lower()} {out_path} ...")
 
 
+_USAGE = """usage: scenic_from_r.py [-h] {grnboost2-diff | <aucun>}
+
+pySCENIC / GRNBoost2 : inférence de réseau de régulation depuis une matrice
+d'expression exportée de R.
+
+sous-commandes :
+  grnboost2-diff   GRNBoost2 (arboreto) sur tous les gènes QC, par condition
+                   (P4 ou P16) -> adjacencies_{cond}.csv, entrée de
+                   build_diff_coexpr.py merge-adjacencies.
+                   `scenic_from_r.py grnboost2-diff --help` pour ses options.
+  (aucune)         chemin LEGACY : pipeline pySCENIC complet + UMAP.
+                   Exige scanpy / matplotlib / seaborn / dask, absents de
+                   l'environnement arboreto de GLiCID.
+"""
+
 if __name__ == '__main__':
     import sys
+    # `--help` est traité AVANT tout import lourd : le chemin legacy importe
+    # scanpy dans main(), si bien que demander l'aide plantait en
+    # ModuleNotFoundError sur un environnement arboreto-seul (relevé par le
+    # test de contrat CLI, 2026-07-27).
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(_USAGE)
+        sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] == "grnboost2-diff":
         import argparse
         ap = argparse.ArgumentParser(

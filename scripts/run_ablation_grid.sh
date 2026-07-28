@@ -621,12 +621,12 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # DOIT vérifier LAB-DATA, pas $PROJECT_DIR/data. Override : --data-root
 # ou env GNN_DATA_ROOT.
 # Précédence : --data-root > env GNN_DATA_ROOT > défaut (= gnn_vgae.py:381)
-DATA_ROOT="${DATA_ROOT_CLI:-${GNN_DATA_ROOT:-/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data}}"
+DATA_ROOT="${DATA_ROOT_CLI:-${GNN_DATA_ROOT:-/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data}}"
 # OUT_DIR_BASE des jobs : /scratch (écriture rapide + WRITABLE). Le code est
 # déployé à plat (src/gnn_vgae.py) → _REPO_ROOT=dirname³ de gnn_vgae remonte un
 # cran trop haut (/scratch/nautilus/users, non writable) → PermissionError l.651.
 # On force donc GNN_OUT_DIR_BASE + GNN_DATA_DIR dans le sbatch (cf. heredoc).
-OUT_BASE_JOB="${GNN_OUT_DIR_BASE:-/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae}"
+OUT_BASE_JOB="${GNN_OUT_DIR_BASE:-/scratch/nautilus/users/${GNN_CLUSTER_USER:-$USER}/gnn_vgae}"
 TS="$(date +%Y%m%d_%H%M%S)"
 # Slug court pour identifier le run dans le LOG_DIR
 ABL_SLUG="${ABLATIONS//,/_}"

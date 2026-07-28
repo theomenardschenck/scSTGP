@@ -70,8 +70,8 @@ MIN_IMAX_QUANTILE=0.5
 # GRNBoost2-local sklearn prend ~2× plus longtemps. 4h ne suffit pas.
 TIME_GRN="08:00:00"
 TIME_MERGE="00:30:00"
-DIFF_DIR="/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/pyscenic/diff_coexpr"
-TF_LIST="/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/pyscenic/scenic_refs/allTFs_hg38.txt"
+DIFF_DIR="/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data/pyscenic/diff_coexpr"
+TF_LIST="/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data/pyscenic/scenic_refs/allTFs_hg38.txt"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

@@ -44,7 +44,7 @@ DRY=0
 # DATA_ROOT : racine des DONNÉES d'entrée (= gnn_vgae BASE_DIR/data). Sur GLiCID
 # les données sont sur /LAB-DATA (PAS rsync vers /scratch où vit le code) → il
 # FAUT pointer gnn_vgae dessus, sinon merged_P4_P16_metadata.csv introuvable.
-DATA_ROOT="${GNN_DATA_ROOT:-/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data}"
+DATA_ROOT="${GNN_DATA_ROOT:-/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data}"
 OUT_BASE="${GNN_OUT_DIR_BASE:-$PWD/output/gnn_vgae}"
 HEAD=1   # tête de classification jointe (--supervised) ; --no-head = VGAE+DE seul
 

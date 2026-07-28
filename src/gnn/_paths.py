@@ -58,7 +58,15 @@ def resolve_paths(cli_args, run_tag, start_file=None, env=None):
     start_file = start_file if start_file is not None else __file__
 
     repo_root = find_repo_root(start_file)
-    lab_dir = env.get("GNN_LAB_DIR", "/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/")
+    # `lab_dir` = espace partagé du cluster où vivent les gros artefacts non
+    # versionnés (HuMess). Le défaut est SITE-SPÉCIFIQUE (GLiCID/Nautilus) et
+    # dérive du compte courant : y coder un compte en dur rendait le dépôt
+    # inutilisable par quiconque d'autre — et publiait une adresse personnelle.
+    # Hors de ce site, poser GNN_LAB_DIR (ou GNN_HUMESS_DIR, qui court-circuite).
+    lab_dir = env.get("GNN_LAB_DIR")
+    if not lab_dir:
+        _user = env.get("GNN_CLUSTER_USER") or env.get("USER") or ""
+        lab_dir = ("/LAB-DATA/GLiCID/users/" + _user + "/") if _user else repo_root
     base_dir = env.get("GNN_BASE_DIR", repo_root)
     data_dir = env.get("GNN_DATA_DIR", os.path.join(base_dir, "data"))
     scenic_dir = env.get("GNN_SCENIC_DIR", os.path.join(base_dir, "output", "pyscenic"))

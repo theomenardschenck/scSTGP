@@ -37,7 +37,7 @@ N_EPOCHS=1200; PATIENCE=150; CPUS=8; MEM="16G"; USE_GPU=1; DRY=0
 FLAGS="--no-scenic-regulons --use-omnipath-signaling --use-omnipath-tf-curated --include-omnipath-genes --use-reactome-fi --signed-message --signed-decoder --coexpr-mode differential"
 CLUSTER="${V6_CLUSTER:-nautilus}"
 # OUT sur scratch (bonne pratique GLiCID). Surchargeable.
-OUT_BASE="${V6_OUT_BASE:-/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae}"
+OUT_BASE="${V6_OUT_BASE:-/scratch/nautilus/users/${GNN_CLUSTER_USER:-$USER}/gnn_vgae}"
 GPU_TIME="${V6_GPU_TIME:-0-03:00:00}"; GPU_PARTITION="${V6_GPU_PARTITION:-gpu}"
 GPU_QOS="${V6_GPU_QOS:-gpus}"; GPU_GRES="${V6_GPU_GRES:-gpu:1}"; GPU_CONSTRAINT="${V6_GPU_CONSTRAINT:-}"
 CPU_TIME="${V6_CPU_TIME:-1-00:00:00}"; CPU_PARTITION="${V6_CPU_PARTITION:-standard}"; CPU_QOS="${V6_CPU_QOS:-short}"

@@ -36,7 +36,7 @@
 set -euo pipefail
 
 DRY_RUN=0
-DIFF_DIR="/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/pyscenic/diff_coexpr"
+DIFF_DIR="/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data/pyscenic/diff_coexpr"
 ONLY_METHOD=""
 ONLY_PRUNE=""
 METHODS=(arboreto sklearn)            # corr/mi non générés en routine (V4.3 figé 2026-05-29)

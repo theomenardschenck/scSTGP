@@ -26,7 +26,7 @@ args <- commandArgs(trailingOnly = TRUE)
 if (length(args) < 1) stop("Usage: Rscript 01_wgcna_bulk.R <GSE98440|GSE163251>")
 DATASET <- args[1]
 
-ROOT    <- "/home/USER/M2/S2/Stage/petry_project/gnn_huvec"
+ROOT    <- Sys.getenv("STGP_ROOT", unset = getwd())  # lancer depuis la racine du depot
 OUTDIR  <- file.path(ROOT, "output/coexpr_benchmark", paste0("wgcna_", DATASET))
 dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
 N_TOP_GENES <- 3500   # most-variable genes kept for WGCNA tractability/power

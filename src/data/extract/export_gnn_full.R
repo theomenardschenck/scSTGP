@@ -14,6 +14,10 @@
 #
 ################################################################################
 
+# STGP_ROOT : racine du depot. Ces scripts pointaient en dur vers un chemin
+# WSL absolu (Projet_Colin/huvec_gnn) qui n'existe plus.
+STGP_ROOT <- Sys.getenv("STGP_ROOT", unset = getwd())
+
 library(Seurat)
 library(dplyr)
 library(Matrix)
@@ -32,7 +36,7 @@ library(MAST)
 # 1. CONFIGURATION
 # ==============================================================================
 
-base_dir <- "//wsl.localhost/Ubuntu/home/USER/M2/S2/Stage/Projet_Colin/huvec_gnn"
+base_dir <- STGP_ROOT
 data_dir <- file.path(base_dir, "data")
 dropseq_dir <- file.path(data_dir, "DROPseq")
 rds_dir <- file.path(base_dir, "output", "r_clustering")

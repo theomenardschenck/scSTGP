@@ -18,7 +18,7 @@
 # Usage :
 #   bash scripts/run_decoy_grid.sh                       # défauts V5.4.1
 #   bash scripts/run_decoy_grid.sh --rankings-dir output/interpretation/V5.4.1/cross_seed \
-#       --runs-base /scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae
+#       --runs-base /scratch/nautilus/users/${GNN_CLUSTER_USER:-$USER}/gnn_vgae
 #   bash scripts/run_decoy_grid.sh --top-n 50 --n-rewires 5 --mode knockout
 #   bash scripts/run_decoy_grid.sh --only baseline,ex-degrees,no-rfi
 #   bash scripts/run_decoy_grid.sh --after 1234567        # chaîne afterok:<jobid>
@@ -42,7 +42,7 @@ BASH_BIN="${BASH_BIN:-$(command -v bash || true)}"
 
 # --- Défauts ----------------------------------------------------------------
 RANKINGS_DIR="output/interpretation/V5.4.1/cross_seed"
-RUNS_BASE="${DECOY_RUNS_BASE:-/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae}"
+RUNS_BASE="${DECOY_RUNS_BASE:-/scratch/nautilus/users/${GNN_CLUSTER_USER:-$USER}/gnn_vgae}"
 RUN_PREFIX="v5.4."          # <run-prefix><config><seed-suffix>
 SEED_SUFFIX=".s1"           # seed servant de support au décoy (encodeur gelé)
 MODE="knockout"             # mode de perturbation pour la confidence (KO recommandé)

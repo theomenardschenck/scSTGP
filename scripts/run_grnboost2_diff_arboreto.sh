@@ -27,10 +27,10 @@
 #
 #   2. Uploader le merged depuis WSL2 vers LAB-DATA :
 #      scp data/gnn_data/merged_P4_P16_normalized.csv \
-#          USER@nautilus.glicid.fr:/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/gnn_data/
+#          ${GNN_CLUSTER_USER:-$USER}@nautilus.glicid.fr:/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data/gnn_data/
 #
 #   3. Vérifier que TF_LIST est bien sur LAB-DATA :
-#      ls /LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/pyscenic/scenic_refs/allTFs_hg38.txt
+#      ls /LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data/pyscenic/scenic_refs/allTFs_hg38.txt
 #
 # Workflow :
 #   1. bash scripts/run_grnboost2_diff_arboreto.sh             # array P4+P16
@@ -54,9 +54,9 @@ MEM_PER_CPU="10G"   # 8 × 10G = 80G/job ; arboreto pic ~50G sur 15779 gènes
 TIME_GRN="06:00:00"
 ENV_NAME="arboreto"
 MICROMAMBA_BIN=""   # opt : chemin absolu vers le binaire (sinon auto-détection)
-DIFF_DIR="/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/pyscenic/diff_coexpr"
-MERGED="/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/gnn_data/merged_P4_P16_normalized.csv"
-TF_LIST="/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/gnn/data/pyscenic/scenic_refs/allTFs_hg38.txt"
+DIFF_DIR="/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data/pyscenic/diff_coexpr"
+MERGED="/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data/gnn_data/merged_P4_P16_normalized.csv"
+TF_LIST="/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data/pyscenic/scenic_refs/allTFs_hg38.txt"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -84,7 +84,7 @@ if [[ ! -f "$MERGED" ]]; then
     echo "[err] merged absent : $MERGED"
     echo "      Upload depuis WSL2 :"
     echo "        scp data/gnn_data/merged_P4_P16_normalized.csv \\"
-    echo "            USER@nautilus.glicid.fr:$MERGED"
+    echo "            ${GNN_CLUSTER_USER:-$USER}@nautilus.glicid.fr:$MERGED"
     exit 1
 fi
 if [[ ! -f "$TF_LIST" ]]; then

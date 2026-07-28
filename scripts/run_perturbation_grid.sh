@@ -77,7 +77,7 @@ BASH_BIN="${BASH_BIN:-$(command -v bash || true)}"
 [[ -z "$BASH_BIN" ]] && BASH_BIN="/bin/bash"
 
 # --- Paramètres par défaut --------------------------------------------------
-OUT_DIR_BASE_DEFAULT="/scratch/nautilus/users/USER@univ-nantes.fr/gnn_vgae"
+OUT_DIR_BASE_DEFAULT="/scratch/nautilus/users/${GNN_CLUSTER_USER:-$USER}/gnn_vgae"
 OUT_DIR_BASE="${OUT_DIR_BASE:-$OUT_DIR_BASE_DEFAULT}"
 DEFAULT_PATTERN="${OUT_DIR_BASE}/*.s*"
 

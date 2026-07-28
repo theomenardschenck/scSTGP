@@ -16,6 +16,10 @@
 # 0. INSTALLATION DES PACKAGES (à exécuter une seule fois)
 # ==============================================================================
 
+# STGP_ROOT : racine du depot. Ces scripts pointaient en dur vers un chemin
+# WSL absolu (Projet_Colin/huvec_gnn) qui n'existe plus.
+STGP_ROOT <- Sys.getenv("STGP_ROOT", unset = getwd())
+
 if (!requireNamespace("BiocManager", quietly = TRUE))
   install.packages("BiocManager")
 
@@ -54,7 +58,7 @@ library(msigdbr)
 
 # --- Définir le répertoire contenant tes fichiers ---
 # Adapte ce chemin à ton propre système
-data_dir <- "//wsl.localhost/Ubuntu/home/USER/M2/S2/Stage/Projet_Colin/huvec_gnn/data/DROPseq"
+data_dir <- file.path(STGP_ROOT, "data/DROPseq")
 
 # --- Option A : Chargement depuis les fichiers MTX séparés (recommandé) ---
 
@@ -492,7 +496,7 @@ print(p_merged)
 # ==============================================================================
 
 # Créer le répertoire de sortie
-output_dir <- "//wsl.localhost/Ubuntu/home/USER/M2/S2/Stage/Projet_Colin/huvec_gnn/output/r_clustering"
+output_dir <- file.path(STGP_ROOT, "output/r_clustering")
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
 
@@ -555,7 +559,7 @@ cat("========================================\n")
 #     ├── DEGs_cluster_X.csv               ← DEGs par cluster P16
 #     ├── DEGs_P4_vs_P16.csv               ← DEGs entre passages
 #     └── cluster_summary.csv
-data_dir <- "//wsl.localhost/Ubuntu/home/USER/M2/S2/Stage/Projet_Colin/huvec_gnn/data"
+data_dir <- file.path(STGP_ROOT, "data")
 gnn_dir <- file.path(data_dir, "gnn_data")
 dir.create(gnn_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -752,7 +756,7 @@ cat("  DEGs_P16_cluster_X.csv         — DEGs intra-P16\n")
 # EXPORT POUR pySCENIC (à exécuter après la section 11)
 # ==============================================================================
 
-scenic_dir <- "//wsl.localhost/Ubuntu/home/USER/M2/S2/Stage/Projet_Colin/huvec_gnn/data/pyscenic"
+scenic_dir <- file.path(STGP_ROOT, "data/pyscenic")
 dir.create(scenic_dir, recursive = TRUE, showWarnings = FALSE)
 
 # Récupérer la count matrix

@@ -10,7 +10,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-ROOT = "/home/USER/M2/S2/Stage/petry_project/gnn_huvec"
+# Racine du dépôt dérivée du fichier (ce script vit dans src/coexpr_benchmark/),
+# surchargeable par STGP_ROOT. Un chemin absolu en dur rendait ces scripts
+# injouables hors de la machine d'origine.
+ROOT = os.environ.get("STGP_ROOT") or os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BM   = os.path.join(ROOT, "output/coexpr_benchmark")
 FIG  = os.path.join(BM, "figures"); os.makedirs(FIG, exist_ok=True)
 METHODS = {"wgcna_GSE98440": "WGCNA\nbulk GSE98440 (n=6)",
