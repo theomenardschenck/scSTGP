@@ -63,6 +63,13 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+# Annotation seule : `HeteroData` était référencé en forward-ref sans jamais
+# être importé, donc irrésolvable par tout outil lisant les annotations.
+# Sous TYPE_CHECKING, le coût à l'exécution reste nul.
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch_geometric.data import HeteroData
 
 
 # ---------------------------------------------------------------------------

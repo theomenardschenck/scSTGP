@@ -1,0 +1,100 @@
+name: CI
+
+# Ce que cette CI peut et ne peut pas faire.
+#
+# PEUT : vérifier que le paquet s'installe, que chaque point d'entrée répond à
+# --help, que le DAG Snakemake se résout, et que les tests unitaires passent.
+# C'est exactement ce qui aurait attrapé les défauts trouvés le 2026-07-27 :
+# loaders V6 non importables, `__init__.py` dans .gitignore, cinq validations
+# débranchées du DAG.
+#
+# NE PEUT PAS : exécuter le pipeline. Les entrées (scRNA, DE, HuMess, pySCENIC)
+# ne sont pas versionnées et l'entraînement demande des heures. La vérification
+# scientifique reste `config.smoke.yaml` sur cluster, hors CI.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Paquet + tests unitaires
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer le paquet (sans la pile lourde)
+        run: |
+          python -m pip install --upgrade pip
+          # torch / torch-geometric / scanpy sont volontairement absents : ils
+          # pèsent des Go et rien ici ne les exerce. Les tests qui en dépendent
+          # se marquent needs_torch et sont désélectionnés ci-dessous.
+          pip install -e '.[dev]'
+
+      - name: Le paquet s'importe et n'installe pas de nom racine générique
+        run: pytest tests/test_package_layout.py -q
+
+      - name: Tests unitaires
+        run: pytest tests/test_de_schema.py tests/test_optim.py -q
+        env:
+          # `search.cmd_search` importe optuna ; le test le skippe s'il manque.
+          PYTHONWARNINGS: ignore
+
+      - name: Lint (uniquement les vrais défauts, pas le style)
+        run: ruff check .
+
+  workflow:
+    name: DAG Snakemake
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer Snakemake (version ÉPINGLÉE)
+        run: |
+          python -m pip install --upgrade pip
+          # 7.32 est épinglé : Snakemake 8/9 a changé le plumbing de l'exécuteur
+          # SLURM, et le profil workflow/profiles/slurm suit la syntaxe 7.x
+          # (clé `cluster:`). Migrer est un chantier à part.
+          pip install -e '.[dev]' 'snakemake-minimal==7.32.4' pulp==2.7.0
+
+      - name: Le DAG se résout, validations comprises
+        run: pytest tests/test_workflow.py -q
+
+  cli:
+    name: Contrat CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Installer avec torch CPU
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install torch-geometric
+
+      - name: Chaque point d'entrée répond à --help
+        run: pytest tests/test_cli_contract.py -q
+        env:
+          GNN_ALLOW_DOWNLOADS: "0"
