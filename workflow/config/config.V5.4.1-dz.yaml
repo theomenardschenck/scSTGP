@@ -1,0 +1,169 @@
+# ──────────────────────────────────────────────────────────────────
+# config.V5.4.1-dz.yaml — cache Δz SUR LES CHECKPOINTS V5.4.1 DE JUIN
+#                         (aucun ré-entraînement : `models.vgae.enabled: false`)
+#
+# Différence avec config.V5.4.1.yaml : celui-ci ne reconstruit rien. Il rejoue
+# la seule perturbation, avec `--cache-delta-z`, sur les `best_vgae.pt` déjà
+# présents dans output/gnn_vgae/V5.4.1/v5.4.baseline.s{1,2}. Les Δz produits
+# correspondent donc EXACTEMENT aux rankings V5.4.1 publiés — ce qu'un
+# ré-entraînement ne peut pas garantir (runs de juin non déterministes,
+# ρ 0.556-0.687 entre deux runs identiques, LOG §27).
+#
+# ⚠️ Il ne produit PAS de cache de graphe : le graphe est déjà figé dans
+#    <run>/hetero_graph_vgae.pt et la perturbation le lit de là (load_run).
+#    Pour _graph_cache.pkl → config.V5.4.1.yaml (règle build_graph).
+#
+# PRÉREQUIS — le Snakefile attend <out_base>/<run_tag>/s<seed>, les runs de juin
+# s'appellent v5.4.baseline.s<seed>. Créer les liens une fois :
+#     bash scripts/link_v541_runs.sh baseline 1 2
+#
+# Lancement :
+#     bash workflow/run.sh --backend cluster \
+#          --configfile workflow/config/config.V5.4.1-dz.yaml --dry-run
+#     bash workflow/run.sh --backend cluster \
+#          --configfile workflow/config/config.V5.4.1-dz.yaml
+#
+# Sorties écrites (à travers les liens) DANS les dossiers de run d'origine :
+#     perturbation_all_genes_axisV4dz_<mode>.tsv          (identique à axisV4)
+#     perturbation_all_genes_axisV4dz_dz_cache_<mode>.npz  ★ le cache Δz
+#     perturbation_all_genes_axisV4dz_random_axis_<mode>.tsv
+# Le suffixe `axisV4dz` (≠ `axisV4`) est délibéré : RIEN des TSV de juin n'est
+# écrasé. Même axe, même checkpoint ⇒ mêmes valeurs, sous un autre nom.
+#
+# Après ce run, tout nouvel axe se re-projette en secondes, sans re-perturber :
+#     python3 src/perturbation/reproject_axes.py \
+#         --run-dirs output/gnn_vgae/V5.4.1/v5.4.baseline.s1 \
+#                    output/gnn_vgae/V5.4.1/v5.4.baseline.s2 \
+#         --out output/interpretation/V5.4.1/cross_seed/baseline/axis_methods \
+#         --axis-method diff,lda,cav,pca
+# ──────────────────────────────────────────────────────────────────
+run:
+  name: "V5.4.1_dzcache"
+  description: "Perturbation +cache Δz sur les checkpoints V5.4.1 (pas de train)"
+
+paths:
+  data_root: "data"
+  out_base: "output/gnn_vgae"
+  humess_dir: "data/humess/output_huvec"
+  scenic_dir: "output/pyscenic"
+  de_magnitude_csv: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
+  coexpr_file: "data/pyscenic/diff_coexpr/coexpr_diff.tsv"
+
+compute:
+  device: "auto"
+  python: "python3"
+  python_torch: "python3"
+  backend: "cluster"
+  # Sans effet ici sur les poids (déjà entraînés) ; fige seulement l'ordre des
+  # opérations de la perturbation.
+  deterministic: true
+
+input:
+  rna_type: scrna
+  degs_path: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
+
+build:
+  enabled: false
+
+models:
+  vgae:
+    # ★ false = on repart des runs déjà entraînés. Ni build_graph ni train_vgae
+    #   n'entrent dans le DAG.
+    enabled: false
+    # → CONFIG_DIR = output/gnn_vgae/V5.4.1/v5.4.baseline
+    #   run dirs    = .../v5.4.baseline/s1, s2   (LIENS vers ../v5.4.baseline.sN)
+    #   analyses    = .../v5.4.baseline/analysis, logs/
+    run_tag: "V5.4.1/v5.4.baseline"
+    # s1+s2 = exactement le cross-seed publié (output/interpretation/V5.4.1/
+    # cross_seed/baseline). s3 existe et est un run baseline valide, mais n'a
+    # jamais été perturbé sur axisV4 — l'ajouter changerait le cross-seed publié.
+    seeds: [1, 2]
+    extra_flags: ""        # ignoré : pas d'entraînement
+  gnn_lite:
+    enabled: false
+
+perturbation:
+  enabled: true
+  modes: [knockout, knockdown, overexpress]
+  scope: all_genes
+  axis_tag: "axisV4dz"      # cf. entête : suffixe distinct pour ne rien écraser
+  out_suffix: "axisV4dz"
+  genes_file: ""
+  axis: "phenotypic"
+  axis_method: diff
+  # Branché (2026-07-29). Le headline reste `diff` — donc les rankings V5.4.1
+  # publiés sont inchangés. `axis_method_compare` re-projette le cache Δz produit
+  # par ce run même (règle axis_method_compare, en aval du cross-seed) et écrit
+  # une table SÉPARÉE : « N définitions d'axe × mêmes drivers ». Cela rend inutile
+  # le reproject_axes.py manuel décrit dans l'en-tête, qui reste valable pour
+  # ajouter un axe APRÈS coup.
+  axis_method_compare: "diff,lda,cav,pca"
+  axis_lda_shrinkage: 0.05
+  axis_cav_top_n: 500
+  axis_cav_seed: 0
+  axis_cav_permutations: 100   # null TCAV → p-value sur l'accuracy du probe
+  transition_axes: none
+  cluster_anchor_mode: none
+  cluster_anchors_file: ""
+  cache_delta_z: true       # ★ la raison d'être de ce config
+
+# axisV4 : quiescent = P4 + c0 ; sénescent = c1..c3.
+dataset:
+  pole_a: "P4,P16_cluster_0"
+  pole_b: "P16_cluster_1,P16_cluster_2,P16_cluster_3"
+
+scoring:
+  de_significance: "pvalue"
+  de_padj_max: 0.05
+  de_abs_lfc_min: 0.5
+
+validation:
+  # ⚠️ Tout ce bloc est post-hoc sur des checkpoints GELÉS. Rien ici ne
+  # ré-entraîne : les règles qui lisent le modèle le font via --run-dir, et
+  # leur entrée `best_vgae.pt` est conditionnée à models.vgae.enabled (sinon
+  # build_graph + train_vgae remonteraient dans le DAG).
+  ora_top_n: 100
+  decoy:
+    # ACTIVÉ (2026-07-29). C'est le run le plus légitime pour payer les ~4000
+    # encodages de N2 : les checkpoints sont ceux de juin, donc la colonne
+    # decoy_confidence obtenue ici qualifie EXACTEMENT les rankings V5.4.1
+    # publiés — ce qu'un ré-entraînement ne pourrait pas garantir (runs de juin
+    # non déterministes, ρ 0.556-0.687, LOG §27). Toute colonne
+    # decoy_confidence antérieure au 2026-07-21 était à n=3 donc non fiable.
+    enabled: true
+    top_n: 40
+    n_rewires: 50           # >= 50 obligatoire (LOG §25bis)
+    frozen_axis: false
+    random_axis: 20         # gratuit : re-projections du cache Δz déjà calculé
+    random_axis_seed: 0
+  cluster_annotation:
+    enabled: true
+  qc:
+    enabled: true
+    blocking: false
+    # Laissés vides À DESSEIN : deux seeds mesureraient la variance de seed, pas
+    # le bruit de reproductibilité. ⚠️ pipeline_qc retombe malgré tout sur deux
+    # seeds de même config quand ces champs sont vides — la ligne `repro` du
+    # rapport est donc à lire comme « variance de seed », pas comme plancher.
+    repro_a: ""
+    repro_b: ""
+  purity_source:
+    # Les cibles du mémoire : le trio métabolique médié par reactome_fi, HMGB1
+    # (miroir, porté par la coexpression) et GCLC (exception connue).
+    enabled: true
+    targets: "OCRL SYNJ2 SMPD1 HMGB1 GCLC"
+    n_random: 200
+  head_to_head:
+    enabled: true
+  readout_specificity:
+    enabled: true           # utilisable dès que le cache Δz existe — c'est le cas ici
+  ora_de_baseline:
+    enabled: true
+  signed_cascade:
+    enabled: true
+
+comparison:
+  enabled: false
+
+output:
+  generate_html_report: false

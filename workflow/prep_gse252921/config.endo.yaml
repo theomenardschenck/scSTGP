@@ -1,0 +1,36 @@
+# ============================================================================
+# Prep GSE252921 endo (EC AD vs CT) — produit les 3 inputs data-dérivés du
+# graphe V6 : coexpr_diff.tsv + SCENIC regulons + HuMess cs_gene_to_importance.
+# Lancer :  snakemake -s workflow/prep_gse252921/Snakefile \
+#              --configfile workflow/prep_gse252921/config.endo.yaml -j 8
+# ============================================================================
+dataset: GSE252921_endo
+
+# --- source : tar GEO → RDS (dgCMatrix genes×cells + metadata cellule) ---
+tar:            data/signleNucleus/GSE252921/GSE252921_RAW.tar
+counts_member:  GSM8010381_counts_endo.rds.gz
+meta_member:    GSM8010381_metadata_endo.rds.gz
+
+# --- sorties ---
+out_dir:    data/pyscenic/GSE252921_endo          # expr/coexpr/scenic_out
+humess_dir: data/humess/GSE252921_endo
+
+# --- grouping / axe ---
+group_col:    type          # colonne condition dans metadata (AD/CT)
+donor_col:    donor         # pseudobulk HuMess par donneur
+celltype_col: ""            # endo : PAS de filtre type cellulaire
+celltype:     ""
+baseline:     CT            # cond[0] = état de référence (jeune/contrôle)
+advanced:     AD            # cond[-1] = état avancé (sénescent/maladie)
+subsample:    8000          # cellules/condition pour coexpr/SCENIC
+min_frac:     0.05          # gène gardé si détecté ≥5% des cellules
+
+# --- références / envs ---
+tf_list:        data/pyscenic/scenic_refs/allTFs_hg38.txt
+humess_repo:    ../humess
+humess_env:     humess       # env conda cplex + carveme
+humess_cs:      1000
+scenic_env:     arboreto      # env conda pyscenic + arboreto
+scenic_workers: 8
+scenic_mem:     8GB
+py:             python        # interpréteur GRNBoost2-local (sklearn, base env)

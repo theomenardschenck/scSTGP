@@ -1,0 +1,35 @@
+# ============================================================================
+# Prep GSE252921 Oligo — CONTRÔLE NÉGATIF de spécificité (type non-EC extrait
+# de count_all_celltype, mêmes donneurs/assay). Même pipeline que l'endo.
+# ⚠ count_all_celltype = 153k noyaux (~6 Go) → lancer sur cluster (RAM), pas
+#   sur une box 7 Go.
+# Lancer :  snakemake -s workflow/prep_gse252921/Snakefile \
+#              --configfile workflow/prep_gse252921/config.oligo.yaml -j 8
+# ============================================================================
+dataset: GSE252921_oligo
+
+tar:            data/signleNucleus/GSE252921/GSE252921_RAW.tar
+counts_member:  GSM8010381_count_all_celltype.rds.gz
+meta_member:    GSM8010381_metadata_all_celltype.rds.gz
+
+out_dir:    data/pyscenic/GSE252921_oligo
+humess_dir: data/humess/GSE252921_oligo
+
+# ⚠ metadata_all_celltype : colonnes DIFFÉRENTES du fichier endo
+group_col:    diagnosis        # AD / Control
+donor_col:    sequence_id
+celltype_col: celltype_global  # filtre le type cellulaire
+celltype:     Oligo
+baseline:     Control
+advanced:     AD
+subsample:    8000
+min_frac:     0.05
+
+tf_list:        data/pyscenic/scenic_refs/allTFs_hg38.txt
+humess_repo:    ../humess
+humess_env:     humess
+humess_cs:      1000
+scenic_env:     arboreto
+scenic_workers: 8
+scenic_mem:     8GB
+py:             python

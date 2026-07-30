@@ -1,0 +1,176 @@
+# ──────────────────────────────────────────────────────────────────
+# config.V5.4.1.yaml — REPRODUCTION EXACTE de la config headline V5.4.1
+#                      (`v5.4.baseline` = split.rfi.dedup.kl1), 3 seeds.
+#
+# But : régénérer les DEUX caches qui manquent aux runs de juin 2026 —
+#   • le cache de GRAPHE   → <out>/V5.4.1_repro/v5.4.baseline/_graph_cache.pkl
+#     (bâti 1× par `build_graph`, réutilisé par les 3 seeds via --reuse-graph)
+#   • le cache Δz          → <run>/perturbation_all_genes_axisV4_dz_cache_<mode>.npz
+#     (`--cache-delta-z` ; permet reproject_axes.py = tout NOUVEL axe en secondes,
+#      sans re-perturber : LOG #log-multiaxis)
+#
+# Lancement :
+#   bash workflow/run.sh --backend cluster --configfile workflow/config/config.V5.4.1.yaml --dry-run
+#   bash workflow/run.sh --backend cluster --configfile workflow/config/config.V5.4.1.yaml
+#   # sorties sur scratch : export GNN_OUT_DIR_BASE=/scratch/.../output avant le run
+#
+# Le graphe seul (≈40 min, sans entraîner) :
+#   snakemake -s workflow/Snakefile --configfile workflow/config/config.V5.4.1.yaml \
+#             --profile workflow/profiles/slurm \
+#             output/gnn_vgae/V5.4.1_repro/v5.4.baseline/_graph_cache.pkl
+#
+# ⚠️ « exact » = exact au niveau de la SPÉCIFICATION (mêmes sources, mêmes flags,
+#    mêmes hyperparamètres, même axe). Les poids ne seront PAS bit-identiques à
+#    ceux de juin : ces runs-là ont tourné SANS `compute.deterministic`, et deux
+#    runs de config identique ne corrèlent qu'à ρ 0.556-0.687 sur driver_score
+#    (LOG §27 — plancher de bruit). Pour des Δz qui correspondent EXACTEMENT aux
+#    rankings V5.4.1 publiés, utiliser config.V5.4.1-dz.yaml (= perturbation des
+#    checkpoints de juin, sans ré-entraînement).
+# ──────────────────────────────────────────────────────────────────
+run:
+  name: "V5.4.1_repro"
+  description: "Reproduction v5.4.baseline (V5.4.1) — caches graphe + Δz"
+
+paths:
+  data_root: "data"
+  out_base: "output/gnn_vgae"        # env GNN_OUT_DIR_BASE (scratch) prime
+  humess_dir: "data/humess/output_huvec"
+  scenic_dir: "output/pyscenic"
+  de_magnitude_csv: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"   # MAST = V5.4.1
+  coexpr_file: "data/pyscenic/diff_coexpr/coexpr_diff.tsv"    # readout only
+                                     # (degré coexpr pour driver_baselines/report ;
+                                     #  l'encodeur reste en coexpr_mode p16_only)
+
+compute:
+  device: "auto"
+  python: "python3"
+  python_torch: "python3"
+  backend: "cluster"
+  # ON : sans lui aucune ablation n'est interprétable (LOG §27). Coût : threads=1
+  # → build/train plus lents. Ne rend PAS les poids identiques à ceux de juin
+  # (qui, eux, ont tourné en non-déterministe) : rend ce run-ci re-jouable.
+  deterministic: true
+
+input:
+  rna_type: scrna
+  degs_path: "data/gnn_data/DEGs_P4_vs_P16_MAST.csv"
+
+# HUVEC : coexpr + HuMess sont des entrées EXTERNES déjà calculées.
+build:
+  enabled: false
+
+models:
+  vgae:
+    enabled: true
+    # run_tag avec "/" = dossiers imbriqués → output/gnn_vgae/V5.4.1_repro/
+    # v5.4.baseline/{build,s1,s2,s3,logs,analysis,_graph_cache.pkl}.
+    # Les runs originaux (output/gnn_vgae/V5.4.1/v5.4.baseline.sN) ne sont pas touchés.
+    run_tag: "V5.4.1_repro/v5.4.baseline"
+    seeds: [1, 2, 3]
+    # ── V54_BASE de scripts/run_ablation_grid.sh (branche V5.4-ablation) :
+    #      V41_FULL   = --use-omnipath-signaling --use-omnipath-tf-curated
+    #                   --include-omnipath-genes
+    #      + signed   = --signed-message --signed-decoder --decoder-split
+    #      + rfi      = --use-reactome-fi
+    #      + kl1      = --kl-beta-max 0.0001
+    #      + dedup    = --dedup-ppi-signed remove
+    #      + régime   = --n-epochs 1500 --patience 200   (fixé le 2026-06-04)
+    #    Vérifié contre output/gnn_vgae/V5.4.1/v5.4.baseline.s1/run_config.json.
+    #
+    # ── Les DEUX derniers flags ne figuraient PAS dans la ligne de juin : ce sont
+    #    des DÉFAUTS QUI ONT BASCULÉ DEPUIS. Sans eux le graphe ne serait pas celui
+    #    de V5.4.1 :
+    #      --no-omnipath-hgnc-alias : alias HGNC ON par défaut depuis le 2026-07-10
+    #                                 → +35 nœuds (11133→11168), +392 signaling,
+    #                                   +614 tf_curated. OFF = legacy V5.4.1.
+    #      --no-dedup-ppi-mirror    : dé-duplication des lignes miroir STRING ON
+    #                                 par défaut depuis le 2026-07-28 → V5.4.1
+    #                                   stockait chaque PPI 4× (ppi_degree et
+    #                                   ‖h_PPI‖ gonflés). OFF = legacy V5.4.1.
+    #    Les retirer donne un graphe MEILLEUR, mais plus V5.4.1.
+    extra_flags: >-
+      --use-omnipath-signaling --use-omnipath-tf-curated --include-omnipath-genes
+      --signed-message --signed-decoder --decoder-split
+      --use-reactome-fi --kl-beta-max 0.0001 --dedup-ppi-signed remove
+      --n-epochs 1500 --patience 200
+      --no-omnipath-hgnc-alias --no-dedup-ppi-mirror
+  gnn_lite:
+    enabled: false
+
+perturbation:
+  enabled: true
+  modes: [knockout, knockdown, overexpress]
+  scope: all_genes
+  # Axe headline V5.4.1 = axisV4 (cf. AXIS="axisV4" dans run_interpretation_v541.sh) :
+  # côté quiescent = P4 + P16_cluster_0, côté sénescent = c1..c3.
+  axis_tag: "axisV4"        # filtre de lecture côté perturb_report
+  out_suffix: "axisV4"      # → perturbation_all_genes_axisV4_<mode>.tsv (nommage V5.4.1)
+  genes_file: ""            # "" = tous les gènes (all-genes, comme V5.4.1)
+  axis: "phenotypic"        # contraste de cell_groups (pas d'axe DE/effecteur)
+  axis_method: diff         # estimateur historique — HEADLINE inchangé
+  # Branché (2026-07-29). Re-projection post-hoc du cache Δz produit par ce run
+  # (règle axis_method_compare, en aval du cross-seed) → table séparée, quelques
+  # secondes, aucun effet sur le ranking headline.
+  axis_method_compare: "diff,lda,cav,pca"
+  axis_cav_permutations: 100
+  transition_axes: none     # V5.4.1 = axe global seul
+  cluster_anchor_mode: none
+  cluster_anchors_file: ""
+  # ★ LA raison de ce run : persiste dz_mean + w_diff_sum (axis-indépendants).
+  cache_delta_z: true
+
+# Pôles de l'axe = définition d'axisV4 (perturb_top_genes --quiescent-groups /
+# --p16-groups). Sans ce bloc le Snakefile laisse les défauts = axisV3 (P4 seul).
+dataset:
+  pole_a: "P4,P16_cluster_0"
+  pole_b: "P16_cluster_1,P16_cluster_2,P16_cluster_3"
+
+scoring:
+  de_significance: "pvalue"
+  de_padj_max: 0.05
+  de_abs_lfc_min: 0.5
+
+validation:
+  ora_top_n: 100
+  decoy:
+    # ACTIVÉ (2026-07-29). Lourd (~4000 encodages) mais ce config RÉ-ENTRAÎNE :
+    # les heures de train+perturbation dominent largement, et un ranking livré
+    # sans nulle de structure n'est pas lisible.
+    enabled: true
+    top_n: 40
+    n_rewires: 50           # >= 50 obligatoire (LOG §25bis)
+    frozen_axis: false
+    # Nulle d'AXE : 20 axes aléatoires re-projetés depuis le cache Δz déjà calculé
+    # → coût quasi nul, n'altère PAS le ranking headline (post-hoc).
+    random_axis: 20
+    random_axis_seed: 0
+  cluster_annotation:
+    enabled: true
+  qc:
+    enabled: true
+    blocking: false
+    # repro_a/repro_b = plancher de bruit entre deux runs de la MÊME config.
+    # À renseigner seulement si tu lances réellement ce config deux fois
+    # (ex. ".../V5.4.1_repro/v5.4.baseline/s1" et un second run identique).
+    repro_a: ""
+    repro_b: ""
+  # Les cinq modules du Stage 10, ON depuis le 2026-07-29 (cf. config.yaml pour
+  # la justification). Tous post-hoc sur l'encodeur gelé.
+  purity_source:
+    enabled: true
+    targets: "OCRL SYNJ2 SMPD1 HMGB1 GCLC"
+    n_random: 200
+  head_to_head:
+    enabled: true
+  readout_specificity:
+    enabled: true
+  ora_de_baseline:
+    enabled: true
+  signed_cascade:
+    enabled: true
+
+comparison:
+  enabled: false
+
+output:
+  generate_html_report: false

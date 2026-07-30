@@ -1,0 +1,211 @@
+# ============================================================================
+# Snakefile — Prep data-dérivée GSE252921 (single-nucleus, système externe).
+# Produit les 3 entrées que consomme le graphe V6 (build_graph / gnn_vgae) :
+#   1. coexpr_diff.tsv                 (GRNBoost2-local différentiel baseline/advanced)
+#   2. SCENIC regulon_edges + mean_TF_activity   (pySCENIC ctx + AUCell)
+#   3. HuMess cs_gene_to_importance_{baseline,advanced}.tsv  (modèle métabolique)
+# Chaîne : extract(tar→RDS) → export(RDS→mtx+pseudobulk) → mtx→expr_csv
+#          → {coexpr, SCENIC, HuMess}.
+#
+# Paramétré par --configfile (config.endo.yaml / config.oligo.yaml).
+# Doit tourner depuis la racine du dépôt (chemins relatifs à gnn_huvec/).
+# ============================================================================
+import os
+
+C          = config
+DATASET    = C["dataset"]
+OUT        = C["out_dir"]
+HUMESS     = C["humess_dir"]
+SCENIC     = os.path.join(OUT, "scenic_out")
+WORK       = os.path.join(OUT, "_rds")          # RDS extraits du tar
+BASE       = C["baseline"]                       # valeur de groupe (ex. CT)
+ADV        = C["advanced"]                        # valeur de groupe (ex. AD)
+PY         = C.get("py", "python")
+
+def _strip_gz(name):
+    return name[:-3] if name.endswith(".gz") else name
+
+COUNTS_RDS = os.path.join(WORK, _strip_gz(C["counts_member"]))
+META_RDS   = os.path.join(WORK, _strip_gz(C["meta_member"]))
+
+# Sorties clés
+EXPR_ALL  = os.path.join(OUT, "expr_all.csv")
+EXPR_BASE = os.path.join(OUT, f"expr_{BASE}.csv")
+EXPR_ADV  = os.path.join(OUT, f"expr_{ADV}.csv")
+CELL_META = os.path.join(OUT, "cell_metadata.csv")
+ABUNDANCE = os.path.join(OUT, "abundance_table.tsv")
+SAMPLESHT = os.path.join(OUT, "samplesheet.tsv")
+CELLGROUP = os.path.join(OUT, "cell_group.tsv")
+ADJ_BASE  = os.path.join(OUT, f"adjacencies_{BASE}.csv")
+ADJ_ADV   = os.path.join(OUT, f"adjacencies_{ADV}.csv")
+COEXPR    = os.path.join(OUT, "coexpr_diff.tsv")
+REGULONS  = os.path.join(SCENIC, "regulon_edges_TF_to_gene.csv")
+TF_ACT    = os.path.join(SCENIC, "mean_TF_activity_per_cluster.csv")
+CS_BASE   = os.path.join(HUMESS, "models", BASE, "cs", f"cs_gene_to_importance_{BASE}.tsv")
+CS_ADV    = os.path.join(HUMESS, "models", ADV,  "cs", f"cs_gene_to_importance_{ADV}.tsv")
+
+# argument optionnel filtre type cellulaire (contrôle Oligo)
+_CT_ARGS = ""
+if C.get("celltype_col") and C.get("celltype"):
+    _CT_ARGS = f"--celltype-col {C['celltype_col']} --celltype {C['celltype']}"
+
+
+rule all:
+    input:
+        COEXPR, REGULONS, TF_ACT, CS_BASE, CS_ADV
+
+
+# ── 1. Extraction tar GEO → RDS ─────────────────────────────────────────────
+rule extract:
+    output:
+        counts=COUNTS_RDS,
+        meta=META_RDS,
+    params:
+        tar=C["tar"], work=WORK,
+        cm=C["counts_member"], mm=C["meta_member"],
+    shell:
+        r"""
+        mkdir -p {params.work}
+        tar -xf {params.tar} -C {params.work} {params.cm} {params.mm}
+        gunzip -f {params.work}/{params.cm} {params.work}/{params.mm}
+        """
+
+
+# ── 2. Export RDS → sparse mtx cellule + pseudobulk (abundance/samplesheet) ──
+rule export:
+    input:
+        counts=COUNTS_RDS, meta=META_RDS,
+    output:
+        mtx=os.path.join(OUT, "cells", "matrix.mtx.gz"),
+        cellgroup=CELLGROUP, abundance=ABUNDANCE, samplesheet=SAMPLESHT,
+    params:
+        group_col=C["group_col"], donor_col=C["donor_col"],
+        ct_args=_CT_ARGS, subsample=C["subsample"], min_frac=C["min_frac"],
+        out=OUT,
+    log:
+        os.path.join(OUT, "_logs", "export.log"),
+    resources:
+        mem_mb=16000,
+    shell:
+        r"""
+        mkdir -p $(dirname {log})
+        Rscript scripts/export_snrna_system.R \
+            --counts {input.counts} --meta {input.meta} \
+            --group-col {params.group_col} --donor-col {params.donor_col} \
+            {params.ct_args} --subsample {params.subsample} \
+            --min-frac {params.min_frac} --out {params.out} &> {log}
+        """
+
+
+# ── 3. mtx sparse → expr_<groupe>.csv (cellules×gènes) + cell_metadata ───────
+rule mtx_to_expr:
+    input:
+        mtx=os.path.join(OUT, "cells", "matrix.mtx.gz"), cellgroup=CELLGROUP,
+    output:
+        expr_all=EXPR_ALL, expr_base=EXPR_BASE, expr_adv=EXPR_ADV,
+        cell_meta=CELL_META,
+    params:
+        out=OUT,
+    log:
+        os.path.join(OUT, "_logs", "mtx_to_expr.log"),
+    shell:
+        r"""
+        {PY} scripts/mtx_to_expr_csv.py --dir {params.out} &> {log}
+        {PY} -c "import pandas as pd; cg=pd.read_csv('{input.cellgroup}',sep='\t',header=None,names=['barcode','group']).set_index('barcode'); cg.to_csv('{output.cell_meta}')"
+        """
+
+
+# ── 4a. GRNBoost2-local par condition (sklearn, base env) ───────────────────
+rule grnboost2:
+    input:
+        expr=os.path.join(OUT, "expr_{cond}.csv"),
+    output:
+        adj=os.path.join(OUT, "adjacencies_{cond}.csv"),
+    params:
+        tf=C["tf_list"],
+    threads: 8
+    log:
+        os.path.join(OUT, "_logs", "grnboost2_{cond}.log"),
+    resources:
+        mem_mb=16000, runtime=1440,
+    shell:
+        r"""
+        {PY} src/data/preprocess/build_diff_coexpr.py grnboost2-local \
+            --expr {input.expr} --tf-list {params.tf} --n-jobs {threads} \
+            --out {output.adj} &> {log}
+        """
+
+
+# ── 4b. merge adjacences → coexpr_diff.tsv (per-target top-K) ────────────────
+rule coexpr_merge:
+    input:
+        base=ADJ_BASE, adv=ADJ_ADV,
+    output:
+        COEXPR,
+    log:
+        os.path.join(OUT, "_logs", "coexpr_merge.log"),
+    shell:
+        r"""
+        {PY} src/data/preprocess/build_diff_coexpr.py merge-adjacencies \
+            --adj-p4 {input.base} --adj-p16 {input.adv} \
+            --prune-mode per-target-topk --per-target-k 5 \
+            --overwrite --out {output} &> {log}
+        """
+
+
+# ── 5. SCENIC regulons (pySCENIC ctx + AUCell, env arboreto) ────────────────
+#    scenic_from_r.py fait son propre GRNBoost2 (arboreto) → prune → AUCell.
+#    Paramétré par STGP_SCENIC_* ; cluster=cell_group (AD/CT).
+rule scenic:
+    input:
+        expr_all=EXPR_ALL, cell_meta=CELL_META,
+    output:
+        regulons=REGULONS, tf_act=TF_ACT,
+    params:
+        scenic_dir=SCENIC, env=C["scenic_env"],
+        workers=C["scenic_workers"], mem=C["scenic_mem"],
+    log:
+        os.path.join(OUT, "_logs", "scenic.log"),
+    threads: 8
+    resources:
+        mem_mb=32000, runtime=1440,
+    shell:
+        r"""
+        STGP_SCENIC_EXPR=$(readlink -f {input.expr_all}) \
+        STGP_SCENIC_META=$(readlink -f {input.cell_meta}) \
+        STGP_SCENIC_RESULTS=$(readlink -f {params.scenic_dir}) \
+        STGP_SCENIC_CLUSTER_COL=group \
+        STGP_SCENIC_WORKERS={params.workers} STGP_SCENIC_MEM_LIMIT={params.mem} \
+        conda run -n {params.env} {PY} src/data/extract/scenic_from_r.py &> {log}
+        """
+
+
+# ── 6. HuMess (modèle métabolique + corner sampling) ────────────────────────
+#    Nested snakemake HuMess ; les règles d'annotation online échouent (|| true),
+#    seul cs_gene_to_importance nous intéresse → vérifié en fin de règle.
+rule humess:
+    input:
+        abundance=ABUNDANCE, samplesheet=SAMPLESHT,
+    output:
+        cs_base=CS_BASE, cs_adv=CS_ADV,
+    params:
+        humess_dir=HUMESS, repo=C["humess_repo"],
+        env=C["humess_env"], cs=C["humess_cs"],
+    log:
+        os.path.join(OUT, "_logs", "humess.log"),
+    threads: 4
+    resources:
+        mem_mb=16000, runtime=1440,
+    shell:
+        r"""
+        set -euo pipefail
+        ABUN=$(readlink -f {input.abundance}); SHEET=$(readlink -f {input.samplesheet})
+        HOUT=$(readlink -f {params.humess_dir}); mkdir -p $HOUT
+        HREPO=$(readlink -f {params.repo})
+        {PY} $HREPO/scripts/make_humess_config.py -s $SHEET -a $ABUN -o $HOUT \
+            --genetype symbol --solver cplex --score sample-ratio -t 0.6 > $HOUT/config.json
+        {PY} -c "import json,sys; d=json.load(open(sys.argv[1])); d['corner_sampling']={{'n_samples':int(sys.argv[2])}}; open(sys.argv[1],'w').write(json.dumps(d,indent=4))" $HOUT/config.json {params.cs}
+        ( cd $HREPO && conda run -n {params.env} snakemake -p --keep-going \
+              --rerun-incomplete --configfile $HOUT/config.json -j {threads} ) &> {log} || true
+        test -f {output.cs_base} && test -f {output.cs_adv}
+        """
