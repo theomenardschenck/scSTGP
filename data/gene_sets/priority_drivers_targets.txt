@@ -1,0 +1,53 @@
+# Priority genes for perturbation (--set-cible / chunk 0 of --chunks).
+# Our known drivers (CLAUDE.md) + metabolic druggable targets (target.md).
+# One HGNC symbol per line; '#' comments ignored. Intersected with the run's
+# gene universe at submit time (genes absent from the graph are skipped).
+#
+# --- Metabolic druggable targets (target.md §11-15) ---
+OCRL
+SYNJ2
+SMPD1
+GCLC
+GCLM
+NAMPT
+# --- Tier-1 drivers (chromatin + glycolysis + cyt-c) ---
+H2AFZ
+HMGB1
+HMGB2
+HMGA1
+ENO1
+FHL2
+CD59
+CYCS
+LDHA
+PKM
+TPI1
+# --- Ambiguous / graph-only / hubs ---
+ASNS
+TP53
+MYC
+MYBL2
+RAN
+# --- Effectors / canonical senescence ---
+CDKN2A
+CDKN1A
+LMNA
+IL6
+# --- TFs (moderate) ---
+CEBPB
+NFE2L2
+MAFF
+# --- Top discoveries V3.3 (non-DE, aging DBs) ---
+EHMT2
+EHMT1
+GADD45A
+DDIT3
+PPARG
+FOS
+# --- Club-of-6 (cross-ablation universal, mitosis/cytokinesis) ---
+CDCA2
+ANLN
+RAD51AP1
+HIST1H1B
+CKAP2L
+MIS18BP1

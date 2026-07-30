@@ -1,0 +1,71 @@
+# =============================================================================
+# registry.yaml — ensembles de gènes de VALIDATION (post-hoc uniquement).
+# =============================================================================
+# L'outil est public : pointez ici VOS bases de gènes (n'importe quel phénotype,
+# pas seulement la sénescence). Le loader `src/data/loaders/gene_sets.py` :
+#   • s'habitue   — sniff du format + de la colonne symbole (symbol_col: auto) ;
+#   • alarme      — health-check du recouvrement à l'univers du graphe
+#                   (OK / WARN / AUTO_OFF) écrit dans db_health.tsv ;
+#   • tourne sans — registre absent ou tous les sets AUTO_OFF ⇒ les features
+#                   dépendantes des BDD passent en OFF, sans crash ni AUROC vide.
+#
+# AUCUN set ci-dessous n'entre dans le graphe/features/entraînement/perturbation.
+# role: validation → interdit en amont du score (garde `assert_not_upstream`).
+#
+# Champs par entrée :
+#   name            (req) → colonne de sortie `in_<name>`
+#   path            (req) → relatif à la racine projet (dossier contenant data/)
+#   symbol_col            → "auto" (sniff) ou nom exact de colonne
+#   format                → auto | csv | tsv | txt | gmt
+#   role                  → validation | annotation | anchor
+#   direction             → up | down | null (signe global)
+#   direction_col / direction_values → split directionnel (ex. CellAge)
+#   gmt_keywords          → (format gmt) mots-clés de filtrage des gene-sets
+#   enabled               → false pour désactiver manuellement
+#
+# Récupérer les fichiers absents : `python scripts/fetch_gene_sets.py`
+# =============================================================================
+
+# --- Sénescence / vieillissement (jeu par défaut, reproduit le legacy V5.4.1) -
+- name: genage
+  path: data/databases/genage_human.csv
+  symbol_col: symbol
+  role: validation
+
+- name: cellage
+  path: data/databases/cellage3.tsv
+  symbol_col: "Gene symbol"
+  role: validation
+  direction_col: "Senescence Effect"
+  direction_values:
+    up: [Induces]
+    down: [Inhibits]
+
+- name: msigdb_aging
+  path: data/databases/h.all.symbols.gmt
+  format: gmt
+  role: validation
+  gmt_keywords:
+    [SENESCENCE, P53, APOPTOSIS, INFLAMMATORY, TNFA, IL6, KRAS, MTORC,
+     REACTIVE_OXYGEN, DNA_REPAIR, OXIDATIVE, AGING]
+
+- name: ageanno
+  path: data/databases/ageanno/aging_DEGs.txt
+  symbol_col: gene
+  format: csv
+  role: validation
+
+- name: aging_local           # proxy SenMayo local (human_age_related_gene.csv)
+  path: data/human_age_related_gene.csv
+  symbol_col: Symbol
+  role: validation
+
+# --- Signature endothéliale spécifique (Saul et al. 2025, Aging Cell) ---------
+# EndoSEN_up : biais endothélial réduit, validation HUVEC directe.
+# Absent par défaut → health-check AUTO_OFF tant que le fichier n'est pas fourni
+# (l'outil tourne quand même). Récupération : scripts/fetch_gene_sets.py.
+- name: endosen_up
+  path: data/gene_sets/endosen_up.txt
+  format: txt
+  role: validation
+  direction: up

@@ -31,6 +31,22 @@ output/
 /data/omnipath/graph_raw/*
 !/data/omnipath/graph_raw/*.tsv.gz
 
+# EXCEPTION VOLONTAIRE — data/gene_sets/ (12 Ko) : MANIFESTES, pas données.
+# `registry.yaml` ne contient que des déclarations et pointe vers
+# data/databases/ ; c'est la surface de configuration de l'outil (« pointez ici
+# VOS bases de gènes »), donc du source. Sans lui sur le cluster,
+# `load_registry` rend [] et TOUS les ensembles de validation disparaissent
+# SANS ERREUR. `priority_drivers_targets.txt` est référencé par trois configs
+# (dont config.smoke.yaml) : absent, elles pointent dans le vide.
+# Troisième occurrence de la même famille que le `/data/` non ancré et le
+# `__init__.py` ignoré — une règle qui a l'air juste et vide le pipeline en
+# silence. Les BASES elles-mêmes (data/databases/) restent ignorées : elles se
+# retéléchargent avec scripts/fetch_gene_sets.py.
+!/data/gene_sets/
+/data/gene_sets/*
+!/data/gene_sets/*.yaml
+!/data/gene_sets/*.txt
+
 # `figures/` ANCRÉ pour la même raison : sinon il ignore le code source
 # src/validation/figures/ (les figures de sortie vivent sous output/).
 /figures/
