@@ -1111,8 +1111,13 @@ def fig_aging_bubbles(ranking: pd.DataFrame, out_dir: Path,
     tiers = tiers or ["A_confirmed", "B_discovery", "C_effector"]
     sub = filter_tier(ranking, tiers).sort_values("driver_score", ascending=False).head(top_n)
 
-    # Identifier les colonnes aging DBs disponibles
+    # Identifier les colonnes de gene-sets disponibles : les canoniques d'abord
+    # (ordre stable) puis TOUT `in_<name>` produit par le registre (l'outil est
+    # public → noms de sets arbitraires), en excluant les sous-ensembles _up/_down.
     db_cols = [c for c in AGING_DBS if c in sub.columns]
+    db_cols += [c for c in sub.columns
+                if c.startswith("in_") and c not in db_cols
+                and not c.endswith(("__up", "__down"))]
     if not db_cols:
         # Fallback : single "n_aging_dbs" column
         if "n_aging_dbs" not in sub.columns:

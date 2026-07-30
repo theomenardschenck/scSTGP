@@ -4,6 +4,12 @@ d'importance émergent (5 composantes), K-means, baselines (MLP/DeepWalk/stat, g
 annotations BDD sénescence, visualisations, assemblage + export du ranking, edge_stats,
 vgae_metrics.json, group_expression.
 
+Les BDD de validation (§14/§16) proviennent du **registre déclaratif**
+`data/gene_sets/registry.yaml` via `src/data/loaders/gene_sets.py` (sniff +
+health-check + mode DB-free ; plus aucun téléchargement au runtime). Colonnes de
+sortie généralisées `in_<name>` + `n_gene_sets` (alias `n_databases`). Cf.
+technical/gene_sets.md, design_log §35 (2026-07-29).
+
 ⚠️ Comme les autres *_body.py : COMPILÉ puis exécuté par `_score.score_and_write()`
 dans un dict-namespace pré-rempli (model + embeddings issus du train + bundle graphe +
 config + chemins + imports). Sémantique module-level exacte du monolithe. Ne pas
@@ -235,12 +241,52 @@ RUN_VALIDATION = not getattr(CLI_ARGS, "no_validation", False)
 # Sentinelles : si une section est sautée, ses variables aval restent définies.
 mlp_auc = float("nan"); mlp_ap = float("nan")
 mlp_gene_score = None; node2vec_score = None
-genage_symbols = cellage_symbols = msigdb_aging_genes = ageanno_genes = aging_local_symbols = set()
 databases = []
 if not RUN_BASELINES:
     print("[skip] baselines entraînées (MLP §12 + DeepWalk §13bis) — --no-baselines")
 if not RUN_VALIDATION:
     print("[skip] validation post-hoc BDD aging (§14) — --no-validation")
+
+# ── Registre déclaratif des ensembles de gènes (validation post-hoc) ─────────
+# Chargé UNE fois, ici, de façon INCONDITIONNELLE (les colonnes d'annotation
+# §16 sont produites même sous --no-validation). Offline-first (aucun DL au
+# runtime, cf. scripts/fetch_gene_sets.py). Registre absent ⇒ GENE_SETS = []
+# ⇒ toutes les features BDD passent en OFF (aucun crash). Le health-check
+# aligne chaque set sur l'univers du graphe (gene_symbols) et déclasse en
+# AUTO_OFF les sets sans recouvrement (mauvais espace d'ID / espèce).
+GENE_SETS = []
+try:
+    import sys as _sys
+    # BASE_DIR = racine projet (fourni par le namespace appelant ; `__file__`
+    # est retiré du ns par _score.exec — ne pas s'en servir ici).
+    _loaders = os.path.join(BASE_DIR, "src", "data", "loaders")
+    if _loaders not in _sys.path:
+        _sys.path.insert(0, _loaders)
+    import gene_sets as _gs  # noqa: E402
+
+    _alias_map = {}
+    try:  # rattrape les renommages HGNC (MARCH1→MARCHF1…) avant l'intersection
+        from hgnc_alias import build_alias_map as _build_alias  # noqa: E402
+        _alias_map = _build_alias(cache_dir=os.path.join(DATA_DIR, "omnipath"),
+                                  download_if_missing=False)
+    except Exception:  # noqa: BLE001
+        _alias_map = {}
+
+    GENE_SETS = _gs.load_registry(root=BASE_DIR)
+    _gs.health_check(GENE_SETS, set(gene_symbols), alias_map=_alias_map or None)
+    _gs.log_health(GENE_SETS)
+    try:
+        _gs.health_table(GENE_SETS).to_csv(
+            os.path.join(OUT_DIR, "db_health.tsv"), sep="\t", index=False)
+    except Exception as _e:  # noqa: BLE001
+        print(f"  [warn] écriture db_health.tsv KO ({_e})")
+    # `databases` (name, gènes) alimente §14 (Mann-Whitney), la PCA §15b et la
+    # violin §15c. Exclut role='anchor' (peut toucher l'axe → hors validation).
+    databases = _gs.validation_pairs(GENE_SETS)
+except Exception as _e:  # noqa: BLE001 — jamais fatal : mode DB-free
+    print(f"  [warn] registre gene-sets indisponible ({type(_e).__name__}: {_e}) "
+          f"— annotations/validation BDD OFF.")
+    GENE_SETS, databases = [], []
 
 if RUN_BASELINES:
     # =============================================================================
@@ -600,84 +646,16 @@ if RUN_VALIDATION:
     #   H1 : les gènes de la BDD ont un score significativement plus élevé
     #   p < 0.05 → enrichissement significatif → le score capture le signal
     print("\n" + "=" * 70)
-    print("14. Validation post-hoc (GenAge, CellAge, MSigDB, AgeAnno)")
+    print("14. Validation post-hoc (ensembles de gènes du registre)")
     print("   → PAS utilisées dans l'entraînement, uniquement pour évaluer")
     print("=" * 70)
 
-    # ── Téléchargement des BDD ───────────────────────────────────────────────────
-    GENAGE_ZIP = os.path.join(DB_DIR, "genage_human.zip")
-    GENAGE_FILE = os.path.join(DB_DIR, "genage_human.csv")
-    download_if_absent(
-        "https://genomics.senescence.info/genes/human_genes.zip",
-        GENAGE_ZIP, "GenAge"
-    )
-    if not os.path.exists(GENAGE_FILE):
-        with zipfile.ZipFile(GENAGE_ZIP, "r") as z_file:
-            csv_names = [n for n in z_file.namelist() if n.endswith(".csv")]
-            if csv_names:
-                with z_file.open(csv_names[0]) as f:
-                    with open(GENAGE_FILE, "wb") as out:
-                        out.write(f.read())
-
-    genage = pd.read_csv(GENAGE_FILE)
-    genage_symbols = set(genage["symbol"].dropna()) if "symbol" in genage.columns else set()
-
-    MSIGDB_HALLMARK = os.path.join(DB_DIR, "h.all.symbols.gmt")
-    download_if_absent(
-        "https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2024.1.Hs/h.all.v2024.1.Hs.symbols.gmt",
-        MSIGDB_HALLMARK, "MSigDB Hallmarks"
-    )
-    msigdb_sets = {}
-    with open(MSIGDB_HALLMARK) as f:
-        for line in f:
-            parts = line.strip().split("\t")
-            msigdb_sets[parts[0]] = set(parts[2:])
-
-    AGING_KEYWORDS = ["SENESCENCE", "P53", "APOPTOSIS", "INFLAMMATORY", "TNFA",
-                      "IL6", "KRAS", "MTORC", "REACTIVE_OXYGEN", "DNA_REPAIR",
-                      "OXIDATIVE", "AGING"]
-    msigdb_aging_genes = set()
-    for name, genes_set in msigdb_sets.items():
-        if any(kw in name.upper() for kw in AGING_KEYWORDS):
-            msigdb_aging_genes |= genes_set
-
-    CELLAGE_ZIP = os.path.join(DB_DIR, "cellAge.zip")
-    CELLAGE_FILE = os.path.join(DB_DIR, "cellage3.tsv")
-    download_if_absent(
-        "https://genomics.senescence.info/cells/cellAge.zip",
-        CELLAGE_ZIP, "CellAge"
-    )
-    if not os.path.exists(CELLAGE_FILE):
-        with zipfile.ZipFile(CELLAGE_ZIP, "r") as z_file:
-            tsv_names = [n for n in z_file.namelist() if n.lower().endswith(('.tsv', '.csv'))]
-            if tsv_names:
-                with z_file.open(tsv_names[0]) as f:
-                    with open(CELLAGE_FILE, "wb") as out:
-                        out.write(f.read())
-
-    cellage = pd.read_csv(CELLAGE_FILE, sep='\t', engine='python',
-                           on_bad_lines='skip', quoting=3, dtype=str)
-    cellage_symbol_col = None
-    for col in cellage.columns:
-        if "symbol" in col.lower() or "gene" in col.lower() or "name" in col.lower():
-            cellage_symbol_col = col
-            break
-    if cellage_symbol_col is None:
-        cellage_symbol_col = cellage.columns[0]
-    cellage_symbols = set(cellage[cellage_symbol_col].dropna().str.strip())
-
-    AGEANNO_DIR = os.path.join(DB_DIR, "ageanno")
-    os.makedirs(AGEANNO_DIR, exist_ok=True)
-    AGEANNO_DEGS = os.path.join(AGEANNO_DIR, "aging_DEGs.txt")
-    download_if_absent(
-        "https://raw.githubusercontent.com/vikkihuangkexin/AgeAnno/main/scRNA/Aging-related%20DEGs.txt",
-        AGEANNO_DEGS, "AgeAnno DEGs"
-    )
-    ageanno_degs = pd.read_csv(AGEANNO_DEGS, sep=",", encoding="latin-1")
-    ageanno_genes = set(ageanno_degs["gene"].dropna().unique())
-
-    aging_local = pd.read_csv(os.path.join(DATA_DIR, "human_age_related_gene.csv"))
-    aging_local_symbols = set(aging_local["Symbol"].dropna())
+    # Les sets proviennent du registre déclaratif chargé plus haut (offline,
+    # sniff + health-check). `databases` = [(name, gènes)] des sets actifs de
+    # rôle validation/annotation. Registre absent / tous AUTO_OFF ⇒ liste vide
+    # ⇒ la validation est simplement sautée (mode DB-free, aucun crash).
+    if not databases:
+        print("  [skip] aucun ensemble de gènes actif — validation post-hoc OFF.")
 
     # ── Évaluation : les gènes à haut score sont-ils enrichis dans les BDD ? ────
     # Pour CHAQUE approche (VGAE, MLP-based, stat), on mesure l'enrichissement.
@@ -721,14 +699,8 @@ if RUN_VALIDATION:
                                 "p_value": p_val, "enriched": p_val < 0.05}
         return results
 
-    databases = [
-        ("GenAge", genage_symbols),
-        ("CellAge", cellage_symbols),
-        ("MSigDB aging", msigdb_aging_genes),
-        ("AgeAnno", ageanno_genes),
-        ("Aging local", aging_local_symbols),
-    ]
-
+    # `databases` est déjà construit depuis le registre (sets actifs). Vide en
+    # mode DB-free → evaluate_ranking n'itère sur rien (aucune sortie).
     vgae_results = evaluate_ranking(importance_score, "VGAE (non supervisé)",
                                      gene_symbols, databases)
     stat_results = evaluate_ranking(stat_score, "Baseline statistique (|ΔExpr|)",
@@ -948,19 +920,21 @@ if RUN_BASELINES:
 # Flag binaire : 1 si le gène est dans le quadrant haut-gauche du scatter
 results["discovery_candidate"] = discovery_candidates.astype(int)
 
-# --- Annotations BDD de validation (binaire, 0 ou 1) ---
-# Permet de vérifier rapidement si un gène du top ranking est déjà connu
-# dans les bases de sénescence/vieillissement.
-results["in_genage"] = [1 if g in genage_symbols else 0 for g in gene_symbols]
-results["in_cellage"] = [1 if g in cellage_symbols else 0 for g in gene_symbols]
-results["in_msigdb_aging"] = [1 if g in msigdb_aging_genes else 0 for g in gene_symbols]
-results["in_ageanno"] = [1 if g in ageanno_genes else 0 for g in gene_symbols]
-results["in_aging_local"] = [1 if g in aging_local_symbols else 0 for g in gene_symbols]
-# n_databases : nombre de BDD dans lesquelles le gène apparaît (0-5)
-# Un gène dans 5/5 BDD est un gène de sénescence "classique" bien validé.
-# Un gène dans 0/5 BDD mais avec un haut score VGAE est une découverte potentielle.
-results["n_databases"] = results[["in_genage", "in_cellage", "in_msigdb_aging",
-                                   "in_ageanno", "in_aging_local"]].sum(axis=1)
+# --- Annotations des ensembles de gènes (binaire, 0 ou 1) ---
+# Une colonne `in_<name>` par set ACTIF du registre (OK/WARN) — nommage
+# généralisé (plus de liste figée). Registre absent / tous AUTO_OFF ⇒ aucune
+# colonne (mode DB-free propre). `n_gene_sets` = nombre de sets contenant le
+# gène ; `n_databases` conservé comme alias rétro-compatible pour les scripts
+# d'analyse V5.4.1. Un gène dans 0 set mais à haut score VGAE = découverte.
+try:
+    _ann = _gs.annotate(GENE_SETS, gene_symbols).reset_index(drop=True)
+    for _c in _ann.columns:
+        results[_c] = _ann[_c].values
+    results["n_databases"] = results.get("n_gene_sets", 0)
+except Exception as _e:  # noqa: BLE001 — jamais fatal
+    print(f"  [warn] annotation gene-sets KO ({_e}) — colonnes in_* omises.")
+    results["n_gene_sets"] = 0
+    results["n_databases"] = 0
 
 # Tri par score d'importance décroissant (les gènes les plus importants en premier)
 results = results.sort_values("vgae_importance", ascending=False)

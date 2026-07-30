@@ -884,12 +884,17 @@ def fig_v2_vs_v3(out_dir: Path, top_n: int = 100) -> Path:
 
     # Panel E : DB overlap — how many top-N genes are in gold-standards
     ax = fig.add_subplot(gs[1, 1])
-    dbs = ["in_genage", "in_cellage", "in_msigdb_aging",
-           "in_ageanno", "in_aging_local"]
+    _dbs_pref = ["in_genage", "in_cellage", "in_msigdb_aging",
+                 "in_ageanno", "in_aging_local"]
     rows = []
     for run in v2_runs + v3_runs:
         r = load_ranking(run)
         tops = r.nlargest(top_n, "vgae_importance")
+        # Colonnes de gene-sets réellement présentes (registre → noms arbitraires,
+        # DB-free → aucune) ; on filtre pour ne jamais planter sur une absente.
+        dbs = [c for c in _dbs_pref if c in r.columns]
+        dbs += [c for c in r.columns if c.startswith("in_") and c not in dbs
+                and not c.endswith(("__up", "__down"))]
         for db in dbs:
             rows.append({"run": run.name,
                          "version": "V2" if run.name.startswith("V2") else "V3",
@@ -1055,9 +1060,13 @@ def fig_consensus(out_dir: Path,
     # Panel F : DB overlap per tier
     ax = fig.add_subplot(gs[1, 2])
     ref = load_ranking(runs[0]).set_index("gene")
-    db_cols = ["in_genage", "in_cellage", "in_msigdb_aging",
-               "in_ageanno", "in_aging_local"]
+    db_cols = [c for c in ref.columns if c.startswith("in_")
+               and not c.endswith(("__up", "__down"))]
     rows = []
+    if not db_cols:  # mode DB-free : rien à tracer sur ce panneau
+        ax.text(0.5, 0.5, "no gene-set columns", ha="center", va="center",
+                transform=ax.transAxes)
+        db_cols = []
     for tier, genes in [("A (all)", conf[conf["n_runs"] == n_runs].index),
                         ("B (majority)", conf[(conf["n_runs"] > n_runs//2) &
                                               (conf["n_runs"] < n_runs)].index),

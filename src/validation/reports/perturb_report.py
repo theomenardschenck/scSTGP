@@ -2612,11 +2612,14 @@ def _load_vgae_baselines(seed_paths: list[Path]) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     cat = pd.concat(frames, ignore_index=True)
-    num_cols = ["vgae_importance", "rank_vgae", "stat_score", "rank_stat"]
-    bool_cols = ["in_genage", "in_cellage", "in_msigdb_aging",
-                 "in_ageanno", "in_aging_local"]
+    num_cols = ["vgae_importance", "rank_vgae", "stat_score", "rank_stat",
+                "n_gene_sets", "n_databases"]
+    # Colonnes de gene-sets détectées dynamiquement (registre → noms arbitraires ;
+    # DB-free → aucune), sous-ensembles _up/_down exclus. Généralise le legacy
+    # in_genage/in_cellage/... à tout phénotype.
+    bool_cols = [c for c in cat.columns
+                 if c.startswith("in_") and not c.endswith(("__up", "__down"))]
     num_cols = [c for c in num_cols if c in cat.columns]
-    bool_cols = [c for c in bool_cols if c in cat.columns]
     agg = {c: "mean" for c in num_cols}
     agg.update({c: "max" for c in bool_cols})
     out = cat.groupby("gene").agg(agg).reset_index()
@@ -2786,9 +2789,15 @@ def build_gene_ranking(df: pd.DataFrame,
         else:  # 'magnitude-rank'
             if rank_stat_v is not None and not (isinstance(rank_stat_v, float) and np.isnan(rank_stat_v)):
                 is_de_significant = bool(int(rank_stat_v) <= de_top_n)
-        n_aging_dbs = sum(int(vgae_row.get(c, 0) or 0) for c in
-                           ("in_genage", "in_cellage", "in_msigdb_aging",
-                            "in_ageanno", "in_aging_local"))
+        # Nombre de gene-sets contenant le gène : `n_gene_sets` du registre si
+        # présent (généralise à tout phénotype), sinon somme des colonnes `in_*`
+        # réellement là (hors _up/_down), sinon 0 (mode DB-free).
+        if pd.notna(vgae_row.get("n_gene_sets")):
+            n_aging_dbs = int(vgae_row.get("n_gene_sets") or 0)
+        else:
+            n_aging_dbs = sum(
+                int(vgae_row.get(c, 0) or 0) for c in vgae_row
+                if str(c).startswith("in_") and not str(c).endswith(("__up", "__down")))
 
         # Per-mode raw diffs/cosines (passed to _gene_interpretation for
         # Tier-1 tags : non-monotonic, gain-of-function-only).
@@ -3512,6 +3521,24 @@ def _load_summaries_from_tsvs(tsvs: list[Path]) -> list[tuple[str, dict]]:
     return out
 
 
+# Diagnostic TSV families written by perturb_top_genes ALONGSIDE the ranking
+# tables, in the same directory and under the same `perturbation_all_*` prefix:
+#   *_random_axis_<mode>.tsv   — random-axis null (--random-axis N)
+#   *_signed_fanout[_<mode>].tsv — 1-hop signed fan-out, ONE ROW PER EDGE
+# Both carry `target` + `mode` columns, so _load_summaries_from_tsvs happily
+# turns them into summaries with every proj_signed_* metric at 0 and the SAME
+# (mode, target) key as the real rows. Aggregating them dilutes the mean by the
+# number of spurious entries — i.e. by the fan-out in-degree, which injects a
+# pure degree artefact into the ranking. They are never ranking inputs; excluded
+# unconditionally, whatever axis_tag says (2026-07-29).
+_NON_RANKING_TSV_MARKERS = ("_random_axis", "_signed_fanout")
+
+
+def _is_ranking_tsv(tsv_name: str) -> bool:
+    """False for the diagnostic/null tables that share the ranking prefix."""
+    return not any(m in tsv_name for m in _NON_RANKING_TSV_MARKERS)
+
+
 def _matches_axis_suffix(tsv_name: str, axis_tag: str | None) -> bool:
     """Filtre un nom de TSV par axe de sénescence (V3 vs V4).
 
@@ -3563,7 +3590,8 @@ def _collect_seed_summaries(
     for candidate in (p, p / "perturbation"):
         if not candidate.is_dir():
             continue
-        all_tsvs = sorted(candidate.glob("perturbation_all_*.tsv"))
+        all_tsvs = sorted(t for t in candidate.glob("perturbation_all_*.tsv")
+                          if _is_ranking_tsv(t.name))
         tsvs = [t for t in all_tsvs if _matches_axis_suffix(t.name, axis_tag)]
         if tsvs:
             filt_msg = f" [axis={axis_tag!r}]" if axis_tag is not None else ""

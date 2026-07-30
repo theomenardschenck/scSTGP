@@ -128,6 +128,24 @@ def load_signatures() -> dict[str, set[str]]:
         )
         sigs.update(parse_gmt(p, prefix_filter=keywords))
 
+    # Sets déclarés dans le registre (généralise à tout phénotype ; intègre p.ex.
+    # EndoSEN sans code). Best-effort : registre absent ⇒ rien ajouté. Préfixés
+    # `Reg:` pour ne pas écraser une signature legacy homonyme.
+    try:
+        import sys
+        _loaders = REPO_ROOT / "src" / "data" / "loaders"
+        if str(_loaders) not in sys.path:
+            sys.path.insert(0, str(_loaders))
+        import gene_sets as _gs  # noqa: E402
+        for _m in _gs.load_registry(root=REPO_ROOT):
+            if _m.symbols:
+                sigs.setdefault(f"Reg:{_m.name}", set(_m.symbols))
+                for _sign, _sub in _m.subsets.items():
+                    if _sub:
+                        sigs.setdefault(f"Reg:{_m.name}_{_sign}", set(_sub))
+    except Exception as _e:  # noqa: BLE001 — jamais fatal
+        print(f"  [warn] registre gene-sets non chargé pour l'annotation ({_e}).")
+
     return sigs
 
 

@@ -185,14 +185,50 @@ def load_reactome_gmt() -> dict[str, set[str]]:
     return sets
 
 
-def load_aging_databases() -> dict[str, set[str]]:
-    """Four aging-gene catalogues as ``{name: set_of_symbols}``.
+def _load_from_registry() -> dict[str, set[str]] | None:
+    """Named gene-sets from the declarative registry (``data/gene_sets/registry.yaml``).
 
-    Shape matches :func:`load_reactome_gmt` so the dict can be fed directly to
-    :func:`run_ora`.
+    Returns ``{name: symbols}`` for every active (OK/WARN) validation/annotation
+    set — this is what lets a user-supplied catalogue (e.g. EndoSEN_up) flow into
+    ``--db aging`` with no code change. Returns ``None`` when no registry exists,
+    so the caller falls back to the legacy hardcoded catalogues.
     """
+    try:
+        import sys
+        loaders = ROOT / "src" / "data" / "loaders"
+        if str(loaders) not in sys.path:
+            sys.path.insert(0, str(loaders))
+        import gene_sets as gs  # noqa: E402
+        sets_meta = gs.load_registry(root=ROOT)
+        if not sets_meta:
+            return None
+        # No graph universe here → health-check would flag everything WARN; we
+        # only need the raw symbols, so skip it and keep any non-empty set.
+        out = {m.name: set(m.symbols) for m in sets_meta if m.symbols}
+        return out or None
+    except Exception as exc:  # noqa: BLE001 — jamais fatal, on retombe sur le legacy
+        print(f"Warning: registre gene-sets illisible ({exc}) -- fallback legacy.")
+        return None
+
+
+def load_aging_databases() -> dict[str, set[str]]:
+    """Aging / phenotype gene catalogues as ``{name: set_of_symbols}``.
+
+    Prefers the declarative registry (généralise à tout phénotype, intègre
+    EndoSEN & co. sans toucher au code) ; retombe sur les catalogues legacy
+    codés en dur si aucun registre n'est présent. Shape matches
+    :func:`load_reactome_gmt` so the dict can be fed directly to :func:`run_ora`.
+    """
+    from_reg = _load_from_registry()
+    if from_reg is not None:
+        return from_reg
+
+    # ── Legacy fallback (aucun registre) ────────────────────────────────────
     sets: dict[str, set[str]] = {}
     for name, (path, col, sep) in AGING_DB_FILES.items():
+        if not Path(path).exists():
+            print(f"Warning: {path} not found -- {name} set is empty")
+            continue
         df = pd.read_csv(path, sep=sep)
         sets[name] = {s.strip() for s in df[col].dropna().astype(str) if s.strip()}
 

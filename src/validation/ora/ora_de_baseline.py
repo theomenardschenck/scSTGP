@@ -14,23 +14,38 @@ Pipeline
 --------
   1. Load DE results (GSE98440 limma-style output).
   2. Rank genes by |stat|, filter on padj < PADJ_THRESH, keep top K.
-  3. Load V3_Run{1,2,3} VGAE rankings, take top K of each,
-     intersect (2/3) to build the GNN consensus list.
+  3. Take the GNN gene list to compare against — see `--gnn-genes` below.
   4. Run hypergeometric REACTOME ORA on both lists against the same
      background (union of gene symbols in the DE table).
   5. Compute gene overlap (Jaccard, exact count) and pathway overlap.
   6. Write side-by-side TSV outputs and a short verdict file.
 
+Which GNN list? (2026-07-29)
+----------------------------
+`--gnn-genes FILE` takes a plain one-symbol-per-line list — typically the
+`top<N>_drivers.txt` that the `ora_top_drivers` rule just produced for THE
+CONFIG BEING RUN. That is the comparison the pipeline actually needs: is this
+run's top-driver ORA saying anything the DE alone does not?
+
+Without it, the script falls back to its historical behaviour: a 2-of-3
+consensus over `V3_Run{1,2,3}`. Those directories are the 2024 layout and no
+longer exist in this repository, so the fallback now raises an explicit error
+instead of a bare `FileNotFoundError` from pandas.
+
 Usage
 -----
-    python src/ora_de_baseline.py --top-k 95
-    python src/ora_de_baseline.py --top-k 500 --padj 0.05
+    # pipeline form (what the Snakemake rule does)
+    python src/validation/ora/ora_de_baseline.py --top-k 100 \
+        --gnn-genes <analysis>/interpret/ora/top100_drivers.txt \
+        --out-dir  <analysis>/interpret/ora/de_baseline
+    # legacy form, needs output/gnn_vgae/V3_Run{1,2,3}/
+    python src/validation/ora/ora_de_baseline.py --top-k 95
 
-Outputs (in gnn_huvec/output/ora_ablation/):
+Outputs (in --out-dir, default gnn_huvec/output/ora_ablation/):
     de_top{K}_genes.txt
-    gnn_consensus2of3_top{K}_genes.txt
+    gnn_top{K}_genes.txt
     de_top{K}_reactome.tsv
-    gnn_consensus2of3_top{K}_reactome.tsv
+    gnn_top{K}_reactome.tsv
     comparison_summary.tsv
     verdict.txt
 """
@@ -131,8 +146,35 @@ def load_de_background() -> set[str]:
     return {s for s in syms if s and s != "NA"}
 
 
+def load_gnn_gene_list(path: Path, top_k: int) -> tuple[set[str], dict]:
+    """Read a plain one-symbol-per-line list (e.g. `top<N>_drivers.txt`).
+
+    Already ranked and already truncated by the caller; `top_k` only guards
+    against a longer file being passed by hand.
+    """
+    genes = [ln.strip() for ln in path.read_text().splitlines() if ln.strip()]
+    kept = set(genes[:top_k])
+    return kept, {"source": str(path), "n_read": len(genes), "n_kept": len(kept)}
+
+
 def load_gnn_consensus(top_k: int, min_votes: int = 2) -> tuple[set[str], dict]:
-    """Return the set of genes that rank in top-K in >= min_votes of 3 V3 runs."""
+    """Return the set of genes that rank in top-K in >= min_votes of 3 V3 runs.
+
+    LEGACY fallback only. `V3_Run{1,2,3}` is the 2024 output layout; on any
+    current checkout it is absent, hence the explicit check — a silent
+    FileNotFoundError from pandas made this look like a data problem rather
+    than a stale default.
+    """
+    missing = [r for r in V3_RUNS
+               if not (VGAE_DIR / r / "gene_ranking_vgae.csv").is_file()]
+    if missing:
+        raise SystemExit(
+            "[ora_de_baseline] runs de référence introuvables : "
+            + ", ".join(str(VGAE_DIR / r) for r in missing)
+            + "\n  Ce sont les runs V3 de 2024 (layout historique). Pour "
+              "comparer le DE au top-drivers du run COURANT — ce que veut le "
+              "pipeline — passer :\n"
+              "      --gnn-genes <analysis>/interpret/ora/top<N>_drivers.txt")
     votes: dict[str, int] = {}
     per_run_top: dict[str, set[str]] = {}
     for run in V3_RUNS:
@@ -229,8 +271,18 @@ def main():
                     help="DE padj threshold before |stat| ranking (default: 0.05).")
     ap.add_argument("--fdr", type=float, default=0.05,
                     help="BH-FDR threshold for pathway significance (default: 0.05).")
+    ap.add_argument("--gnn-genes", type=Path, default=None,
+                    help="One-symbol-per-line GNN gene list to compare the DE "
+                         "baseline against — typically the top<N>_drivers.txt "
+                         "of the run being analysed. Omit for the legacy "
+                         "V3_Run{1,2,3} 2-of-3 consensus.")
+    ap.add_argument("--out-dir", type=Path, default=None,
+                    help="Output directory (default: output/ora_ablation/).")
     args = ap.parse_args()
 
+    global OUT_DIR
+    if args.out_dir is not None:
+        OUT_DIR = args.out_dir
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     K = args.top_k
 
@@ -239,10 +291,17 @@ def main():
     de_top = set(de.head(K)["hgnc_symbol"].astype(str))
     print(f"      DE significant: {len(de)} genes, keeping top {len(de_top)}.")
 
-    print(f"[2/5] Loading GNN V3 consensus top-{K} (>=2/3 runs) ...")
-    gnn_top, info = load_gnn_consensus(top_k=K, min_votes=2)
-    print(f"      per-run top-{K}: {info['per_run_sizes']} "
-          f"-> consensus 2/3 = {len(gnn_top)} genes.")
+    if args.gnn_genes is not None:
+        print(f"[2/5] Loading GNN gene list {args.gnn_genes} ...")
+        gnn_top, info = load_gnn_gene_list(args.gnn_genes, top_k=K)
+        gnn_label = "GNN_top_drivers"
+        print(f"      {info['n_read']} gène(s) lus -> {len(gnn_top)} gardés.")
+    else:
+        print(f"[2/5] Loading GNN V3 consensus top-{K} (>=2/3 runs) ...")
+        gnn_top, info = load_gnn_consensus(top_k=K, min_votes=2)
+        gnn_label = "GNN_consensus2of3"
+        print(f"      per-run top-{K}: {info['per_run_sizes']} "
+              f"-> consensus 2/3 = {len(gnn_top)} genes.")
 
     print(f"[3/5] Loading REACTOME GMT ...")
     reactome = load_reactome_gmt()
@@ -251,7 +310,7 @@ def main():
 
     (OUT_DIR / f"de_top{K}_genes.txt").write_text(
         "\n".join(sorted(de_top)) + "\n")
-    (OUT_DIR / f"gnn_consensus2of3_top{K}_genes.txt").write_text(
+    (OUT_DIR / f"gnn_top{K}_genes.txt").write_text(
         "\n".join(sorted(gnn_top)) + "\n")
 
     print(f"[4/5] Running hypergeometric ORA on both lists ...")
@@ -259,7 +318,7 @@ def main():
     rows_gnn = run_ora(gnn_top, background, reactome)
     sig_de = write_ora_tsv(rows_de, OUT_DIR / f"de_top{K}_reactome.tsv",
                            fdr_thresh=args.fdr)
-    sig_gnn = write_ora_tsv(rows_gnn, OUT_DIR / f"gnn_consensus2of3_top{K}_reactome.tsv",
+    sig_gnn = write_ora_tsv(rows_gnn, OUT_DIR / f"gnn_top{K}_reactome.tsv",
                             fdr_thresh=args.fdr)
     print(f"      significant pathways (padj<{args.fdr}): DE={sig_de}, GNN={sig_gnn}.")
 
@@ -277,7 +336,8 @@ def main():
     summary = pd.DataFrame([
         {"metric": "top_k",                           "value": K},
         {"metric": "DE_genes",                        "value": len(de_top)},
-        {"metric": "GNN_consensus2of3_genes",         "value": len(gnn_top)},
+        {"metric": "gnn_list",                        "value": gnn_label},
+        {"metric": "GNN_genes",                       "value": len(gnn_top)},
         {"metric": "gene_overlap",                    "value": len(gene_inter)},
         {"metric": "gene_jaccard",                    "value": round(jacc, 4)},
         {"metric": "DE_sig_pathways",                 "value": len(top_de_pw)},

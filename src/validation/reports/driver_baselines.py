@@ -52,6 +52,32 @@ def _coexpr_degree(coexpr_file: Path) -> pd.Series:
     return pd.concat([cx["TF"], cx["target"]]).value_counts().rename("coexpr_degree")
 
 
+def _load_positives(cellage: Path) -> set[str]:
+    """Ensemble positif (CellAge) tolérant à l'absence/format — jamais fatal.
+
+    Cherche une colonne symbole plausible ; retourne un set vide si le fichier
+    manque ou n'est pas lisible (⇒ l'AUROC CellAge est simplement omise, mode
+    DB-free). Généralise à tout TSV/CSV de gènes fourni via --cellage.
+    """
+    try:
+        cellage = Path(cellage)
+        if not cellage.exists():
+            return set()
+        sep = "\t" if cellage.suffix.lower() in (".tsv", ".txt") else ","
+        df = pd.read_csv(cellage, sep=sep, engine="python", on_bad_lines="skip",
+                         dtype=str, quoting=3)
+        df.columns = [str(c).strip().strip('"') for c in df.columns]
+        col = next((c for c in df.columns
+                    if c.lower() in ("gene symbol", "symbol", "gene", "gene_symbol")),
+                   None) or next((c for c in df.columns
+                                  if "symbol" in c.lower() or "gene" in c.lower()), None)
+        if col is None:
+            return set()
+        return set(df[col].dropna().astype(str).str.strip().str.strip('"')) - {""}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def run(ranking: Path, coexpr_file: Path | None, cellage: Path,
         out: Path, score_col: str = "driver_score") -> pd.DataFrame:
     d = pd.read_csv(ranking, sep="\t").sort_values(score_col, ascending=False).reset_index(drop=True)
@@ -67,18 +93,22 @@ def run(ranking: Path, coexpr_file: Path | None, cellage: Path,
     if "target_ppi_degree" in d.columns:
         metrics["rho_ppi_degree"] = round(float(spearmanr(d[score_col], d["target_ppi_degree"], nan_policy="omit")[0]), 3)
 
-    # 2. CellAge brut + intra-degré
-    pos = set(pd.read_csv(cellage, sep="\t")["Gene symbol"].astype(str))
-    d["_y"] = d["target"].isin(pos).astype(int)
-    metrics["auroc_cellage_raw"] = round(_auc(d[score_col], d["_y"]), 3)
-    if "target_ppi_degree" in d.columns:
-        d["_db"] = pd.qcut(d["target_ppi_degree"].rank(method="first"), 6, labels=False)
-        wa = wt = 0.0
-        for _, sub in d.groupby("_db"):
-            a = _auc(sub[score_col], sub["_y"])
-            if not np.isnan(a):
-                wa += a * len(sub); wt += len(sub)
-        metrics["auroc_cellage_degctrl"] = round(wa / wt, 3) if wt else np.nan
+    # 2. CellAge brut + intra-degré — sauté proprement si la BDD est absente
+    #    (mode DB-free : l'outil tourne quand même, l'AUROC est simplement omise).
+    pos = _load_positives(cellage)
+    if pos:
+        d["_y"] = d["target"].isin(pos).astype(int)
+        metrics["auroc_cellage_raw"] = round(_auc(d[score_col], d["_y"]), 3)
+        if "target_ppi_degree" in d.columns:
+            d["_db"] = pd.qcut(d["target_ppi_degree"].rank(method="first"), 6, labels=False)
+            wa = wt = 0.0
+            for _, sub in d.groupby("_db"):
+                a = _auc(sub[score_col], sub["_y"])
+                if not np.isnan(a):
+                    wa += a * len(sub); wt += len(sub)
+            metrics["auroc_cellage_degctrl"] = round(wa / wt, 3) if wt else np.nan
+    else:
+        print(f"  [skip] AUROC CellAge — set positif absent/illisible ({cellage})")
 
     # 3. robustesse top-50 + Tier-1
     if {"mean_robustness", "mean_stability"}.issubset(d.columns):
