@@ -50,14 +50,42 @@ root_tag: "sup"
 seeds: [1, 2, 3]
 deterministic: true
 
-# Pas de décoy N2/N4 ici : le livrable est la saliency par cluster, pas la nulle
-# de structure. random_axis reste utile (nulle de spécificité d'axe, ~gratuit).
-decoy: false
+# Décoy N2 ACTIVÉ (2026-07-29), n>=50 obligatoire (LOG §25bis). Le livrable
+# principal reste la saliency par cluster, mais le run produit aussi un
+# driver_score par axe : sans nulle de structure il n'est pas lisible, et la
+# confrontation saliency ↔ perturbation (les deux voies « μ encode k » vs
+# « perturber g déplace vers k ») exige que les deux côtés soient qualifiés.
+decoy: true
+decoy_n_rewires: 50
+decoy_frozen_axis: false
 decoy_random_axis: 20
 decoy_random_axis_seed: 0
 
+# F1 — headline `diff` inchangé ; la comparaison est une re-projection post-hoc
+# du cache Δz (secondes, table séparée). Elle a un sens propre ici : si μ encode
+# réellement les sous-états, l'axe ne devrait pas pivoter d'un estimateur à
+# l'autre (contre-exemple connu : ASNS, cos 0.058→0.514 selon kl1).
 axis_method: diff
-axis_method_compare: ""
+axis_method_compare: "diff,lda,cav,pca"
+axis_cav_permutations: 100
+
+# Recopié tel quel dans le config généré (fusion récursive). Hérite de
+# config.yaml où les cinq modules du Stage 10 sont ON.
+validation:
+  purity_source:
+    enabled: true
+    # Ancres d'état plutôt que le trio métabolique : la question de cette vague
+    # est ce que le latent sait des SOUS-ÉTATS, donc les gènes qui les portent.
+    targets: "CDKN2A CDKN1A LMNB1 MKI67 HMGB2 TP53"
+    n_random: 200
+  signed_cascade:
+    enabled: true
+    # `both` : `--de-features` et les flags `pure` touchent les FEATURES de
+    # nœud et les sources NON signées — le substrat signé est identique d'un
+    # bras à l'autre. Seul le signe appris (décodeur bilinéaire sur μ) peut
+    # bouger, et c'est précisément la question ici : la tête supervisée
+    # déplace-t-elle ce que le latent croit du signe de la régulation ?
+    sign_source: both
 
 base_extra_flags: >-
   --signed-message --signed-decoder --use-reactome-fi

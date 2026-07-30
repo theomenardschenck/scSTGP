@@ -71,6 +71,24 @@ _pure_flags: &pure >-
   --exclude-features ppi_degree,reg_degree
   --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges
 
+# Recopié tel quel dans le config généré (fusion récursive, cf. l'en-tête du
+# wrapper). Hérite de config.yaml, où les cinq modules du Stage 10 sont ON.
+validation:
+  purity_source:
+    # LE module de cette vague. On modifie l'ORIENTATION de reactome_fi, et
+    # `mediate` a déjà établi que le trio métabolique est médié par rfi
+    # (cos −0.48 → −0.11 en coupant rfi, LOG §26quater). C'est donc la mesure
+    # directe de ce que l'orientation déplace, gène par gène et source par
+    # source — là où le Δrang global ne dit que « ça bouge ».
+    enabled: true
+    targets: "OCRL SYNJ2 SMPD1 GCLC NAMPT HMGB1"
+    n_random: 200
+  signed_cascade:
+    # rfi non signé était l'angle mort de la cascade : sur le bras `rich-dir`
+    # les arêtes deviennent orientées, donc la composition de signes multi-hop
+    # change de substrat. À lire en regard du bras legacy.
+    enabled: true
+
 ablation_grid:
   # ── CONTRÔLES (= op.base / op.all, à reproduire) ──────────────────────────
   - {name: rich-legacy,      add_flags: ""}

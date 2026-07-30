@@ -58,18 +58,28 @@ root_tag: "mirror"
 seeds: [1, 2, 3]
 deterministic: true
 
-# Décoy N2 coupé : le livrable ici est un Δrang entre deux graphes, pas une
-# nulle de structure — et N2 coûte ~4000 encodages par config. random_axis
-# reste (re-projection du cache Δz, quasi gratuit) pour garder la nulle de
-# spécificité d'axe dans chaque bras.
-decoy: false
+# Décoy N2 ACTIVÉ (2026-07-29). Il coûte ~4000 encodages par config, mais c'est
+# précisément la vague où il porte : le correctif change des DEGRÉS PPI, et la
+# nulle de rewiring degré-préservant est ce qui distingue « le voisinage compte »
+# de « le degré a bougé ». n>=50 obligatoire (LOG §25bis) : à n=3-5 les SD sont
+# sous-estimées ~10x et 3 des 4 « passages » s'évaporent à n=50.
+decoy: true
+decoy_n_rewires: 50
+decoy_frozen_axis: false
+# Nulle de spécificité d'AXE, complémentaire de N2 (structure) : quasi gratuite,
+# ce sont N re-projections du cache Δz déjà calculé.
 decoy_random_axis: 20
 decoy_random_axis_seed: 0
 
+# F1 — le HEADLINE reste `diff` : l'A/B à variable unique est intact, puisque
+# `axis_method_compare` ne re-perturbe RIEN. Il re-projette le cache Δz après
+# coup (secondes) et produit une table SÉPARÉE. On obtient donc, en plus du
+# Δrang, la réponse à « le verdict du correctif tient-il quelle que soit la
+# façon de tracer l'axe ? » — qui est une question qu'un A/B de graphe pose
+# forcément. `pca` est le null non supervisé.
 axis_method: diff
-# Pas de comparaison d'estimateurs ici : elle brouillerait la lecture d'un A/B
-# à variable unique. C'est le rôle de la vague rfi2.
-axis_method_compare: ""
+axis_method_compare: "diff,lda,cav,pca"
+axis_cav_permutations: 100      # null TCAV → p-value sur l'accuracy du probe
 
 base_extra_flags: >-
   --signed-message --signed-decoder --use-reactome-fi
@@ -81,6 +91,33 @@ _pure_flags: &pure >-
   --dedup-ppi-signed remove --no-ppi
   --exclude-features ppi_degree,reg_degree
   --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges
+
+# Bloc recopié tel quel dans le config généré (fusion récursive, cf. l'en-tête
+# du wrapper). Hérite de config.yaml, où les cinq modules du Stage 10 sont
+# désormais ON ; on ne surcharge ici que ce qui est spécifique à cette vague.
+validation:
+  readout_specificity:
+    # LE module de cette vague. Le correctif divise les degrés PPI par deux :
+    # sans métrique affranchie du degré, un Δrang reste ambigu entre effet de
+    # message-passing et artefact structurel.
+    enabled: true
+  purity_source:
+    enabled: true
+    # Cibles orientées PPI plutôt que le trio métabolique par défaut : c'est le
+    # canal PPI qu'on modifie, donc les gènes dont la purity en dépend.
+    targets: "HMGB1 HMGB2 H2AFZ TP53 OCRL SYNJ2"
+    n_random: 200
+  signed_cascade:
+    enabled: true
+    # `both` et pas `known` (défaut) — mesuré : le PPI n'est PAS signé, donc
+    # legacy et fixed ont un substrat signé STRICTEMENT identique (195 739
+    # arêtes à signe non nul, même univers de nœuds). Avec `known` seul, les
+    # deux bras rendraient deux tables rigoureusement identiques : zéro
+    # information. Ce que le correctif peut déplacer, c'est le signe APPRIS —
+    # le décodeur bilinéaire est entraîné sur un graphe dont les degrés PPI
+    # ont changé. `known` sert alors de contrôle invariant, `pred` de mesure.
+    # Coût : une seconde propagation creuse sur 6 hops, négligeable.
+    sign_source: both
 
 ablation_grid:
   # ── Contexte RICHE : PPI présent, c'est là que le correctif agit ──────────

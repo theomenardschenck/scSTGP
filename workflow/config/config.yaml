@@ -174,26 +174,55 @@ validation:
     repro_a: ""
     repro_b: ""
 
+  # Les cinq modules ci-dessous sont ON depuis le 2026-07-29. Ils étaient
+  # `false` par héritage de leur branchement (2026-07-27, où l'objectif était
+  # de ne pas modifier le DAG existant) — conséquence : ils ne tournaient
+  # toujours nulle part, deux mois après avoir été écrits. Ils sont post-hoc
+  # sur l'encodeur GELÉ (aucun ré-entraînement) et coûtent des minutes face aux
+  # heures de train+perturbation, donc le défaut raisonnable est ON.
+
   purity_source:
     # D'où vient la purity qui classe une cible, et quelle source la porte ?
     # (encodeur gelé, post-hoc sur Δz ; `decompose` + `mediate` + nulle d'axe)
-    enabled: false
-    targets: ""             # OBLIGATOIRE si enabled — ex. "OCRL SYNJ2 SMPD1"
+    enabled: true
+    # OBLIGATOIRE si enabled (le Snakefile lève une ValueError sinon).
+    # Défaut = les cibles que la question concerne réellement : le trio
+    # métabolique médié par reactome_fi (LOG §26quater), HMGB1 comme miroir
+    # porté par la coexpression, GCLC comme exception connue. À remplacer
+    # quand la question change — ce n'est pas une liste universelle.
+    targets: "OCRL SYNJ2 SMPD1 HMGB1 GCLC"
     n_random: 200           # axes aléatoires pour la nulle de spécificité
 
   head_to_head:
     # Un outil plus simple (feature d'importance, betweenness) sort-il les
     # mêmes cibles que le GNN ?
-    enabled: false
+    enabled: true
     targets: ""             # fichier de cibles ; vide = défaut du script
 
   readout_specificity:
     # Métriques de readout affranchies du degré, depuis le cache Δz.
-    enabled: false
+    # Indispensable pour lire une vague qui DÉPLACE des degrés (ex. le A/B du
+    # dédoublonnage miroir PPI) : sans elle on ne distingue pas l'effet réel de
+    # l'artefact structurel.
+    enabled: true
 
   ora_de_baseline:
     # ORA sur le DE seul = le comparateur obligatoire de l'ORA top-drivers.
-    enabled: false
+    enabled: true
+
+  signed_cascade:
+    # Solution C.1 (gnn_futur §8.C) — cascade signée ancrée-effecteurs.
+    # Propagation multi-hop du rôle d'un noyau d'effecteurs EN AMONT par
+    # composition de signes (balance structurelle, Harary 1953 ; cf.
+    # CARNIVAL/VIPER/CellOracle). Post-hoc sur l'encodeur gelé + graphe signé
+    # curé, 1 run (SEEDS[0]). Généralise le fan-out signé 1-hop.
+    enabled: true
+    sign_source: known      # known (curé, NON-circulaire, défaut) | pred (bilin appris) | both
+    alpha: 0.85             # damping ; profondeur effective ~1/(1-alpha)
+    hops: 6                 # itérations de propagation (>2 dépasse les 2 hops du GAT)
+    norm: sym               # sym (breadth-rewarding, Zhou 2004, défaut) | row (deg-safe) | in
+    effector_pro: ""        # ancres pro-sén ; vide = défaut du script (CDKN2A,CDKN1A,…)
+    effector_anti: ""       # ancres anti-sén ; vide = défaut du script (LMNB1,MKI67,…)
 
 # ── Stage 10 : cross-method (opt-in, non câblé end-to-end)
 comparison:

@@ -181,6 +181,17 @@ H2H_TARGETS = str(_v("head_to_head", "targets", "") or "").strip()
 READOUT_SPEC_ON = _v("readout_specificity")
 ORA_DE_BASE_ON  = _v("ora_de_baseline")
 
+# Signed cascade (Solution C.1, gnn_futur §8.C) : effector-anchored multi-hop
+# signed propagation on the frozen encoder + curated signed graph. Post-hoc,
+# seed-invariant for the curated sign → run once on SEEDS[0]. Opt-in, défaut OFF.
+CASCADE_ON        = _v("signed_cascade")
+CASCADE_SIGN_SRC  = str(_v("signed_cascade", "sign_source", "known") or "known")
+CASCADE_ALPHA     = float(_v("signed_cascade", "alpha", 0.85))
+CASCADE_HOPS      = int(_v("signed_cascade", "hops", 6))
+CASCADE_NORM      = str(_v("signed_cascade", "norm", "sym") or "sym")
+_CASC_PRO = str(_v("signed_cascade", "effector_pro", "") or "").strip()
+_CASC_ANTI = str(_v("signed_cascade", "effector_anti", "") or "").strip()
+
 if PURITY_ON and not PURITY_TARGETS:
     raise ValueError("validation.purity_source.enabled: true exige "
                      "validation.purity_source.targets (liste de gènes).")
@@ -352,7 +363,10 @@ def final_targets():
     if READOUT_SPEC_ON:
         t.append(ANALYSIS_DIR / "interpret" / "readout_specificity.tsv")
     if ORA_DE_BASE_ON:
-        t.append(ANALYSIS_DIR / "interpret" / "ora" / "de_baseline.tsv")
+        t.append(ANALYSIS_DIR / "interpret" / "ora" / "de_baseline"
+                 / "comparison_summary.tsv")
+    if CASCADE_ON:
+        t.append(ANALYSIS_DIR / "interpret" / "signed_cascade.tsv")
     return t
 
 rule all:
@@ -460,7 +474,12 @@ rule perturb:
             if RANDOM_AXIS > 0 else [])),
     params:
         rd=lambda wc: run_dir(wc.seed),
-        suffix=(("--out-suffix " + str(OUT_SUFFIX)) if OUT_SUFFIX else ""),
+        # perturb_top_genes CONCATÈNE le suffixe brut ("perturbation_all_genes"
+        # + suffix) : il faut donc passer "_axisV4", pas "axisV4". Sans le
+        # souligné, le script écrivait "perturbation_all_genesaxisV4_ko.tsv"
+        # alors que _PSEG déclare "perturbation_all_genes_axisV4_ko.tsv" →
+        # MissingOutputException pour TOUT out_suffix non vide (corrigé 2026-07-29).
+        suffix=(("--out-suffix " + _PSEG) if OUT_SUFFIX else ""),
         genes=(("--genes-file " + str(GENES_FILE)) if GENES_FILE else ""),
         multi=_MULTI_FLAGS,
         axis=AXIS_FLAGS,
@@ -501,7 +520,19 @@ rule aggregate_cross_seed:
     params:
         runs=[str(run_dir(s)) for s in SEEDS],
         report_dir=ANALYSIS_DIR,
-        axis=(("--axis-tag " + str(AXIS_TAG)) if AXIS_TAG else ""),
+        # ALWAYS pass --axis-tag, including when it is empty (2026-07-29 fix).
+        # perturb_report distinguishes axis_tag="" (only suffix-less TSVs, i.e.
+        # the V3 naming) from axis_tag=None (match EVERYTHING). Dropping the
+        # flag on a falsy AXIS_TAG sent None, so the cross-seed glob
+        # `perturbation_all_*.tsv` also swallowed the DIAGNOSTIC families
+        # written by the same perturb job — `_random_axis_<mode>.tsv` (axis
+        # null) and `_signed_fanout_<mode>.tsv` (one row per EDGE) — whose
+        # `target`/`mode` columns look like real rows but carry none of the
+        # proj_signed_* metrics. Measured on the completed V6.1.3 rfi2 wave:
+        # n_seeds_present up to 1480 instead of <=3, robustness_score up to
+        # 740, and avg_proj_signed_diff divided by the fan-out in-degree
+        # (TP53 0.0148 instead of ~10.9) => a degree-weighted artefact.
+        axis=('--axis-tag "' + str(AXIS_TAG) + '"'),
         de_sig=SCORING["de_significance"],
         padj=SCORING["de_padj_max"],
         lfc=SCORING["de_abs_lfc_min"],
@@ -704,7 +735,13 @@ rule purity_source_attribution:
     """
     input:
         ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
-        model=run_dir(SEEDS[0]) / "best_vgae.pt",
+        # Conditionnel comme interpret_embedding / signed_cascade : sous
+        # `models.vgae.enabled: false` (config .-dz, qui REJOUE des checkpoints
+        # de juin) déclarer le modèle en entrée ferait remonter build_graph +
+        # train_vgae dans le DAG — soit exactement le ré-entraînement que ce
+        # mode existe pour éviter. Le checkpoint est de toute façon lu par le
+        # script via --run-dir.
+        model=run_dir(SEEDS[0]) / "best_vgae.pt" if TRAIN_VGAE else [],
     output:
         decompose=ANALYSIS_DIR / "interpret" / "purity" / "decompose.tsv",
         mediate=ANALYSIS_DIR / "interpret" / "purity" / "mediate.tsv",
@@ -759,7 +796,8 @@ rule readout_specificity:
     """
     input:
         ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
-        model=run_dir(SEEDS[0]) / "best_vgae.pt",
+        # Conditionnel : cf. purity_source_attribution ci-dessus.
+        model=run_dir(SEEDS[0]) / "best_vgae.pt" if TRAIN_VGAE else [],
     output:
         spec=ANALYSIS_DIR / "interpret" / "readout_specificity.tsv",
     params:
@@ -779,17 +817,59 @@ rule ora_de_baseline:
 
     Sans lui, rien ne dit que l'enrichissement du top-drivers apporte quoi que
     ce soit au-dessus d'un simple tri par statistique DE.
+
+    On lui passe le top-N drivers DE CE RUN (`--gnn-genes`), pas le consensus
+    V3 de 2024 qui était son défaut : ces runs n'existent plus, et la question
+    posée porte sur la config courante. Sortie = le TSV de comparaison
+    (recouvrement gènes + pathways), pas la sortie console.
     """
+    input:
+        genes=ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_drivers.txt"),
     output:
-        ora=ANALYSIS_DIR / "interpret" / "ora" / "de_baseline.tsv",
+        ora=ANALYSIS_DIR / "interpret" / "ora" / "de_baseline" / "comparison_summary.tsv",
     params:
         top_n=ORA_TOP_N,
+        out_dir=ANALYSIS_DIR / "interpret" / "ora" / "de_baseline",
     log:
         LOG_DIR / "ora_de_baseline.log",
     shell:
-        'mkdir -p "$(dirname {output.ora})" "$(dirname {log})" && '
+        'mkdir -p "{params.out_dir}" "$(dirname {log})" && '
         "{PY} src/validation/ora/ora_de_baseline.py "
-        "--top-k {params.top_n} > {output.ora} 2> {log}"
+        "--top-k {params.top_n} --gnn-genes {input.genes} "
+        "--out-dir {params.out_dir} &> {log}"
+
+
+rule signed_cascade:
+    """Solution C.1 — effector-anchored signed cascade (gnn_futur §8.C).
+
+    Multi-hop generalisation of the 1-hop signed fan-out: propagates the role of
+    a small effector core UPSTREAM by sign composition (structural balance,
+    Harary 1953 ; cf. CARNIVAL/VIPER/CellOracle). Runs on the FROZEN encoder +
+    the curated signed graph — no re-training, seed-invariant for the curated
+    sign → computed once on SEEDS[0]. Emits per-gene cascade_role/coherence/
+    reach/score (non-ranking, joined for arbitration cross-dataset).
+    """
+    input:
+        model=run_dir(SEEDS[0]) / "best_vgae.pt" if TRAIN_VGAE else [],
+    output:
+        casc=ANALYSIS_DIR / "interpret" / "signed_cascade.tsv",
+    params:
+        rd=run_dir(SEEDS[0]),
+        sign_src=CASCADE_SIGN_SRC,
+        alpha=CASCADE_ALPHA,
+        hops=CASCADE_HOPS,
+        norm=CASCADE_NORM,
+        pro=(("--effector-pro " + _CASC_PRO) if _CASC_PRO else ""),
+        anti=(("--effector-anti " + _CASC_ANTI) if _CASC_ANTI else ""),
+    log:
+        LOG_DIR / "signed_cascade.log",
+    shell:
+        'mkdir -p "$(dirname {output.casc})" "$(dirname {log})" && '
+        "{PY_TORCH} src/perturbation/signed_cascade.py "
+        "--run-dir {params.rd} --sign-source {params.sign_src} "
+        "--alpha {params.alpha} --hops {params.hops} --norm {params.norm} "
+        "{params.pro} {params.anti} --device {DEVICE} "
+        "--out {output.casc} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────

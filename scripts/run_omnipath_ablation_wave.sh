@@ -9,6 +9,12 @@
 # lance `snakemake --configfile base --configfile <généré>` jusqu'à `rule all`
 # (train → perturb → cross-seed → driver_baselines/interpret → decoy).
 #
+# Le profil accepte, en plus des raccourcis (decoy, decoy_n_rewires, axis_method,
+# …), un bloc `validation:` et un bloc `perturbation:` recopiés TELS QUELS dans le
+# config généré (fusion récursive, appliquée en dernier). C'est la seule voie pour
+# piloter par vague les cinq modules du Stage 10 — purity_source, head_to_head,
+# readout_specificity, ora_de_baseline, signed_cascade.
+#
 # Usage :
 #   scripts/run_omnipath_ablation_wave.sh <profil.yaml> [options] [-- snakemake args]
 #     --only a,b,c      restreint aux ablations nommées
@@ -106,6 +112,16 @@ python - "$PROFILE" "$ONLY" "$TMPDIR" <<'PY'
 import os, sys, yaml
 profile, only, tmpd = sys.argv[1], sys.argv[2], sys.argv[3]
 p = yaml.safe_load(open(profile))
+
+def deep_merge(dst, src):
+    """Recursive dict update (same semantics as snakemake's update_config), so a
+    profile can override ONE leaf without restating the whole section."""
+    for k, v in (src or {}).items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            deep_merge(dst[k], v)
+        else:
+            dst[k] = v
+    return dst
 grid = p["ablation_grid"]
 if only:
     want = set(s.strip() for s in only.split(",") if s.strip())
@@ -155,6 +171,16 @@ for g in grid:
     }
     if p.get("deterministic") is not None:
         cfg["compute"] = {"deterministic": bool(p["deterministic"])}
+    # PASSE-PLAT `validation:` (2026-07-29). Jusqu'ici le wrapper n'émettait que
+    # decoy + cluster_annotation : les cinq modules du Stage 10 (purity_source,
+    # head_to_head, readout_specificity, ora_de_baseline, signed_cascade)
+    # n'étaient atteignables QUE par le config de base — aucun profil de vague ne
+    # pouvait les activer, même en déclarant la clé. Ce bloc est fusionné EN
+    # DERNIER : il peut donc aussi corriger un décoy/cluster_annotation dérivé
+    # ci-dessus, et tout module ajouté plus tard passe sans retoucher ce script.
+    deep_merge(cfg.setdefault("validation", {}), p.get("validation"))
+    # Idem pour la perturbation (axes de transition, ancres de cluster, …).
+    deep_merge(cfg.setdefault("perturbation", {}), p.get("perturbation"))
     fp = os.path.join(tmpd, tag.replace("/", "_") + ".yaml")
     with open(fp, "w") as fh:
         yaml.safe_dump(cfg, fh, sort_keys=False)
