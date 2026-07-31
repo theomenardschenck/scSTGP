@@ -42,9 +42,11 @@ build:
 # DÉCRIT le dataset externe (les 3 clés + poles vont ensemble) → GNN_CELL_GROUPS,
 # GNN_EXPR_MATRIX, GNN_GROUP_META ; axe phénotypique pole_a→pole_b (CT→AD).
 dataset:
+  # ⚠ expr_matrix / group_meta sont RELATIFS à data_root (≠ paths.* qui incluent
+  # data/) → NE PAS mettre le préfixe data/ ici (sinon chemin data/data/...).
   cell_groups: "CT,AD"
-  expr_matrix: "data/pyscenic/GSE252921_endo/expr_all.csv"
-  group_meta: "data/pyscenic/GSE252921_endo/samplesheet.tsv"
+  expr_matrix: "pyscenic/GSE252921_endo/expr_all.csv"
+  group_meta: "pyscenic/GSE252921_endo/samplesheet.tsv"
   pole_a: "CT"                # origine (référence)
   pole_b: "AD"                # destination (état avancé/maladie)
 

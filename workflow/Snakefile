@@ -178,6 +178,18 @@ PURITY_N_RANDOM = int(_v("purity_source", "n_random", 200))
 H2H_ON      = _v("head_to_head")
 H2H_TARGETS = str(_v("head_to_head", "targets", "") or "").strip()
 
+# Thesis "result" figures F1-F8 (src/validation/figures/memoire_figures.py).
+# Opt-in, défaut OFF. Consomme le ranking de LA config + des références curées
+# partagées (MASTER, nulles, bulk cross-dataset) dont les chemins sont
+# surchargeables. Chaque figure saute proprement si son entrée manque → sortie
+# = MANIFEST listant les PNG réellement produits (récupérés par le site).
+MEMOIRE_FIGS_ON      = _v("memoire_figures")
+MEMOIRE_FIGS_MASTER  = str(_v("memoire_figures", "master", "") or "").strip()
+MEMOIRE_FIGS_RANDNULL = str(_v("memoire_figures", "random_axis_null", "") or "").strip()
+MEMOIRE_FIGS_DECOY   = str(_v("memoire_figures", "decoy", "") or "").strip()
+MEMOIRE_FIGS_GSE     = str(_v("memoire_figures", "gse98440", "") or "").strip()
+MEMOIRE_FIGS_ONLY    = str(_v("memoire_figures", "only", "") or "").strip()
+
 READOUT_SPEC_ON = _v("readout_specificity")
 ORA_DE_BASE_ON  = _v("ora_de_baseline")
 
@@ -277,13 +289,16 @@ if _DS_GROUPS or _DS_MATRIX or _DS_META:
             "dataset: exige les TROIS clés ensemble — cell_groups, expr_matrix, "
             "group_meta. Une seule manquante et gnn_vgae repart en mode scRNA "
             "HUVEC, qui cherchera merged_P4_P16_metadata.csv.")
-    # GNN_EXPR_MATRIX est résolu par le code RELATIVEMENT à data_root/gnn_data
-    # (os.path.join(GNN_DATA_DIR, EXPR_MATRIX)) → on ne passe QUE le nom de
-    # fichier. GNN_GROUP_META, lui, est ouvert tel quel → chemin complet.
+    # expr_matrix ET group_meta sont donnés RELATIVEMENT à data_root et rendus
+    # absolus par _abs_to_data_root → sous-dossiers préservés (ex.
+    # pyscenic/<dataset>/expr_all.csv). Le code fait os.path.join(GNN_DATA_DIR,
+    # EXPR_MATRIX) : un chemin absolu y est renvoyé tel quel. GROUP_META est
+    # ouvert directement. (Historique : EXPR_MATRIX prenait le basename seul, ce
+    # qui cassait tout expr matrix hors de la racine data_root.)
     GNN_ENV += " " + " ".join([
         "GNN_CELL_GROUPS=" + _DS_GROUPS,
         "GNN_HUMESS_CONDITIONS=" + _DS_GROUPS,
-        "GNN_EXPR_MATRIX=" + os.path.basename(_DS_MATRIX),
+        "GNN_EXPR_MATRIX=" + _abs_to_data_root(_DS_MATRIX),
         "GNN_GROUP_META=" + _abs_to_data_root(_DS_META),
     ])
 elif BUILD_ON:
@@ -367,6 +382,8 @@ def final_targets():
                  / "comparison_summary.tsv")
     if CASCADE_ON:
         t.append(ANALYSIS_DIR / "interpret" / "signed_cascade.tsv")
+    if MEMOIRE_FIGS_ON:
+        t.append(ANALYSIS_DIR / "memoire_figures" / "MANIFEST.txt")
     return t
 
 rule all:
@@ -579,6 +596,33 @@ rule axis_method_compare:
         "--axis-lda-shrinkage {params.shrink} "
         "--axis-cav-top-n {params.cav_n} --axis-cav-seed {params.cav_seed} "
         "--axis-cav-permutations {params.cav_perm} &> {log}"
+
+
+rule memoire_figures:
+    """Thesis result figures F1-F8 → analysis/memoire_figures/ (picked up by the
+    config site gallery). Config ranking drives F1/F4 ; curated references
+    (MASTER, nulls, bulk) drive F2/F3/F7/F8 and are overridable. Each panel
+    skips gracefully → MANIFEST.txt is the sentinel output."""
+    input:
+        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
+    output:
+        manifest=ANALYSIS_DIR / "memoire_figures" / "MANIFEST.txt",
+    params:
+        out_dir=ANALYSIS_DIR / "memoire_figures",
+        h2h=ANALYSIS_DIR / "interpret" / "head_to_head_baselines.tsv",
+        master=("--master " + MEMOIRE_FIGS_MASTER) if MEMOIRE_FIGS_MASTER else "",
+        randnull=("--random-axis-null " + MEMOIRE_FIGS_RANDNULL) if MEMOIRE_FIGS_RANDNULL else "",
+        decoy=("--decoy " + MEMOIRE_FIGS_DECOY) if MEMOIRE_FIGS_DECOY else "",
+        gse=("--gse98440 " + MEMOIRE_FIGS_GSE) if MEMOIRE_FIGS_GSE else "",
+        only=("--only " + MEMOIRE_FIGS_ONLY) if MEMOIRE_FIGS_ONLY else "",
+    log:
+        LOG_DIR / "memoire_figures.log",
+    shell:
+        "{PY} src/validation/figures/memoire_figures.py "
+        "--baseline-ranking {input.ranking} --head-to-head {params.h2h} "
+        "--out {params.out_dir} --manifest "
+        "{params.master} {params.randnull} {params.decoy} {params.gse} "
+        "{params.only} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -1,22 +1,17 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_suite_v613.sh — Complete the post-perturbation analyses for the three
-# V6.1.3 waves (output_de / output_fi / output_hyper) once the 3-seed
-# cross_seed_gene_ranking.tsv files are regenerated.
+# run_suite_v613.sh — COMPLETE post-perturbation validation suite for the three
+# V6.1.3 waves. Idempotent (per-output skip) so restarts resume. Reuses the
+# 3-seed cross_seed_gene_ranking.tsv already in <cfg>/analysis (never re-perturbs).
 #
-# Fills the gaps found on 2026-07-30:
-#   - driver_baselines : MISSING everywhere  (GNN vs trivial baselines)
-#   - pipeline_qc      : MISSING everywhere  (repro gate rho>=0.95 + 5 checks)
-#   - HYPER downstream : MISSING (decoy + interpret + ora for the 7 cplx.* arms)
-#   - purity_source    : MISSING everywhere  (optional, Stage C — commented)
-#
-# It REUSES the 3-seed ranking already in <cfg>/analysis (--skip-cross-seed), so
-# it never re-perturbs and never overwrites the ranking.
-#
-# Usage (detached):
-#   setsid bash scripts/run_suite_v613.sh >logs/suite_v613.log 2>&1 &
-#   # or gate on the ranking batch first:
-#   #   until [ -f .../xseed3_batch.log ] && grep -q '^ALL DONE' .../xseed3_batch.log; do sleep 60; done
+# Stages (each independent, each skips finished outputs):
+#   A driver_baselines      — GNN vs trivial baselines            (all 17)
+#   B hyper downstream       — decoy + interpret + ora (run_analysis) (7 cplx.*)
+#   C pipeline_qc            — repro gate rho>=0.95 + 5 checks      (per wave)
+#   D purity_source mediate  — source attribution of the readout   (all 17, s1)
+#   E head_to_head_baselines — does a simple statistic reproduce it (all 17)
+#   F readout_specificity    — off-axis / structured-but-not-DE    (all 17, s1)
+#   G driver_pattern (NULL)  — GBM on raw descriptors vs known drivers (all 17)
 # =============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -24,49 +19,70 @@ PY=/home/USER/miniforge3/envs/gnn/bin/python
 export ANALYSIS_PY="$PY" ANALYSIS_TORCH_PY="$PY"
 ROOT=output/gnn_vgae/V6.1.3
 COEXPR=data/pyscenic/diff_coexpr/coexpr_diff.tsv
+TGT="HMGB1 HMGB2 H2AFZ KMT2A OCRL SYNJ2 SMPD1 TP53 ISG15 CYCS"
 FAILED=()
+seeds_of(){ for s in s1 s2 s3; do [ -f "$1/$s/perturbation_all_genes_knockout.tsv" ] && echo "$1/$s"; done; }
+have(){ [ -f "$1" ]; }
 
-seeds_of() { for s in s1 s2 s3; do [ -f "$1/$s/perturbation_all_genes_knockout.tsv" ] && echo "$1/$s"; done; }
-
-echo "==================== STAGE A : driver_baselines (all 17) ===================="
 for w in output_de output_fi output_hyper; do
-  for cfg in "$ROOT/$w"/*/; do
-    cfg="${cfg%/}"; a="$cfg/analysis"; name=$(basename "$cfg")
-    [ -f "$a/cross_seed_gene_ranking.tsv" ] || { echo "SKIP $name (no ranking yet)"; continue; }
-    echo "-- driver_baselines $name"
-    "$PY" src/validation/reports/driver_baselines.py \
-        --ranking "$a/cross_seed_gene_ranking.tsv" \
-        --coexpr-file "$COEXPR" --out "$a/driver_baselines.tsv" \
-        >>"$a/driver_baselines.log" 2>&1 || FAILED+=("baselines:$name")
-  done
-done
-
-echo "==================== STAGE B : HYPER downstream (decoy+interpret+ora) ========"
-# DE/FI already have decoy/interpret/ora from the cluster; only the 7 cplx.* need it.
-for cfg in "$ROOT/output_hyper"/*/; do
+ for cfg in "$ROOT/$w"/*/; do
   cfg="${cfg%/}"; a="$cfg/analysis"; name=$(basename "$cfg")
-  [ -f "$a/cross_seed_gene_ranking.tsv" ] || { echo "SKIP $name"; continue; }
-  mapfile -t sd < <(seeds_of "$cfg")
-  echo "-- run_analysis (baselines+interpret+decoy) $name  seeds=${#sd[@]}"
-  bash scripts/run_analysis.sh --out "$a" --seeds "${sd[@]}" \
-      --skip-cross-seed --decoy --decoy-top-n 40 --coexpr-file "$COEXPR" \
-      >>"$a/run_analysis_suite.log" 2>&1 || FAILED+=("hyper-analysis:$name")
+  rk="$a/cross_seed_gene_ranking.tsv"; have "$rk" || { echo "SKIP $name (no ranking)"; continue; }
+  s1="$cfg/s1"; emb="$s1/gene_embeddings_vgae.csv"; graph="$s1/hetero_graph_vgae.pt"
+
+  # A — driver_baselines
+  if ! have "$a/driver_baselines.tsv" && ! have "$a/interpret/driver_baselines.tsv"; then
+    echo "A driver_baselines $name"
+    "$PY" src/validation/reports/driver_baselines.py --ranking "$rk" \
+      --coexpr-file "$COEXPR" --out "$a/driver_baselines.tsv" >>"$a/driver_baselines.log" 2>&1 || FAILED+=("A:$name")
+  fi
+
+  # B — hyper downstream (decoy+interpret+ora) only for cplx.* lacking decoy
+  if [[ "$w" == output_hyper ]] && ! have "$a/interpret/decoy_confidence.tsv"; then
+    mapfile -t sd < <(seeds_of "$cfg")
+    echo "B run_analysis $name (seeds=${#sd[@]})"
+    bash scripts/run_analysis.sh --out "$a" --seeds "${sd[@]}" --skip-cross-seed \
+      --decoy --decoy-top-n 40 --coexpr-file "$COEXPR" >>"$a/run_analysis_suite.log" 2>&1 || FAILED+=("B:$name")
+  fi
+
+  # D — purity_source mediate (s1)
+  if ! have "$a/purity_mediation.tsv"; then
+    echo "D purity $name"
+    "$PY" src/validation/explain/purity_source_attribution.py mediate \
+      --run-dir "$s1" --ranking "$rk" --targets $TGT --out "$a/purity_mediation.tsv" \
+      >>"$a/purity.log" 2>&1 || FAILED+=("D:$name")
+  fi
+
+  # E — head_to_head_baselines (no humess = robust across pure/rich)
+  if ! have "$a/head_to_head_baselines.tsv"; then
+    echo "E head_to_head $name"
+    "$PY" src/validation/reports/head_to_head_baselines.py --ranking "$rk" \
+      --no-humess --coexpr-file "$COEXPR" --out "$a/head_to_head_baselines.tsv" \
+      >>"$a/head_to_head.log" 2>&1 || FAILED+=("E:$name")
+  fi
+
+  # F — readout_specificity (s1)
+  if ! have "$a/readout_specificity.tsv"; then
+    echo "F readout_spec $name"
+    "$PY" src/validation/explain/readout_specificity.py --run-dir "$s1" --ranking "$rk" \
+      --targets "$TGT" --out "$a/readout_specificity.tsv" >>"$a/readout_spec.log" 2>&1 || FAILED+=("F:$name")
+  fi
+
+  # G — driver_pattern NULL (needs graph + embeddings)
+  if ! have "$a/driver_pattern_importance.tsv" && have "$graph" && have "$emb"; then
+    echo "G driver_pattern $name"
+    "$PY" src/validation/reports/driver_pattern_classifier.py --graph "$graph" \
+      --embeddings "$emb" --ranking "$rk" --label-sets cellage,genage \
+      --out "$a/driver_pattern_importance.tsv" >>"$a/driver_pattern.log" 2>&1 || FAILED+=("G:$name")
+  fi
+ done
 done
 
-echo "==================== STAGE C : pipeline_qc per wave (repro gate) ============="
+# C — pipeline_qc per wave (runs once all rankings in the wave exist)
 for w in output_de output_fi output_hyper; do
-  echo "-- pipeline_qc $w"
-  "$PY" src/validation/qc/pipeline_qc.py all --wave "$ROOT/$w" \
-      >"$ROOT/$w/pipeline_qc.txt" 2>&1 || FAILED+=("qc:$w")
+  echo "C pipeline_qc $w"
+  "$PY" src/validation/qc/pipeline_qc.py all --wave "$ROOT/$w" >"$ROOT/$w/pipeline_qc.txt" 2>&1 || FAILED+=("C:$w")
 done
-
-# ---- STAGE D (optional, targeted) : purity_source_attribution --------------
-# Heavier (frozen-encoder re-projection). Uncomment to run on the headline arms.
-# for cfg in "$ROOT/output_fi/rfi2.rich-dir" "$ROOT/output_hyper/cplx.rich-ctrl"; do
-#   "$PY" src/validation/explain/purity_source_attribution.py mediate \
-#       --run-dir "$cfg/s1" --targets OCRL SYNJ2 SMPD1 HMGB1 GCLC \
-#       --out "$cfg/analysis/purity_source.tsv" || FAILED+=("purity:$(basename $cfg)")
-# done
 
 if [ ${#FAILED[@]} -gt 0 ]; then echo "SUITE done WITH FAILURES: ${FAILED[*]}" >&2; exit 1; fi
 echo "SUITE done (all OK)."
