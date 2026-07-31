@@ -1,0 +1,117 @@
+# ============================================================================
+# Config workflow PRINCIPAL — GSE252921 endo (EC AD vs CT), système externe sn.
+# Pipeline complet : build_graph → train ×seeds → perturb → cross-seed →
+# validation → report. Consomme les 3 inputs produits par prep_gse252921.
+#
+# Lancer (cluster) :
+#   bash workflow/run.sh --backend cluster \
+#        --configfile workflow/config/config.gse252921_endo.yaml
+# Dry-run :
+#   bash workflow/run.sh --dry-run \
+#        --configfile workflow/config/config.gse252921_endo.yaml
+# ============================================================================
+run:
+  name: "gse252921_endo"
+  description: "VGAE GSE252921 EC (AD vs CT, snRNA) — test capacité encodeur système externe"
+
+paths:
+  data_root: "data"
+  out_base: "output/snakemake/GSE252921_endo"          # (GLiCID : surcharger vers /scratch/...)
+  humess_dir: "data/humess/GSE252921_endo"             # HuMess FAIT
+  scenic_dir: "data/pyscenic/GSE252921_endo/scenic_out"  # regulons SCENIC
+  coexpr_file: "data/pyscenic/GSE252921_endo/coexpr_diff.tsv"
+  # DE AD-vs-CT absente pour l'instant → rôle DE sauté (magnitude-rank).
+  # Générer ce fichier (pseudobulk edgeR/t-test) réactive role_de + ora_de_baseline.
+  de_magnitude_csv: "data/pyscenic/GSE252921_endo/DEGs_AD_vs_CT.tsv"
+
+compute:
+  deterministic: true
+  device: "cpu"
+  python: "python"
+  python_torch: "python"
+  backend: "cluster"          # run.sh → --executor slurm --profile ; override via --backend
+
+input:
+  rna_type: scrna             # snRNA traité comme scRNA (cellule-niveau)
+  degs_path: "data/pyscenic/GSE252921_endo/DEGs_AD_vs_CT.tsv"
+
+# Stage 0 OFF : coexpr/SCENIC/HuMess = inputs EXTERNES (produits par prep_gse252921).
+build:
+  enabled: false
+
+# DÉCRIT le dataset externe (les 3 clés + poles vont ensemble) → GNN_CELL_GROUPS,
+# GNN_EXPR_MATRIX, GNN_GROUP_META ; axe phénotypique pole_a→pole_b (CT→AD).
+dataset:
+  cell_groups: "CT,AD"
+  expr_matrix: "data/pyscenic/GSE252921_endo/expr_all.csv"
+  group_meta: "data/pyscenic/GSE252921_endo/samplesheet.tsv"
+  pole_a: "CT"                # origine (référence)
+  pole_b: "AD"                # destination (état avancé/maladie)
+
+models:
+  vgae:
+    enabled: true
+    run_tag: "gse252921_endo"
+    seeds: [1, 2, 3]
+    # config C2-signée sn COMPLÈTE + regulons SCENIC. PAS les flags coexpr :
+    # le Snakefile ajoute lui-même --coexpr-mode differential --diff-coexpr-file.
+    extra_flags: "--use-scenic-regulons --use-omnipath-signaling --use-omnipath-tf-curated --include-omnipath-genes --use-reactome-fi --signed-message --signed-decoder"
+  gnn_lite:
+    enabled: false
+
+perturbation:
+  enabled: true
+  modes: [knockdown, knockout, overexpress]
+  scope: all_genes
+  axis_tag: ""
+  out_suffix: ""
+  transition_axes: none       # pas de sous-clusters ici (2 groupes CT/AD)
+  cluster_anchor_mode: none
+  cache_delta_z: true
+  axis_method: diff
+
+scoring:
+  de_significance: "magnitude-rank"   # pas de DE externe AD/CT → rang |ΔExpr|
+  de_padj_max: 0.05
+  de_abs_lfc_min: 0.5
+
+validation:
+  ora_top_n: 100
+  decoy:
+    enabled: false            # N2 coûteux (opt-in) ; random_axis suffit au 1er run
+    top_n: 40
+    n_rewires: 50
+    random_axis: 20
+    random_axis_seed: 0
+  cluster_annotation:
+    enabled: true
+  qc:
+    enabled: true
+    blocking: false
+    repro_a: ""
+    repro_b: ""
+  purity_source:
+    enabled: false            # analyse ciblée (cibles HUVEC-spécifiques) — hors 1er run
+    targets: ""
+    n_random: 200
+  head_to_head:
+    enabled: true             # HuMess GSE252921 dispo → imp_delta OK
+    targets: ""
+  readout_specificity:
+    enabled: true
+  ora_de_baseline:
+    enabled: false            # exige une DE AD/CT (à générer) → OFF pour l'instant
+  signed_cascade:
+    enabled: true
+    sign_source: known
+    alpha: 0.85
+    hops: 6
+    norm: sym
+    effector_pro: ""
+    effector_anti: ""
+
+comparison:
+  enabled: false
+
+output:
+  generate_html_report: false
