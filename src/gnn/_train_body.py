@@ -621,10 +621,18 @@ for epoch in range(N_EPOCHS):
     # Loss totale = reconstruction + β × KL + λ_signed × signed_aux (V5)
     loss = recon_loss + kl_beta * kl_loss \
         + CLI_ARGS.signed_loss_weight * signed_aux_loss
-    # V-sup : + λ × classification JOINTE (multi-tâche) sur μ. L'encodeur reste
-    # entraîné par reconstruction ; la tête ajoute le signal DEG par cluster.
+    # V-sup : tête de classification sur μ. DEUX RÉGIMES, et la différence n'est
+    # pas cosmétique (V6.4, LOG §39) :
+    #   * --supervised-detach  -> PROBE. La tête lit mu.detach() : son gradient
+    #     s'arrête à la tête, l'encodeur reste entraîné par reconstruction SEULE.
+    #     C'est le seul régime où « μ encode-t-il les sous-états ? » est une
+    #     question falsifiable — et où --de-features est un vrai plafond.
+    #   * défaut (joint)       -> MULTI-TÂCHE. Le gradient remonte dans μ, donc
+    #     les labels DEG (= la DE) FAÇONNENT le latent. Un run sans
+    #     --de-features n'est alors PAS propre : la DE entre par le gradient.
     if _SUP_HEAD is not None:
-        _clf_loss = weighted_bce(_SUP_HEAD(mu), _SUP_LABELS_T, _SUP_CONF_T,
+        _mu_sup = mu.detach() if CLI_ARGS.supervised_detach else mu
+        _clf_loss = weighted_bce(_SUP_HEAD(_mu_sup), _SUP_LABELS_T, _SUP_CONF_T,
                                  _SUP_TRAIN_MASK)
         loss = loss + CLI_ARGS.supervised_loss_weight * _clf_loss
     loss.backward()

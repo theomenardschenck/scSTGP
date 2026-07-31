@@ -1,5 +1,5 @@
 # ===========================================================================
-# ablations_de_probe.yaml — V6.2 probe: what is the CIRCULAR CEILING?
+# ablations_de_probe.yaml — V6.2/V6.4 probe: what is the CIRCULAR CEILING?
 #
 # Context (LOG §25). On the stripped graph the targets are on-axis but
 # low-amplitude (SYNJ2 |cos|=0.85, rank #26 under amp x cos_brut, #134 under
@@ -8,17 +8,18 @@
 # anti-circularity backbone for a problem that does not exist.
 #
 # This profile runs it anyway, ON PURPOSE, as a labelled CEILING: how high can
-# the ranking go if we allow ourselves to cheat? The gap pure <-> circular is
+# the ranking go if we allow ourselves to cheat? The gap control <-> circular is
 # itself a result (it quantifies how much of the ranking the DE alone buys).
 # It is NOT a headline config and must never be reported as one.
 #
-# A/B/C by design — one run proves nothing. All arms are identical except the
-# feature flag, so each delta is attributable to that flag alone:
-#   * pure-dir-nodrug       control  (topology only, FI corrected, no druggability)
-#   * pure-dir-nodrug-de    ceiling  (same + DE stats  = P4-vs-P16 CONTRAST)
-#   * pure-dir-nodrug-expr  middle   (same + raw expr = per-group LEVEL)
+# ── A/B/C by design, now on TWO graphs ─────────────────────────────────────
+# Within a family all arms are identical except the feature flag, so each delta
+# is attributable to that flag alone:
+#   * <fam>-dir-nodrug        control  (FI corrected, no druggability)
+#   * <fam>-dir-nodrug-de     ceiling  (same + DE stats  = P4-vs-P16 CONTRAST)
+#   * <fam>-dir-nodrug-expr   middle   (same + raw expr = per-group LEVEL)
 #
-# The third arm (2026-07-21) separates two things the DE arm conflates. log2FC
+# The `expr` arm (2026-07-21) separates two things the DE arm conflates. log2FC
 # hands the encoder the readout axis itself; raw per-group expression only says
 # "how much is this gene expressed in each state". If -expr recovers most of the
 # -de gain, the ceiling is mostly about expression LEVEL, not about the
@@ -26,37 +27,117 @@
 # (features -> mean): a gain that N4 abolishes lives in the features, not in the
 # propagation.
 #
+# ── Why the RICH family was added (2026-07-29) ─────────────────────────────
+# The probe used to run on the PURE graph only, which answers "how much does DE
+# buy when the graph carries nothing DE-correlated". That is the easy half. The
+# rich graph carries COEXPRESSION, and the differential-cosine circularimeter
+# already puts it at median 0.316 (rich V6.1.2) against 0.013 (pure) — i.e. the
+# rich graph is ALREADY partly circular, without anyone injecting the DE.
+#
+# So the informative quantity is not one gap but the COMPARISON of two:
+#     delta_pure = pure-de - pure-control
+#     delta_rich = rich-de - rich-control
+#   * delta_rich ~ delta_pure  -> coexpr is NOT doing the DE's work; the
+#                                 headline rich config is not secretly circular.
+#   * delta_rich << delta_pure -> the rich graph already leaks the axis, and
+#                                 most of what looked like graph-derived
+#                                 structure was re-derivable from the DE.
+# The second outcome is the one the whole anti-circularity argument stands or
+# falls on, and a pure-only design cannot detect it. Note the asymmetry: a SMALL
+# delta_rich is the WORRYING result here, not the reassuring one.
+#
 # Druggability node features (op_druggable / op_drug_records) are dropped in
-# BOTH arms: they are a SELECTION prior, so ranking druggable targets with
+# EVERY arm: they are a SELECTION prior, so ranking druggable targets with
 # druggability as input is circular on the actionability axis (target.md §15) --
 # the same objection we make to coexpr on the DE axis.
+#
+# ⚠️ PPI mirror-dedup (LOG §32) is ON by default, so the RICH arms run on the
+# CORRECTED PPI graph (2x), not the 4x legacy. They are therefore NOT directly
+# comparable to the V6.1.3 rich rankings. The PURE arms are unaffected (--no-ppi
+# makes both --dedup-ppi-* flags inert).
+#
+# COST. 6 configs x 3 seeds = 18 trainings + 54 perturbations; the graph is
+# built once per config (seed-independent cache), so 6 builds — of which 3 are
+# rich, i.e. the slow ones (~40 min each).
 #
 # Usage (detached! the orchestrator must survive to submit downstream jobs):
 #   tmux new -s deprobe
 #   scripts/run_omnipath_ablation_wave.sh workflow/config/ablations_de_probe.yaml \
 #       --profile workflow/profiles/slurm -j 8 --parallel 2
+#   # one family at a time, to stage the cost:
+#   scripts/run_omnipath_ablation_wave.sh workflow/config/ablations_de_probe.yaml \
+#       --only pure-dir-nodrug,pure-dir-nodrug-de,pure-dir-nodrug-expr \
+#       --profile workflow/profiles/slurm -j 8 --parallel 2
+#
+#   # reading, once finished — the DELTAS are the deliverable, not the rankings.
+#   # Run it twice, once per family, each against ITS OWN control:
+#   python src/validation/reports/compare_runs.py \
+#       --runs-glob 'output/snakemake/deprobe.pure-*' --baseline deprobe.pure-dir-nodrug
+#   python src/validation/reports/compare_runs.py \
+#       --runs-glob 'output/snakemake/deprobe.rich-*' --baseline deprobe.rich-dir-nodrug
 # ===========================================================================
 
 root_tag: "deprobe"
 seeds: [1, 2, 3]          # 3 seeds MANDATORY: at fixed seed, two runs of an
-                         # IDENTICAL config give rho=0.556-0.687 (median gap
-                         # 942 ranks). The first pass of this probe ran at 1
-                         # seed and gave rho(control, expr)=0.693 -- inside
-                         # that noise floor, so nothing was interpretable.
+                          # IDENTICAL config give rho=0.556-0.687 (median gap
+                          # 942 ranks). The first pass of this probe ran at 1
+                          # seed and gave rho(control, expr)=0.693 -- inside
+                          # that noise floor, so nothing was interpretable.
+deterministic: true       # LOG §27. Was inherited from config.yaml; made
+                          # explicit because this profile's entire argument is a
+                          # comparison of deltas against that noise floor.
 
+# Décoy N2 de STRUCTURE : rewire degré-préservant. n>=50 OBLIGATOIRE (LOG
+# §25bis) — à n=3-5 les SD sont sous-estimées ~10x et 3 des 4 « passages »
+# s'évaporent à n=50. Explicite ici plutôt que laissé au défaut du wrapper.
 decoy: true
+decoy_n_rewires: 50
+decoy_frozen_axis: false
+# Nulle de SPÉCIFICITÉ D'AXE, distincte de N2 et complémentaire : N2 teste le
+# VOISINAGE, random_axis teste l'AXE. Quasi gratuite (re-projections du cache Δz).
 decoy_random_axis: 20
 decoy_random_axis_seed: 0
 
 # F1 (FUT §2.8) — comparaison d'ESTIMATEURS d'axe, re-projetée depuis le cache
-# Δz : aucune re-perturbation, ~secondes. Le headline reste `diff` ; on obtient
-# en plus la table « N définitions d'axe × mêmes drivers ». `pca` est le NULL
-# NON SUPERVISÉ : s'il sort les mêmes drivers que `diff`, l'axe n'apporte rien
-# de plus que la variance dominante du latent. `lda` teste l'axe flottant
-# (ASNS : cos 0.058→0.514 selon kl1 ⇒ l'axe PIVOTE avec les hyperparamètres).
+# Δz : aucune re-perturbation, ~secondes. Le headline reste `diff`. `pca` est le
+# NULL NON SUPERVISÉ : s'il sort les mêmes drivers que `diff`, l'axe n'apporte
+# rien de plus que la variance dominante du latent.
+# Enjeu PROPRE à cette vague : injecter la DE devrait FIGER l'axe (il devient
+# re-dérivable des features), donc l'écart entre estimateurs devrait CHUTER dans
+# les bras `-de`. Prédiction falsifiable, pas un contrôle de forme — et un
+# second angle sur la circularité, indépendant du Δrang.
 axis_method: diff
 axis_method_compare: "diff,lda,cav,pca"
 axis_cav_permutations: 100      # null TCAV -> p-value sur l'accuracy du probe
+
+# Bloc recopié tel quel dans le config généré (fusion récursive, appliquée en
+# dernier — cf. l'en-tête du wrapper). Hérite de config.yaml, où les cinq
+# modules du Stage 10 sont ON ; on ne surcharge que le spécifique à la vague.
+validation:
+  purity_source:
+    # Cibles choisies pour COUVRIR les trois classes de circularité de
+    # target.md §11-15, parce que la question est précisément de savoir
+    # laquelle la DE achète :
+    #   * chromatine (HMGB1/HMGB2/H2AFZ) — DE-redérivable, portée par la coexpr
+    #   * métabolique (OCRL/SYNJ2/GCLC/NAMPT) — graph-native, médiée par rfi
+    #   * TP53 — hub, ambigu
+    # Prédiction : les bras `-de` remontent la chromatine et laissent le
+    # métabolique en place. Si le métabolique bouge autant, il n'était pas
+    # graph-native — et c'est le résultat qui compte.
+    enabled: true
+    targets: "HMGB1 HMGB2 H2AFZ OCRL SYNJ2 GCLC NAMPT TP53"
+    n_random: 200
+  signed_cascade:
+    enabled: true
+    # `both`, pas `known` (défaut). Mesuré : `--de-features`/`--expr-features`
+    # touchent les FEATURES de nœud, et les flags `pure` ne retirent que des
+    # sources NON signées — le substrat signé est donc IDENTIQUE d'un bras à
+    # l'autre au sein d'une famille. Avec `known` seul, les trois bras
+    # rendraient trois tables rigoureusement identiques. Seul le signe APPRIS
+    # (décodeur bilinéaire sur μ) peut bouger, et c'est une vraie question ici :
+    # donner la DE en feature déplace-t-il ce que le latent croit du SIGNE de la
+    # régulation ? `known` = contrôle invariant, `pred` = mesure.
+    sign_source: both
 
 base_extra_flags: >-
   --signed-message --signed-decoder --use-reactome-fi
@@ -65,15 +146,36 @@ base_extra_flags: >-
   --omnipath-edges transcriptional,enzyme_substrate,ligand_receptor
 
 # NOTE: --exclude-features must appear ONCE per run (argparse keeps the last
-# occurrence), so the pure-graph exclusions and the druggability exclusions are
-# merged into a single flag here.
+# occurrence), so the graph exclusions and the druggability exclusions are
+# merged into a single flag. YAML cannot concatenate a scalar anchor with extra
+# text either, hence the fully spelled-out strings below rather than *anchor +
+# suffix. Keep each family in sync with its own anchor by hand.
 _pure_nodrug: &pure >-
   --dedup-ppi-signed remove --no-ppi
   --exclude-features ppi_degree,reg_degree,op_druggable,op_drug_records
   --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges
   --reactome-fi-directed
 
+# RICH = le graphe complet (PPI, coexpr, HuMess, Reactome, cell-group) ; on ne
+# retire QUE la druggabilité, pour garder l'argument d'actionnabilité. Ni
+# `--exclude-features ppi_degree,reg_degree` ni `--dedup-ppi-signed remove` :
+# les bras riches des autres vagues (rfi2, mirror, sup) ne les ont pas, et
+# cette vague doit rester comparable à elles.
+_rich_nodrug: &rich >-
+  --exclude-features op_druggable,op_drug_records
+  --reactome-fi-directed
+
 ablation_grid:
-  - {name: pure-dir-nodrug,    add_flags: *pure}                      # control
-  - {name: pure-dir-nodrug-de, add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree,op_druggable,op_drug_records --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --reactome-fi-directed --de-features"}
+  # ── Famille PURE : « ce que la DE achète quand le graphe ne porte rien de
+  #    DE-corrélé ». Borne haute de l'effet de circularité. ─────────────────
+  - {name: pure-dir-nodrug,      add_flags: *pure}                      # control
+  - {name: pure-dir-nodrug-de,   add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree,op_druggable,op_drug_records --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --reactome-fi-directed --de-features"}
   - {name: pure-dir-nodrug-expr, add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree,op_druggable,op_drug_records --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --reactome-fi-directed --expr-features"}
+
+  # ── Famille RICHE : le MÊME A/B/C sur le graphe de production. La coexpr y
+  #    est déjà partiellement circulaire (cos différentiel médian 0.316 vs
+  #    0.013 en pur) — donc si delta_rich << delta_pure, une partie de ce qu'on
+  #    attribuait au graphe était re-dérivable de la DE. ────────────────────
+  - {name: rich-dir-nodrug,      add_flags: *rich}                      # control
+  - {name: rich-dir-nodrug-de,   add_flags: "--exclude-features op_druggable,op_drug_records --reactome-fi-directed --de-features"}
+  - {name: rich-dir-nodrug-expr, add_flags: "--exclude-features op_druggable,op_drug_records --reactome-fi-directed --expr-features"}

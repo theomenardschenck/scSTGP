@@ -434,7 +434,28 @@ def parse_cli_args(argv=None):
     p.add_argument("--supervised-loss-weight", dest="supervised_loss_weight",
                    type=float, default=1.0,
                    help="V-sup : λ du terme de classification dans la loss jointe. "
-                        "Défaut 1.0.")
+                        "Défaut 1.0. Sans effet sur l'encodeur en mode "
+                        "--supervised-detach (le gradient n'y remonte pas).")
+    # --- V6.4 (2026-07-29) : PROBE vs MULTI-TÂCHE -------------------------
+    # Sans ce drapeau la tête lit `mu` NON détaché : la BCE rétropropage dans
+    # l'encodeur, donc les labels DEG (= la DE) FAÇONNENT le latent. Un run
+    # `--supervised` sans --de-features n'est alors PAS anti-circulaire : la DE
+    # entre par le gradient au lieu d'entrer par les features. La saliency y
+    # retrouve nécessairement les labels — c'est une tautologie, pas un résultat.
+    # --supervised-detach fait de la tête un PROBE sur représentation gelée
+    # (Alain & Bengio 2016) : l'encodeur reste entraîné par reconstruction seule
+    # et la question « μ encode-t-il les sous-états ? » redevient falsifiable.
+    # Défaut OFF = comportement historique préservé ; à activer explicitement.
+    p.add_argument("--supervised-detach", dest="supervised_detach",
+                   action="store_true", default=False,
+                   help="V-sup : entraîne la tête sur mu.detach() → PROBE, "
+                        "l'encodeur n'est PAS influencé par les labels DEG "
+                        "(anti-circulaire). Tag run 'sup-probe'.")
+    p.add_argument("--no-supervised-detach", dest="supervised_detach",
+                   action="store_false",
+                   help="V-sup : tête co-entraînée, gradient remontant dans "
+                        "l'encodeur (multi-tâche, DÉFAUT historique). ⚠ le "
+                        "latent devient DE-informé.")
     p.add_argument("--supervised-recompute-labels",
                    dest="supervised_recompute_labels", action="store_true",
                    help="V-sup : force le recalcul de la DE par cluster (scanpy "

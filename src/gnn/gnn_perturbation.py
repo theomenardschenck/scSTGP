@@ -1894,14 +1894,25 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
     shift_proj_df = None
     if (group_expr is not None and axis_global is not None
             and axes_cluster is not None):
-        # Degré PPI total de la/des cible(s) : utilisé pour la métrique
-        # proj_signed_degree (correction explicite du biais hub).
-        ppi_key = ("gene", "ppi", "gene")
+        # Degré TOTAL gène-gène de la/des cible(s) : somme des incidences sur
+        # TOUS les edge_types gene<->gene (coexpr, reactome_fi, signaling, tf,
+        # ...), pas seulement PPI. ppi_degree seul sous-estime massivement les
+        # hubs de coexpression (ex. HMGB2 : ppi=4 mais coexpr=680, total=731) →
+        # utilisé pour la correction de biais hub proj_signed_degree, qui doit
+        # voir TOUTES les connexions. On conserve le PPI seul à part (heuristique
+        # hub-inflation PPI-spécifique + rétro-compat).
         target_degree = 0
-        if ppi_key in data.edge_types:
-            ppi_ei = data[ppi_key].edge_index
-            target_degree = int(torch.isin(ppi_ei[0], target_idx).sum().item()
-                                + torch.isin(ppi_ei[1], target_idx).sum().item())
+        target_ppi_degree = 0
+        for _et in data.edge_types:
+            _s, _r, _t = _et
+            if _s != "gene" or _t != "gene":
+                continue
+            _ei = data[_et].edge_index
+            _d = int(torch.isin(_ei[0], target_idx).sum().item()
+                     + torch.isin(_ei[1], target_idx).sum().item())
+            target_degree += _d
+            if _r == "ppi":
+                target_ppi_degree = _d
         shift_proj_df = cell_group_shift_projected(
             mu_base, mu_pert, group_expr, gene_symbols, target_idx,
             axis_global, axes_cluster,
@@ -2043,10 +2054,13 @@ def run_perturbation_once(model, data, gene_symbols, gene_to_idx,
             summary["_w_diff_sum_global"] = np.asarray(
                 [float(_ws.get(g, 0.0)) for g in _gn], dtype=np.float32)
 
-        # Degré PPI et n_affected médian — utiles pour interpréter la métrique
-        # proj_signed_degree et la relation hub/étendue cross-gene.
-        if "target_degree" in shift_proj_df.columns:
-            summary["target_ppi_degree"] = int(shift_proj_df["target_degree"].iloc[0])
+        # Degré TOTAL (toutes arêtes gène-gène) et PPI seul — utiles pour
+        # interpréter proj_signed_degree et la relation hub/étendue cross-gene.
+        # target_total_degree = l'indicateur de hub réel ; target_ppi_degree
+        # reste pour l'heuristique hub-inflation PPI-spécifique (rétro-compat).
+        if shift_proj_df is not None and "target_degree" in shift_proj_df.columns:
+            summary["target_total_degree"] = int(shift_proj_df["target_degree"].iloc[0])
+            summary["target_ppi_degree"] = int(target_ppi_degree)
 
         # Indicateurs max/min : un par métrique de projection, avec le groupe /
         # axe associé. On reporte la valeur signée (pas |.|), mais on choisit

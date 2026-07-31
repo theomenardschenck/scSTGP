@@ -1,49 +1,101 @@
 # ===========================================================================
 # ablations_supervised.yaml — V6.4 : tête de prédiction de sous-état (V-sup)
+#                             A/B PROBE vs MULTI-TÂCHE (refondu 2026-07-29)
 #
 # CE QUE FAIT LA TÊTE (_supervised.py). Une tête MLP multi-label branchée sur le
 # latent μ PAR GÈNE, prédisant l'appartenance aux labels {P4_vs_P16,
-# cluster_0..3} (le gène est-il DEG/marqueur de chaque sous-état). Co-entraînée
-# DANS la boucle VGAE (la reconstruction n'est JAMAIS interrompue → run
-# perturbation-ready) : loss = recon + β·KL + λ_signed·aux + λ_sup·weighted_bce.
-# `finalize_supervised` (_train_body.py) écrit, après entraînement :
-#   - un SCORE D'IMPORTANCE PAR GÈNE ET PAR SOUS-CLUSTER (saliency grad×input,
-#     `cluster_importance`) = « quels gènes portent l'appartenance à cluster_k »,
-#   - l'éval de la tête (AUC/AP par label) + le checkpoint de tête.
+# cluster_0..3} (le gène est-il DEG/marqueur de chaque sous-état). Entraînée
+# DANS la boucle VGAE, la reconstruction n'étant jamais interrompue → run
+# perturbation-ready. `finalize_supervised` écrit ensuite, par seed :
+#   - `cluster_importance.tsv` : SCORE D'IMPORTANCE PAR GÈNE ET PAR SOUS-CLUSTER
+#     (saliency grad×input) = « quels gènes portent l'appartenance à cluster_k »
+#   - `supervised_metrics.json` : AUC/AP par label ; `predictions.tsv` ;
+#     `supervised_model.pt` ; `supervised_config.json`
 # Complémentaire (pas redondant) du driver_score par axe : la saliency dit « μ
 # encode l'appartenance à k », la perturbation dit « perturber g déplace le long
 # de l'axe k ».
 #
-# CIRCULARITÉ — l'axe orthogonal du projet. La tête est propre TANT QU'ON NE LUI
-# DONNE PAS la DE en feature. `--de-features` (flag de BUILD) injecterait les
-# stats DE comme features de nœud → la tête prédirait la DE qu'on lui a donnée
-# (circulaire). Les deux bras `*-sup` ci-dessous sont SANS de-features (test
-# propre : « ce que la topologie + features non-DE savent du sous-état »). Le
-# bras `rich-sup-defeat` AJOUTE `--de-features` = PLAFOND circulaire de référence
-# (tag `de-feat`) : borne haute que la saliency propre ne devrait pas atteindre.
+# ⚠️ AUCUNE de ces sorties n'est une cible Snakemake — ce sont des effets de bord
+# de `train_vgae`. Si la tête échoue APRÈS l'entraînement, `best_vgae.pt` est
+# déjà écrit et le pipeline continue sans rien signaler. Vérifier la présence de
+# `cluster_importance.tsv` dans chaque `s<seed>/` avant de lire quoi que ce soit.
 #
-# PRÉDICTION. Si μ encode réellement les sous-états sans DE en feature, la tête
-# propre a AUC(label) nettement > 0.5 et la saliency par cluster sort des
-# marqueurs plausibles ; l'écart au bras `de-feat` mesure la part non-circulaire.
+# ── LE DÉFAUT CORRIGÉ ICI (LOG §39) ────────────────────────────────────────
+# Jusqu'au 2026-07-29 la tête lisait `mu` NON détaché : `loss.backward()`
+# remontait à travers elle jusque dans l'encodeur. Les labels étant des appels
+# DEG, la chaîne était
+#       DE -> labels -> BCE -> gradient -> μ -> poids de l'encodeur
+# donc **la DE entrait dans l'encodeur même sans `--de-features`**. La version
+# précédente de ce fichier revendiquait pourtant un « test propre » : c'était
+# faux. Un μ façonné pour prédire les labels les retrouve nécessairement en
+# saliency — tautologie, pas résultat. Et le bras `--de-features` cessait d'être
+# un plafond de référence, puisque les deux bras étaient circulaires, seulement
+# par des ROUTES différentes (gradient vs features).
+#
+# `--supervised-detach` (V6.4) fait de la tête un PROBE sur représentation gelée
+# (Alain & Bengio 2016, « Understanding intermediate layers using linear
+# classifier probes ») : la tête lit `mu.detach()`, l'encodeur reste entraîné par
+# reconstruction SEULE. Vérifié : gradient encodeur 9.34 -> 0.00.
+# Défaut CLI = OFF (comportement historique préservé) ⇒ chaque bras l'active
+# explicitement ci-dessous.
+#
+# ── CE QUE MESURE LA GRILLE ────────────────────────────────────────────────
+# Trois comparaisons, chacune à variable unique :
+#   (1) probe <-> joint, à graphe et features IDENTIQUES
+#       = ce que la rétropropagation de la tête INJECTE dans μ. C'est la mesure
+#         directe de la circularité par le gradient. Si les deux régimes donnent
+#         la même saliency, la tête ne déformait pas le latent et le débat est
+#         clos ; si le joint est bien meilleur, il l'était.
+#   (2) `-probe` <-> `-probe-defeat` (± --de-features)
+#       = plafond circulaire par les FEATURES, VALIDE uniquement en régime probe
+#         (l'encodeur y est propre, donc l'écart est attribuable aux features).
+#   (3) `-joint` <-> `-joint-defeat`
+#       = le même plafond quand l'encodeur est DÉJÀ DE-informé par le gradient.
+#         Attendu PLUS PETIT que (2) : le gradient a déjà fait une partie du
+#         travail. S'il ne l'est pas, les deux routes ne sont pas redondantes —
+#         résultat en soi.
+#
+# PRÉDICTION. Si μ encode réellement les sous-états sans DE, le bras
+# `rich-sup-probe` a AUC(label) nettement > 0.5 et sa saliency sort des
+# marqueurs plausibles. C'est le SEUL bras qu'on peut citer comme non circulaire.
+#
+# ⚠️ Les runs `-joint` ont un encodeur DE-informé : leur `driver_score` n'est PAS
+# comparable aux rankings anti-circulaires des autres vagues. À étiqueter comme
+# tel partout où ils sortent.
 #
 # VERROUS (LOG §27/§28) : deterministic + 3 seeds, non négociables (plancher de
 # bruit rho 0.556-0.687 sinon).
 #
-# ⚠️ DÉPENDANCE LABELS. --supervised reconstruit les 5 labels DEG dans le train
-# (_train_body.py). Les caches DEGs_P16_cluster_*.csv ont disparu de data/gnn_data
-# (cf. CLAUDE.md) → --supervised-recompute-labels force le recalcul scanpy
-# Wilcoxon, qui a besoin de la MATRICE d'expression scRNA sur le nœud d'exécution.
-# À vérifier AVANT de lancer sur le cluster (sinon le train plante à l'étape tête).
+# ⚠️ LABELS. `--supervised-recompute-labels` force le recalcul scanpy Wilcoxon
+# de la DE par cluster, qui exige la MATRICE d'expression scRNA sur le nœud
+# d'exécution (`merged_P4_P16_normalized.csv`). Les caches
+# `DEGs_P16_cluster_*.csv` SONT présents dans data/gnn_data (contrairement à ce
+# que dit un vieux commentaire de CLAUDE.md) — on force malgré tout le recalcul
+# pour que les 6 bras partagent des labels identiques et datés du run.
 #
 # ⚠️ PPI mirror-dedup (LOG §32) est ON par défaut → ces runs tournent sur le
 # graphe PPI CORRIGÉ (2x), pas le 4x legacy. Bonus, mais les rend non
 # directement comparables aux rankings V6.1.3 rich (graphe 4x).
 #
+# COÛT. 6 configs × 3 seeds = 18 entraînements + 54 perturbations ; 6 builds
+# (le graphe est bâti 1× par config, cache seed-indépendant).
+#
 # Usage (détaché !) :
 #   tmux new -s sup
 #   scripts/run_omnipath_ablation_wave.sh workflow/config/ablations_supervised.yaml \
 #       --profile workflow/profiles/slurm -j 8 --parallel 2
-#   # saliency par cluster : <config>/s*/  (sorties finalize_supervised)
+#   # la moitié propre seulement, pour étaler le coût :
+#   scripts/run_omnipath_ablation_wave.sh workflow/config/ablations_supervised.yaml \
+#       --only pure-sup-probe,rich-sup-probe,rich-sup-probe-defeat \
+#       --profile workflow/profiles/slurm -j 8 --parallel 2
+#
+#   # lecture : la saliency vit dans <config>/s*/cluster_importance.tsv ;
+#   # les deltas de ranking se lisent famille par famille, chacune contre SON
+#   # contrôle (un --baseline unique mélangerait régime et features) :
+#   python src/validation/reports/compare_runs.py \
+#       --runs-glob 'output/snakemake/sup.*-probe*' --baseline sup.rich-sup-probe
+#   python src/validation/reports/compare_runs.py \
+#       --runs-glob 'output/snakemake/sup.*-joint*'  --baseline sup.rich-sup-joint
 # ===========================================================================
 
 root_tag: "sup"
@@ -64,7 +116,9 @@ decoy_random_axis_seed: 0
 # F1 — headline `diff` inchangé ; la comparaison est une re-projection post-hoc
 # du cache Δz (secondes, table séparée). Elle a un sens propre ici : si μ encode
 # réellement les sous-états, l'axe ne devrait pas pivoter d'un estimateur à
-# l'autre (contre-exemple connu : ASNS, cos 0.058→0.514 selon kl1).
+# l'autre (contre-exemple connu : ASNS, cos 0.058→0.514 selon kl1). Second
+# usage : en régime JOINT l'axe devrait se FIGER (il devient re-dérivable des
+# labels) — l'écart entre estimateurs est donc un circularimètre indépendant.
 axis_method: diff
 axis_method_compare: "diff,lda,cav,pca"
 axis_cav_permutations: 100
@@ -82,9 +136,9 @@ validation:
     enabled: true
     # `both` : `--de-features` et les flags `pure` touchent les FEATURES de
     # nœud et les sources NON signées — le substrat signé est identique d'un
-    # bras à l'autre. Seul le signe appris (décodeur bilinéaire sur μ) peut
-    # bouger, et c'est précisément la question ici : la tête supervisée
-    # déplace-t-elle ce que le latent croit du signe de la régulation ?
+    # bras à l'autre (mesuré). Seul le signe appris (décodeur bilinéaire sur μ)
+    # peut bouger, et c'est précisément la question ici : le régime de la tête
+    # déplace-t-il ce que le latent croit du signe de la régulation ?
     sign_source: both
 
 base_extra_flags: >-
@@ -101,11 +155,18 @@ _pure_flags: &pure >-
   --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges
 
 ablation_grid:
-  # ── Tête propre (SANS de-features) : saliency par sous-cluster non circulaire ─
-  - {name: pure-sup, add_flags: *pure}
-  - {name: rich-sup, add_flags: ""}
+  # ── RÉGIME PROBE (--supervised-detach) : encodeur entraîné par reconstruction
+  #    SEULE. Les seuls bras citables comme non circulaires. ────────────────
+  - {name: pure-sup-probe,        add_flags: "--dedup-ppi-signed remove --no-ppi --exclude-features ppi_degree,reg_degree --no-coexpr --no-humess-edges --no-reactome --no-cell-group-edges --supervised-detach"}
+  - {name: rich-sup-probe,        add_flags: "--supervised-detach"}
+  # Plafond circulaire par les FEATURES, mesuré sur un encodeur propre — c'est
+  # ce qui en fait une borne haute interprétable.
+  - {name: rich-sup-probe-defeat, add_flags: "--supervised-detach --de-features"}
 
-  # ── Plafond circulaire de référence : la MÊME tête AVEC la DE en feature. ────
-  # Tag `de-feat`. Borne haute ; l'écart rich-sup ↔ rich-sup-defeat = part non
-  # circulaire de ce que μ sait des sous-états.
-  - {name: rich-sup-defeat, add_flags: "--de-features"}
+  # ── RÉGIME JOINT (défaut historique) : le gradient de la tête remonte dans
+  #    l'encodeur. Conservés comme MESURE de ce que cela injecte, pas comme
+  #    résultat propre. Leur driver_score est DE-informé. ───────────────────
+  - {name: pure-sup-joint,        add_flags: *pure}
+  - {name: rich-sup-joint,        add_flags: ""}
+  # Les DEUX routes cumulées (gradient + features) = plafond absolu.
+  - {name: rich-sup-joint-defeat, add_flags: "--de-features"}

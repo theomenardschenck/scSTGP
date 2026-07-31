@@ -156,7 +156,12 @@ def _build_run_tag():
     # features never shares a directory with an anti-circular one.
     if USE_EXPR_NODE_FEATURES:                   parts.append("expr-feat")
     if getattr(CLI_ARGS, "de_features", False):  parts.append("de-feat")
-    if getattr(CLI_ARGS, "supervised", False):   parts.append("sup")
+    # V6.4 : le RÉGIME de la tête doit être visible dans le nom — un probe
+    # (encodeur intact) et un multi-tâche (encodeur DE-informé par le gradient)
+    # ne produisent pas le même latent et ne doivent jamais partager un dossier.
+    if getattr(CLI_ARGS, "supervised", False):
+        parts.append("sup-probe" if getattr(CLI_ARGS, "supervised_detach", False)
+                     else "sup")
     if OMNIPATH_EXTRA_EDGES:
         # Tag court : op-edges<N> (N types) ; ex op-edges2. Détail dans run_config.
         parts.append(f"op-edges{len(OMNIPATH_EXTRA_EDGES)}")

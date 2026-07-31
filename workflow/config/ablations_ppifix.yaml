@@ -1,0 +1,54 @@
+# ===========================================================================
+# ablations_ppifix.yaml — V6.5 : re-run the RICH configs on the CORRECTED PPI
+# graph (mirror-dedup ON, LOG §32) + a legacy 4x A/B control.
+#
+# WHY. Every V6.1.3 rich ranking was built on the STRING mirror-duplication bug:
+# each undirected PPI stored 4x (measured ratio 4.00), inflating ppi_degree and
+# ||h_PPI|| (~13x). --dedup-ppi-mirror (default ON) now stores each edge once as
+# a true 2x bidirectional. This wave re-measures the rich drivers on the clean
+# graph, and the `*-legacy4x` arms (--no-dedup-ppi-mirror, tag ppi-mirror-dup)
+# quantify the shift the fix causes.
+#
+# PREDICTION (write before reading). The 4x->2x deflation of ||h_PPI|| should
+# demote PPI-hub genes (MYC, RAN, and cell-cycle/ribosome hubs that ride PPI
+# density) and leave the coexpr-borne chromatin program (HMGB1/2, H2AFZ,
+# KMT2/DOT1L) roughly in place (it is carried by coexpr, not PPI). If chromatin
+# also moves a lot, PPI was propping it up too.
+#
+# VERROUS (LOG §27/§28) : deterministic + 3 seeds.
+#
+# Usage (detached):
+#   tmux new -s ppifix
+#   scripts/run_omnipath_ablation_wave.sh workflow/config/ablations_ppifix.yaml \
+#       --profile workflow/profiles/slurm -j 8 --parallel 2
+# ===========================================================================
+
+root_tag: "ppifix"
+seeds: [1, 2, 3]
+deterministic: true
+
+decoy: true
+decoy_n_rewires: 50
+decoy_random_axis: 20
+decoy_random_axis_seed: 0
+
+axis_method: diff
+axis_method_compare: "diff,lda,cav,pca"
+axis_cav_permutations: 100
+
+# Rich base = the headline graph (coexpr + HuMess + reactome_fi + OmniPath).
+base_extra_flags: >-
+  --signed-message --signed-decoder --use-reactome-fi
+  --use-omnipath-signaling --use-omnipath-tf-curated
+  --use-omnipath-node-features
+  --omnipath-edges transcriptional,enzyme_substrate,ligand_receptor
+  --reactome-fi-directed
+
+ablation_grid:
+  # ── CORRECTED graph (mirror-dedup ON = default) ──────────────────────────
+  - {name: rich-fix,        add_flags: ""}
+  # ── LEGACY 4x control (reproduces the pre-fix rich graph) — A/B ──────────
+  - {name: rich-legacy4x,   add_flags: "--no-dedup-ppi-mirror"}
+  # ── Directed-FI variant on the corrected graph (matches rfi2.rich-dir) ───
+  - {name: rich-dir-fix,    add_flags: "--reactome-fi-directed"}
+  - {name: rich-dir-legacy4x, add_flags: "--reactome-fi-directed --no-dedup-ppi-mirror"}
