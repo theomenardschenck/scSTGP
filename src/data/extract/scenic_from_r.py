@@ -47,10 +47,13 @@ import numpy as np
 # encore np.object/np.bool/np.int/np.float/np.str, retirés depuis numpy 1.24.
 # L'env `arboreto` tourne en numpy 1.26 (requis par arboreto/scanpy) ; on
 # restaure les alias builtins AVANT tout import pySCENIC (paresseux, dans main()).
-for _np_alias, _np_builtin in {"object": object, "bool": bool, "int": int,
-                               "float": float, "str": str}.items():
-    if not hasattr(np, _np_alias):
-        setattr(np, _np_alias, _np_builtin)
+import warnings as _warnings
+with _warnings.catch_warnings():            # numpy<1.24 warne à l'accès np.object
+    _warnings.simplefilter("ignore")
+    for _np_alias, _np_builtin in {"object": object, "bool": bool, "int": int,
+                                   "float": float, "str": str}.items():
+        if not hasattr(np, _np_alias):
+            setattr(np, _np_alias, _np_builtin)
 # scanpy / matplotlib / seaborn — imports paresseux dans main() (UMAP
 # legacy). La sous-commande grnboost2-diff n'en a pas besoin et l'env
 # `arboreto` GLiCID ne les installe pas (fail au top-level cassait
@@ -58,10 +61,20 @@ for _np_alias, _np_builtin in {"object": object, "bool": bool, "int": int,
 # Voir §14bis.6septdecies du rapport pour le contexte V4.3.
 
 def main():
-    import scanpy as sc
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    from matplotlib.colors import LinearSegmentedColormap
+    # Viz legacy (UMAP/heatmap) OPTIONNELLE : absente sur certains envs cluster
+    # (arboreto sans scanpy/matplotlib). Le cœur SCENIC + les exports GNN
+    # (regulon_edges_TF_to_gene.csv, mean_TF_activity_per_cluster.csv) n'en
+    # dépendent PAS → on n'échoue pas si ces paquets manquent.
+    try:
+        import scanpy as sc
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        from matplotlib.colors import LinearSegmentedColormap
+        _HAVE_VIZ = True
+    except ImportError as _viz_err:
+        _HAVE_VIZ = False
+        print(f"[viz] scanpy/matplotlib/seaborn indisponibles ({_viz_err}) — "
+              "visualisations sautées, exports GNN produits normalement.")
 
     from dask.distributed import Client, LocalCluster
     import os
@@ -305,8 +318,40 @@ def main():
     print(mean_activity.round(4).to_string())
 
     # =============================================================================
-    # 7. VISUALISATIONS
+    # 8. EXPORT POUR LE GNN — fait AVANT la viz (sortie critique, sans dépendance
+    #    scanpy/matplotlib). regulon_edges_TF_to_gene.csv + mean_TF_activity...
     # =============================================================================
+    print("\n" + "=" * 60)
+    print("EXPORT DES DONNÉES POUR LE GNN HÉTÉROGÈNE")
+    print("=" * 60)
+    regulon_table = []
+    for reg in regulons:
+        for gene, weight in zip(reg.genes, reg.weights):
+            regulon_table.append(
+                {"TF": reg.name, "target_gene": gene, "weight": weight})
+    regulon_df = pd.DataFrame(regulon_table)
+    regulon_df.to_csv(
+        os.path.join(RESULTS_DIR, "regulon_edges_TF_to_gene.csv"), index=False)
+    print(f"Arêtes TF → gène cible : {len(regulon_df)} interactions")
+    mean_activity.to_csv(
+        os.path.join(RESULTS_DIR, "mean_TF_activity_per_cluster.csv"))
+    print("Activité moyenne TF par cluster sauvegardée.")
+    pd.DataFrame(
+        [("Nombre de regulons (TFs)", len(regulons)),
+         ("Nombre total d'interactions TF-cible", len(regulon_df)),
+         ("Nombre de cellules", auc_matrix.shape[0]),
+         ("Top 25 TFs variables", ", ".join(top25_tfs))],
+        columns=["Métrique", "Valeur"],
+    ).to_csv(os.path.join(RESULTS_DIR, "scenic_summary.csv"), index=False)
+
+    # =============================================================================
+    # 9. VISUALISATIONS (optionnelles) — sautées si scanpy/matplotlib absents
+    # =============================================================================
+    if not _HAVE_VIZ:
+        print("[viz] scanpy/matplotlib absents → UMAP/heatmap sautées ; "
+              "exports GNN produits. Pipeline SCENIC terminé.")
+        client.close(); cluster.close()
+        return
 
     print("\n" + "=" * 60)
     print("GÉNÉRATION DES VISUALISATIONS")
@@ -473,58 +518,7 @@ def main():
     plt.show()
     print("UMAP AUCell sauvegardées.")
 
-    # =============================================================================
-    # 8. EXPORT DES RÉSULTATS POUR LE GNN
-    # =============================================================================
-
-    print("\n" + "=" * 60)
-    print("EXPORT DES DONNÉES POUR LE GNN HÉTÉROGÈNE")
-    print("=" * 60)
-
-    # --- 8a. Table des regulons (TF → gènes cibles) ---
-    regulon_table = []
-    for reg in regulons:
-        tf_name = reg.name
-        for gene, weight in zip(reg.genes, reg.weights):
-            regulon_table.append({
-                "TF": tf_name,
-                "target_gene": gene,
-                "weight": weight
-            })
-
-    regulon_df = pd.DataFrame(regulon_table)
-    regulon_df.to_csv(
-        os.path.join(RESULTS_DIR, "regulon_edges_TF_to_gene.csv"),
-        index=False
-    )
-    print(f"Arêtes TF → gène cible : {len(regulon_df)} interactions")
-
-    # --- 8b. Matrice AUCell (activité TF par cellule) ---
-    # Déjà sauvegardée en AUCELL_MTX
-
-    # --- 8c. Activité TF par cluster (résumé) ---
-    mean_activity.to_csv(os.path.join(RESULTS_DIR, "mean_TF_activity_per_cluster.csv"))
-    print("Activité moyenne TF par cluster sauvegardée.")
-
-    # --- 8d. Adjacences GRNBoost2 (réseau de co-expression complet) ---
-    # Déjà sauvegardé en ADJACENCIES_FILE
-
-    # --- 8e. Résumé pour le GNN ---
-    summary = {
-        "Nombre de regulons (TFs)": len(regulons),
-        "Nombre total d'interactions TF-cible": len(regulon_df),
-        "Nombre de cellules": auc_matrix.shape[0],
-        "Top 25 TFs variables": ", ".join(top25_tfs),
-    }
-
-    summary_df = pd.DataFrame(
-        list(summary.items()),
-        columns=["Métrique", "Valeur"]
-    )
-    summary_df.to_csv(
-        os.path.join(RESULTS_DIR, "scenic_summary.csv"),
-        index=False
-    )
+    # (exports GNN déjà écrits en section 8, avant la viz)
 
     print("\n" + "=" * 60)
     print("PIPELINE pySCENIC TERMINÉ")

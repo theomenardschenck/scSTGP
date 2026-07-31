@@ -716,11 +716,20 @@ part du signal portée par le graphe plutôt que par le DE.</p>
                                     encoding="utf-8")
 
 
-def serve(site: Path, port: int, auth: str | None) -> None:
+def serve(site: Path, root: Path, port: int, auth: str | None) -> None:
+    """Sert le site en local.
+
+    On sert l'ancêtre commun de --out et --root, PAS `site` : les figures et
+    TSV sont référencés en relatif hors du dossier du site, et
+    SimpleHTTPRequestHandler refuse toute remontée au-dessus de sa racine.
+    """
     import base64
     import functools
     import http.server
     import socketserver
+
+    serve_dir = Path(os.path.commonpath([site, root]))
+    entry = rel(site / "index.html", serve_dir)
     base = http.server.SimpleHTTPRequestHandler
     if auth:
         user, _, pw = auth.partition(":")
@@ -736,8 +745,10 @@ def serve(site: Path, port: int, auth: str | None) -> None:
                     return
                 super().do_GET()
         base = Auth
-    handler = functools.partial(base, directory=str(site))
-    print(f"### http://127.0.0.1:{port}/  (Ctrl-C pour arrêter)")
+    handler = functools.partial(base, directory=str(serve_dir))
+    print(f"### racine servie : {serve_dir}")
+    print(f"### http://127.0.0.1:{port}/{entry}  (Ctrl-C pour arrêter)")
+    socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("127.0.0.1", port), handler) as httpd:
         httpd.serve_forever()
 
@@ -799,7 +810,7 @@ def main() -> None:
     print(f"\n[SUCCESS] {out}/index.html  ({size/1e6:.1f} Mo générés)")
 
     if args.serve:
-        serve(out, args.port, args.auth)
+        serve(out, root, args.port, args.auth)
 
 
 if __name__ == "__main__":
