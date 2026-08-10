@@ -3,13 +3,23 @@
 Hypergeometric ORA on one or more gene lists, with optional consensus-building
 from VGAE run outputs.
 
-Supports two gene-set "databases":
+Supports four gene-set "databases":
   * ``--db reactome`` (default): REACTOME pathways from MSigDB
     (``data/databases/c2.cp.reactome.symbols.gmt``). One hypergeometric test
     per pathway, BH-FDR on all tested pathways.
+  * ``--db kegg``: KEGG human pathways
+    (``data/databases/c2.cp.kegg.symbols.gmt``, built by
+    ``scripts/fetch_kegg_gmt.py`` from the open KEGG REST API).
+  * ``--db hallmark``: the 50 MSigDB HALLMARK sets
+    (``data/databases/h.all.symbols.gmt``), unfiltered -- this is the
+    collection ShinyGO reports as "MSigDB Hallmark".
   * ``--db aging``: four aging gene catalogues -- SenMayo (local aging list),
     CellAge, Fridman (MSigDB hallmarks filtered on aging keywords), GenAge.
     One hypergeometric test per catalogue, BH-FDR across the four.
+
+``kegg``/``hallmark``/``reactome`` are the three collections a ShinyGO run
+would give on the same list; running them side by side on the same background
+makes the internal ORA directly comparable to the external cross-check.
 
 Input gene lists come either from ``--genes FILE...`` (plain text, one symbol
 per line) or are built on the fly from VGAE runs via ``--consensus-runs``
@@ -80,6 +90,8 @@ def _find_project_root(start: Path, fallback_levels: int = 2) -> Path:
 ROOT = _find_project_root(Path(__file__))
 # Override possible : GNN_PROJECT_ROOT=/LAB-DATA/GLiCID/users/.../gnn/ python ...
 GMT_PATH = ROOT / "data/databases/c2.cp.reactome.symbols.gmt"
+KEGG_GMT_PATH = ROOT / "data/databases/c2.cp.kegg.symbols.gmt"
+HALLMARK_GMT_PATH = ROOT / "data/databases/h.all.symbols.gmt"
 
 def _resolve_de_path(root: Path) -> Path:
     """GSE98440 DE — robuste à la réorg data/RNAseq → data/bulkRNAseq."""
@@ -173,9 +185,21 @@ def load_background(path: Path | None = None) -> set[str]:
     return load_gene_list(path)
 
 
-def load_reactome_gmt() -> dict[str, set[str]]:
+def load_gmt(path: Path) -> dict[str, set[str]]:
+    """Any ``.gmt`` collection as ``{set_name: symbols}``.
+
+    Same shape as :func:`load_aging_databases`, so the result can be fed
+    directly to :func:`run_ora`. Missing file is fatal here on purpose: an ORA
+    silently run against an empty collection would report "no enrichment".
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"gene-set collection not found: {path}\n"
+            "  KEGG: run `python scripts/fetch_kegg_gmt.py` (open KEGG REST API)."
+        )
     sets: dict[str, set[str]] = {}
-    with open(GMT_PATH) as f:
+    with open(path) as f:
         for line in f:
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 3:
@@ -183,6 +207,10 @@ def load_reactome_gmt() -> dict[str, set[str]]:
             name, _url, *genes = parts
             sets[name] = {g.strip() for g in genes if g.strip()}
     return sets
+
+
+def load_reactome_gmt() -> dict[str, set[str]]:
+    return load_gmt(GMT_PATH)
 
 
 def _load_from_registry() -> dict[str, set[str]] | None:
@@ -390,8 +418,11 @@ def main():
                      help="Run directories (or gene_ranking_vgae.csv paths) to "
                           "build a consensus gene list from.")
 
-    ap.add_argument("--db", choices=("reactome", "aging"), default="reactome",
-                    help="Gene-set collection to test against (default: reactome).")
+    ap.add_argument("--db", choices=("reactome", "kegg", "hallmark", "aging"),
+                    default="reactome",
+                    help="Gene-set collection to test against (default: reactome). "
+                         "reactome/kegg/hallmark = the three ShinyGO-comparable "
+                         "pathway collections; aging = the senescence catalogues.")
     ap.add_argument("--background", type=str, default=None,
                     help="Optional background file (gene_ranking_vgae.csv or plain "
                          "text). Default: DE table; if --consensus-runs is used and "
@@ -428,6 +459,10 @@ def main():
     print(f"Loading {args.db} gene sets and background ...")
     if args.db == "reactome":
         gene_sets = load_reactome_gmt()
+    elif args.db == "kegg":
+        gene_sets = load_gmt(KEGG_GMT_PATH)
+    elif args.db == "hallmark":
+        gene_sets = load_gmt(HALLMARK_GMT_PATH)
     else:
         gene_sets = load_aging_databases()
 

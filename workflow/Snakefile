@@ -671,6 +671,11 @@ rule perturb_decoy:
         top_n=DECOY_TOP_N,
         rewires=DECOY_REWIRES,
         frozen=("--frozen-axis" if DECOY_FROZEN else ""),
+    resources:
+        # top_n * rewires * 2 encodages (ex. 40*50*2 = 4000) : le défaut profil
+        # (mem 8000 / runtime 120) le tue vers le gène 30/40. Cf. LOG.
+        mem_mb=16000,
+        runtime=720,
     log:
         LOG_DIR / "perturb_decoy.log",
     shell:

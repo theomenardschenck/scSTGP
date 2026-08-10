@@ -47,9 +47,11 @@ SOURCES: dict[str, dict] = {
         "note": "proxy SenMayo local — fourni avec le dépôt, pas de source publique."},
     "endosen_up": {
         "url": None, "dest": GS / "endosen_up.txt",
-        "note": ("EndoSEN_up (Saul et al. 2025, Aging Cell, PMC11488300) — "
-                 "extraire la signature du supplément et déposer un symbole HGNC "
-                 "par ligne à ce chemin.")},
+        "note": ("EndoSEN_up (Guduric-Fuchs et al. 2024, Aging Cell 23:e14240, "
+                 "PMC11488300) — FOURNI dans le dépôt (70/75 transcrits de la "
+                 "Fig. SF5 ; voir l'en-tête du fichier). Les 5 gènes manquants ne "
+                 "sont pas étiquetés dans la figure ; pour les 75 exacts, re-dériver "
+                 "depuis GSE160166 ou contacter les auteurs.")},
 }
 
 

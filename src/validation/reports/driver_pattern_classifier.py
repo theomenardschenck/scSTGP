@@ -119,6 +119,15 @@ def main(argv=None):
     deg_auroc, _ = _auroc_cv(X[["deg_total"]].values, y, seed=a.seed)
     print(f"[degree-only NULL]         AUROC = {deg_auroc:.3f}")
 
+    # LATENT arm: GBM on the LEARNED embedding mu (post-message-passing). The gap
+    # AUROC(mu) - AUROC(raw) = what the GNN's representation ADDS for known-driver
+    # recall. mu is already loaded as the embeddings CSV (same gene order as X).
+    mu = pd.read_csv(a.embeddings, index_col=0)
+    if len(mu) == len(X):
+        mu_auroc, mu_sd = _auroc_cv(mu.values.astype(float), y, seed=a.seed)
+        print(f"[LATENT mu GBM]            AUROC = {mu_auroc:.3f} ± {mu_sd:.3f}   "
+              f"=> message-passing value (mu - raw) = {mu_auroc-auroc:+.3f}")
+
     # GNN-score reference (the thing the NULL must beat to justify the GNN)
     if a.ranking and Path(a.ranking).exists():
         rk = pd.read_csv(a.ranking, sep="\t")

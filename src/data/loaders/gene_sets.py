@@ -159,7 +159,7 @@ def _read_table(path: Path, sep: str) -> pd.DataFrame:
     dé-guillemetage des en-têtes (gère à la fois cellage — guillemets parasites
     dans "Gene name" — et AgeAnno — en-têtes eux-mêmes guillemetés)."""
     df = pd.read_csv(path, sep=sep, engine="python", on_bad_lines="skip",
-                     dtype=str, quoting=3)
+                     dtype=str, quoting=3, comment="#")
     df.columns = [str(c).strip().strip('"') for c in df.columns]
     return df
 

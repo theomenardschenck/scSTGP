@@ -227,6 +227,39 @@ EXPR_MATRIX         = _PATHS.EXPR_MATRIX
 GROUP_META          = _PATHS.GROUP_META
 ensure_dirs(_PATHS)
 
+
+# --- Full, drift-proof provenance -------------------------------------------
+# The curated manifest below is an ALLOWLIST, so every new CLI flag silently
+# failed to be recorded (found 2026-08-04: `--dedup-ppi-mirror`,
+# `--reactome-fi-directed` and the deterministic mode were all absent, making
+# two runs with different graphs indistinguishable from their run_config.json).
+# `_all_cli_args()` dumps every argparse value, so a run is always fully
+# described by its own directory. Env-level switches that are NOT argparse
+# flags (determinism, hash seed) are captured explicitly.
+def _json_safe(v):
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    if isinstance(v, (list, tuple, set)):
+        return [_json_safe(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _json_safe(x) for k, x in v.items()}
+    return str(v)
+
+
+def _all_cli_args() -> dict:
+    """Every argparse value, JSON-safe, sorted — the drift-proof record."""
+    return {k: _json_safe(v) for k, v in sorted(vars(CLI_ARGS).items())}
+
+
+def _runtime_env() -> dict:
+    """Execution-mode switches that are env vars, not CLI flags."""
+    return {
+        "deterministic": os.environ.get("GNN_DETERMINISTIC", "0") == "1",
+        "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
+        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+    }
+
+
 # Manifest des modules activés/désactivés pour ce run — sert d'audit pour les
 # études d'ablation (cf. perturb_report.py / cross_seed_report).
 _MANIFEST_PATH = os.path.join(OUT_DIR, "run_config.json")
@@ -267,6 +300,11 @@ with open(_MANIFEST_PATH, "w") as _fh:
         # sont enrichies plus tard (cf. section 10) une fois le pool construit.
         "holdout_signed_tf_fraction": CLI_ARGS.holdout_signed_tf_fraction,
         "holdout_signed_tf_seed": CLI_ARGS.holdout_signed_tf_seed,
+        # Drift-proof: the two blocks below make the allowlist above redundant
+        # for provenance. Keep the curated keys (consumers read them by name),
+        # but never rely on them being complete.
+        "cli_args": _all_cli_args(),
+        "runtime_env": _runtime_env(),
     }, _fh, indent=2)
 print(f"  Manifest écrit    : {_MANIFEST_PATH}")
 

@@ -1073,6 +1073,31 @@ _edge_stats_block = {
         if omnipath_endpoints else 0),
 }
 
+
+# --- Drift-proof provenance helpers (mirror of gnn_vgae.py) -----------------
+def _json_safe_metrics(v):
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    if isinstance(v, (list, tuple, set)):
+        return [_json_safe_metrics(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _json_safe_metrics(x) for k, x in v.items()}
+    return str(v)
+
+
+def _all_cli_args_metrics() -> dict:
+    return {k: _json_safe_metrics(v) for k, v in sorted(vars(CLI_ARGS).items())}
+
+
+def _runtime_env_metrics() -> dict:
+    import os as _os
+    return {
+        "deterministic": _os.environ.get("GNN_DETERMINISTIC", "0") == "1",
+        "pythonhashseed": _os.environ.get("PYTHONHASHSEED"),
+        "cublas_workspace_config": _os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+    }
+
+
 _metrics = {
     "version": 1,
     "seed": int(getattr(CLI_ARGS, "seed", 42)),
@@ -1123,6 +1148,15 @@ _metrics = {
         # V4.3 — choix méthode×prune amont (consommé par cross-method report).
         "coexpr_method": CLI_ARGS.coexpr_method,
         "coexpr_prune": CLI_ARGS.coexpr_prune,
+        # Drift-proof provenance (2026-08-04). The curated keys above are an
+        # ALLOWLIST and silently dropped every new flag (`--dedup-ppi-mirror`,
+        # `--reactome-fi-directed`, determinism...), which made two runs on
+        # DIFFERENT graphs indistinguishable from their metrics file. These two
+        # blocks record everything; keep the named keys for existing consumers
+        # (gnn_perturbation.load_run reads them by name) but never assume they
+        # are complete. Same blocks are written to run_config.json.
+        "cli_args": _all_cli_args_metrics(),
+        "runtime_env": _runtime_env_metrics(),
     },
     "edge_stats": _edge_stats_block,
 }

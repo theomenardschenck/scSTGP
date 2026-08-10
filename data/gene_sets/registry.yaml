@@ -60,10 +60,11 @@
   symbol_col: Symbol
   role: validation
 
-# --- Signature endothéliale spécifique (Saul et al. 2025, Aging Cell) ---------
-# EndoSEN_up : biais endothélial réduit, validation HUVEC directe.
-# Absent par défaut → health-check AUTO_OFF tant que le fichier n'est pas fourni
-# (l'outil tourne quand même). Récupération : scripts/fetch_gene_sets.py.
+# --- Signature endothéliale spécifique (Guduric-Fuchs et al. 2024) -------------
+# EndoSEN_up : biais endothélial réduit, dérivée sur ECFC/HRMEC.
+# Aging Cell 23(9):e14240, PMC11488300. 70/75 gènes transcrits depuis la
+# Figure supplémentaire SF5 (les 75 ne sont publiés que sous forme d'images) —
+# provenance détaillée en tête de endosen_up.txt.
 - name: endosen_up
   path: data/gene_sets/endosen_up.txt
   format: txt

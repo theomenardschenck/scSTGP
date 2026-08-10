@@ -154,11 +154,14 @@ rule coexpr_merge:
 
 
 # ── 5. SCENIC regulons (pySCENIC ctx + AUCell, env arboreto) ────────────────
-#    scenic_from_r.py fait son propre GRNBoost2 (arboreto) → prune → AUCell.
-#    Paramétré par STGP_SCENIC_* ; cluster=cell_group (AD/CT).
+#    ⚠ On NE laisse PAS scenic_from_r.py refaire son GRNBoost2 (arboreto+dask
+#    HANGUE sur GLiCID + redondant). On lui fournit adjacencies_arb.csv construit
+#    depuis les adjacences coexpr déjà calculées (poolé AD∪CT, top-50/cible) →
+#    il détecte le fichier, saute GRNBoost2, et fait modules→cisTarget→AUCell.
+#    Prérequis env : `conda run -n arboreto pip install "setuptools<81" pyscenic`.
 rule scenic:
     input:
-        expr_all=EXPR_ALL, cell_meta=CELL_META,
+        expr_all=EXPR_ALL, cell_meta=CELL_META, base=ADJ_BASE, adv=ADJ_ADV,
     output:
         regulons=REGULONS, tf_act=TF_ACT,
     params:
@@ -168,9 +171,11 @@ rule scenic:
         os.path.join(OUT, "_logs", "scenic.log"),
     threads: 8
     resources:
-        mem_mb=32000, runtime=1440,
+        mem_mb=64000, runtime=1440,
     shell:
         r"""
+        mkdir -p {params.scenic_dir}
+        {PY} -c "import pandas as pd; a=pd.read_csv('{input.base}'); b=pd.read_csv('{input.adv}'); m=pd.concat([a,b]).groupby(['TF','target'],as_index=False)['importance'].mean(); m=m.sort_values('importance',ascending=False).groupby('target').head(50); m.to_csv('{params.scenic_dir}/adjacencies_arb.csv',index=False); print('adjacencies_arb.csv',len(m),'paires')"
         STGP_SCENIC_EXPR=$(readlink -f {input.expr_all}) \
         STGP_SCENIC_META=$(readlink -f {input.cell_meta}) \
         STGP_SCENIC_RESULTS=$(readlink -f {params.scenic_dir}) \

@@ -1413,23 +1413,41 @@ def _compute_driver_score(canon_diff: float, canon_cos: float, n_modes: int,
 
     Aggregates only signals the GNN itself produces : amplitude
     (log-normalized) + purity (cosine alignment with senescence axis) +
-    coverage (n_modes) + coherence (sign-consistency) + centrality
-    (VGAE rank). External literature evidence (DE-significance, aging
-    DBs) is **not** part of the driver score — it is exposed
-    separately via `validation_score` (corroboration) and inverted in
-    `discovery_score` (graph-only findings). This decoupling lets the
-    user choose between confirmatory and exploratory ranking.
+    coverage (n_modes) + coherence (sign-consistency). External
+    literature evidence (DE-significance, aging DBs) is **not** part of
+    the driver score — it is exposed separately via `validation_score`
+    (corroboration) and inverted in `discovery_score` (graph-only
+    findings). This decoupling lets the user choose between
+    confirmatory and exploratory ranking.
 
-    Weights normalised to 1.0 with amplitude+purity dominant (0.65) so
+    Weights normalised to 1.0 with amplitude+purity dominant (0.72) so
     the score reflects the graph signal first, then coverage/coherence
-    (sanity), then centrality (graph context).
+    (sanity).
 
-    Hub-inflated genes : V3.4 attenuates rather than zeroing-out.
-    Their amplitude is real but partly explained by PPI connectivity,
-    so we down-weight by 0.5 to push them mid-rank — visible but not
-    dominating. The [hub-inflated] tag in `interpretation` is the
-    explicit caveat. Replaces the V3.3 killswitch which made ASNS &
-    TP53 disappear entirely.
+    2026-08-07 — CENTRALITY AND HUB ATTENUATION REMOVED
+    --------------------------------------------------
+    The score used to carry two extra terms, both of which encoded the
+    very confound the analysis is built to control:
+
+      * ``centrality = max(0, 1 - vgae_rank/total_genes)``, an explicit
+        degree prior of weight 0.10 sitting inside a score that is then
+        read against a degree-only control. Measured cost: ρ(score,
+        total degree) = +0.62 to +0.72 across the four V6.1.3 views,
+        dropping to +0.38 to +0.59 once the term is gone, at ρ(old,new)
+        = 0.92-0.95 and 79-92 of the top-100 retained. The ranking is
+        therefore not rebuilt, it is decontaminated.
+      * ``hub`` attenuation (x0.9), a post-hoc patch on the same
+        confound. Measured to be **inert**: zero gene carries
+        ``is_hub_indexed`` in any of the seven V6.1.3 configs, so it
+        never fired. Removing it changes no rank.
+
+    `vgae_rank`, `total_genes` and `hub` are kept in the signature: they
+    are still written to the report as diagnostic columns, and dropping
+    them would break every caller. They no longer enter the score.
+
+    Existing runs are patched in place by ``scripts/rescore_headline.py
+    --apply`` rather than re-trained, since only the aggregation of four
+    already-computed ingredients changes.
     """
     # log-normalized amplitude: log10(|x|+1) / log10(500+1) ≈ /2.7
     amp = float(min(np.log10(abs(canon_diff) + 1.0) / np.log10(501.0), 1.0))
@@ -1441,20 +1459,17 @@ def _compute_driver_score(canon_diff: float, canon_cos: float, n_modes: int,
         coherence = 0.3   # low but not 0 (keeps non-monotonic candidates visible)
     else:
         coherence = 0.5   # NaN (single mode) — neutral
-    centrality = 0.0
-    if vgae_rank is not None and vgae_rank > 0:
-        centrality = max(0.0, 1.0 - vgae_rank / total_genes)
-    # Weights sum to 1.0. Amplitude + purity = 0.65 (graph signal core),
-    # coverage + coherence = 0.25 (sanity), centrality = 0.10 (context).
+    # Weights renormalised to 1.0 over the four surviving ingredients
+    # (former weights summed to 0.90 once centrality was dropped).
+    # Amplitude + purity = 0.72 (graph signal core), coverage +
+    # coherence = 0.28 (sanity). `vgae_rank`/`total_genes`/`hub` are
+    # diagnostics only — see the docstring.
     score = (
         0.35 * amp
         + 0.30 * purity
         + 0.15 * coverage
         + 0.10 * coherence
-        + 0.10 * centrality
-    )
-    if hub:
-        score *= 0.9   # attenuation, not killswitch
+    ) / 0.90
     return float(min(max(score, 0.0), 1.0))
 
 

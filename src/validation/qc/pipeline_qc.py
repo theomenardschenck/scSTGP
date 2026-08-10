@@ -61,26 +61,36 @@ TARGETS = ["OCRL", "SYNJ2", "SMPD1", "NAMPT", "GCLC",
 
 
 # --------------------------------------------------------------------- utils
-def _find_ranking(d: Path) -> Path | None:
+def _find_ranking(d: Path, strict: bool = False) -> Path | None:
     """Locate a cross-seed ranking for a run dir.
 
     Layouts differ: the flat one keeps it under <run>/xseed/, the Snakemake one
     puts it at CONFIG level (<config>/analysis/) while the run is <config>/s1/ --
     i.e. a SIBLING, which no rglob under the run dir would ever find.
+
+    ``strict=True`` FORBIDS the d.parent fallback. check_repro MUST use it:
+    without it, two seed dirs <config>/s1 and <config>/s2 both resolve to the
+    SAME config-level ranking, so the noise-floor rho is 1.0 by construction —
+    a file compared to itself. In strict mode a run dir without its OWN ranking
+    returns None, and check_repro reports SKIP (honest) instead of a fake pass.
     """
+    bases = (d,) if strict else (d, d.parent)     # run dir [, config dir]
     subs = ("", "xseed", "analysis", "cross_seed_report")
-    for base in (d, d.parent):                    # run dir, then config dir
+    for base in bases:
         for sub in subs:
             for name in RANKING_NAMES:
                 p = (base / sub / name) if sub else (base / name)
                 if p.exists():
                     return p
-    hits = sorted(d.rglob(RANKING_NAMES[0])) or sorted(d.parent.rglob(RANKING_NAMES[0]))
+    if strict:
+        hits = sorted(d.rglob(RANKING_NAMES[0]))
+    else:
+        hits = sorted(d.rglob(RANKING_NAMES[0])) or sorted(d.parent.rglob(RANKING_NAMES[0]))
     return hits[0] if hits else None
 
 
-def _load_ranking(d: Path) -> pd.DataFrame | None:
-    p = _find_ranking(d)
+def _load_ranking(d: Path, strict: bool = False) -> pd.DataFrame | None:
+    p = _find_ranking(d, strict=strict)
     if p is None:
         return None
     r = pd.read_csv(p, sep="\t", low_memory=False)
@@ -108,10 +118,15 @@ def check_repro(a: Path, b: Path) -> dict:
     """Rank correlation between two runs. If configs are identical, this is the
     NOISE FLOOR: any ablation effect weaker than it is unattributable."""
     from scipy.stats import spearmanr
-    ra, rb = _load_ranking(a), _load_ranking(b)
+    # strict: each run dir must have its OWN ranking. Otherwise both seeds fall
+    # back to the shared config ranking and rho=1.0 is a file-vs-itself artefact.
+    ra, rb = _load_ranking(a, strict=True), _load_ranking(b, strict=True)
     if ra is None or rb is None:
         return {"check": "repro", "status": "SKIP",
-                "detail": f"ranking absent ({'A' if ra is None else 'B'})"}
+                "detail": ("aucun ranking PAR RUN (layout Snakemake = 1 ranking "
+                           "cross-seed par config, pas par seed) => plancher de "
+                           "bruit NON mesurable ici ; relancer 2× la MÊME config "
+                           "pour l'obtenir")}
     common = ra.index.intersection(rb.index)
     rho = float(spearmanr(ra.loc[common, "driver_score"],
                           rb.loc[common, "driver_score"])[0])
@@ -124,8 +139,9 @@ def check_repro(a: Path, b: Path) -> dict:
     same_cfg, cfg_diff = None, []
     if ca.exists() and cb.exists():
         ja, jb = json.load(open(ca)), json.load(open(cb))
+        # seed & run_tag legitimately differ between two runs of the SAME config
         cfg_diff = sorted(k for k in set(ja) & set(jb)
-                          if ja[k] != jb[k] and k != "run_tag")
+                          if ja[k] != jb[k] and k not in ("run_tag", "seed"))
         same_cfg = not cfg_diff and set(ja) == set(jb)
 
     status = "OK"
