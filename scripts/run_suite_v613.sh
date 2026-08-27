@@ -15,7 +15,13 @@
 # =============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
-PY=/home/USER/miniforge3/envs/gnn/bin/python
+# Interpreter carrying torch + torch-geometric. This used to be a hardcoded path
+# into one machine's conda prefix, which made the suite unrunnable anywhere else.
+# The suite spawns sub-processes that do not necessarily inherit a `conda
+# activate`, so point SUITE_PY at the right interpreter when `python` on PATH has
+# no torch: SUITE_PY=/path/to/env/bin/python bash scripts/run_suite_v613.sh
+PY="${SUITE_PY:-$(command -v python3 || command -v python)}"
+[ -x "$PY" ] || { echo "no python found — export SUITE_PY" >&2; exit 1; }
 export ANALYSIS_PY="$PY" ANALYSIS_TORCH_PY="$PY"
 ROOT=output/gnn_vgae/V6.1.3
 COEXPR=data/pyscenic/diff_coexpr/coexpr_diff.tsv

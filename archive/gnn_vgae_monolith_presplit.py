@@ -582,7 +582,7 @@ print()
 # Sert de défaut PORTABLE (local ET clone cluster), tout reste surchargeable env.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LAB_DIR = os.environ.get(
-    "GNN_LAB_DIR", "/LAB-DATA/GLiCID/users/USER@univ-nantes.fr/")
+    "GNN_LAB_DIR", "/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER}/")
 # BASE_DIR : défaut = racine du repo (data co-localisée avec le code). Sur GLiCID,
 # le clone est sous LAB-DATA → _REPO_ROOT pointe déjà au bon endroit.
 BASE_DIR = os.environ.get("GNN_BASE_DIR", _REPO_ROOT)
@@ -628,8 +628,8 @@ OMNIPATH_CACHE_DIR = (CLI_ARGS.omnipath_cache_dir
 # HUMESS_DIR pointe vers les sorties HuMess pour les HUVEC.
 HUMESS_DIR = os.environ.get(
     "GNN_HUMESS_DIR", os.path.join(LAB_DIR, "humess", "output_huvec"))
-# Local fallback si la structure diffère :
-# HUMESS_DIR = "/home/USER/M2/S2/Stage/Projet_Colin/humess/output_huvec"
+# Local fallback si la structure diffère : exporter GNN_HUMESS_DIR vers le
+# répertoire de sorties HuMess (…/humess/output_huvec).
 # Les deux conditions HuMess à comparer. Configurable (généralisation V6 : un
 # dataset bulk a ses propres conditions, ex. "pro,sen") via env GNN_HUMESS_CONDITIONS.
 # Défaut HUVEC = P4,P16 (rétro-compat). Doivent matcher HUMESS_DIR/models/<cond>/.
