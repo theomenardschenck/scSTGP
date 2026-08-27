@@ -1,6 +1,6 @@
-# Généralisation — ce qui, dans (sc)STGP, est encore lié à la sénescence
+# Généralisation — ce qui, dans stateshift, est encore lié à la sénescence
 
-(sc)STGP = *State Transition Gene Prediction*. La méthode prend deux états
+stateshift = *State Transition Gene Prediction*. La méthode prend deux états
 cellulaires et prédit les gènes qui **pilotent** le passage de l'un à l'autre.
 L'application de référence est la sénescence réplicative endothéliale (HUVEC
 P4 → P16), mais rien dans la méthode n'y est propre.
@@ -31,7 +31,7 @@ réponse qu'on lui demande.
 | Conditions HuMess | `GNN_HUMESS_CONDITIONS` |
 | Matrice / métadonnées | `GNN_EXPR_MATRIX`, `GNN_GROUP_META` |
 | Définition de l'axe | `perturbation.axis: phenotypic \| de \| effector` — l'axe DE-ancré ne demande qu'une table DE au schéma canonique |
-| Schéma DE | `stgp.data.loaders.de_schema` : détection automatique des colonnes, `<A>_vs_<B>` arbitraire, sc et bulk indifféremment |
+| Schéma DE | `stateshift.data.loaders.de_schema` : détection automatique des colonnes, `<A>_vs_<B>` arbitraire, sc et bulk indifféremment |
 | Sources du graphe | chaque source est activable/désactivable (`--no-coexpr`, `--no-humess`, `--omnipath-edges`, …) |
 
 ### Encore lié à la sénescence
