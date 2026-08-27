@@ -37,6 +37,34 @@ def python_exe() -> str:
     return str(local) if local.exists() else sys.executable
 
 
+def _can_import_torch(python_exe: str) -> bool:
+    """Does THAT interpreter have torch? (not the one running pytest)"""
+    try:
+        proc = subprocess.run(
+            [python_exe, "-c", "import torch"],
+            capture_output=True, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+@pytest.fixture(scope="session")
+def python_has_torch(python_exe: str) -> bool:
+    """Whether the subprocess interpreter can import torch.
+
+    Deliberately about ``python_exe``, not ``sys.executable``: the two differ
+    exactly when ``.venv-local`` exists, which is the case that used to hide the
+    problem. On the author's machine ``.venv-local`` carries torch and every CLI
+    answers ``--help``; on a fresh clone it does not exist, the fallback
+    interpreter has no torch, and eight entry points that ``import torch`` at
+    module level exited 1. The suite must report that as "not exercised here",
+    not as a failure — installing torch is opt-in (``pip install .[torch]``) and
+    CI deliberately skips it.
+    """
+    return _can_import_torch(python_exe)
+
+
 @pytest.fixture(scope="session")
 def snakemake_exe() -> str:
     exe = shutil.which("snakemake")

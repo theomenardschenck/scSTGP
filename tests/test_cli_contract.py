@@ -22,9 +22,18 @@ SCRIPTS = cli_scripts()
 
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda p: p.stem)
-def test_cli_help(python_exe, repo_root, script):
+def test_cli_help(python_exe, python_has_torch, repo_root, script):
     proc = run_script(python_exe, script, "--help", timeout=300)
     rel = script.relative_to(repo_root)
+
+    # Torch is an opt-in extra (`pip install '.[torch]'`) and CI deliberately
+    # runs without it, so "this entry point needs torch and torch is absent" is
+    # not-exercised, not a failure. The condition is read off the ACTUAL error
+    # rather than guessed from the source, because the dependency is often
+    # transitive: run_signed_auc_gate.py imports test_signed_auc, which imports
+    # torch. A static scan of the file itself would have missed it.
+    if not python_has_torch and "No module named 'torch'" in proc.stderr:
+        pytest.skip(f"{rel} exige torch (absent de {python_exe})")
     assert proc.returncode == 0, (
         f"{rel} --help sort en {proc.returncode}\n"
         f"--- stderr (fin) ---\n{proc.stderr[-1500:]}"
