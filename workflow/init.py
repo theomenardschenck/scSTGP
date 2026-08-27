@@ -106,9 +106,24 @@ def main():
     ap = argparse.ArgumentParser(description="Assistant de config du pipeline VGAE.")
     ap.add_argument("--preset", choices=list(PRESETS), default=None,
                     help="démarre sur un préréglage (quick|full)")
+    ap.add_argument("--out-dir", default=None, metavar="DIR",
+                    help="où écrire les configs (défaut : workflow/config/ dans un "
+                         "clone, ./stateshift-configs/ depuis un paquet installé)")
     args = ap.parse_args()
 
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # racine du dépôt
+
+    # Destination des configs. Depuis un paquet installé, `repo` pointe dans
+    # site-packages : y écrire serait au mieux invisible, au pire impossible
+    # selon les droits. On bascule alors sur le répertoire de travail, qui est
+    # le seul endroit dont l'utilisateur est propriétaire à coup sûr.
+    if args.out_dir:
+        cfg_dir = os.path.abspath(args.out_dir)
+        in_clone = False
+    else:
+        clone_cfg = os.path.join(repo, "workflow", "config")
+        in_clone = os.path.isfile(os.path.join(repo, "pyproject.toml"))
+        cfg_dir = clone_cfg if in_clone else os.path.abspath("stateshift-configs")
 
     print("\n" + "=" * 64)
     print("  Assistant de configuration — pipeline VGAE (priorisation gènes)")
@@ -424,7 +439,7 @@ comparison:
 output:
   generate_html_report: false
 """
-        out_path = os.path.join(repo, "workflow", "config", f"config.{_tag}.yaml")
+        out_path = os.path.join(cfg_dir, f"config.{_tag}.yaml")
         if os.path.exists(out_path) and not ask_yesno(
                 f"\n{out_path} existe déjà — écraser ?", default=False):
             print(f"  Ignoré : config.{_tag}.yaml")
@@ -432,7 +447,9 @@ output:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(cfg)
-        written.append(os.path.relpath(out_path, repo))
+        # Chemin relatif au répertoire COURANT : c'est celui que l'utilisateur
+        # va recopier dans sa commande de lancement.
+        written.append(os.path.relpath(out_path, os.getcwd()))
 
     # ── Récap + prochaines étapes ─────────────────────────────────────────
     print("\n" + "=" * 64)
@@ -441,14 +458,18 @@ output:
         print(f"       {_r}")
     print("=" * 64)
     if written:
+        # Un clone dispose de run.sh ; un paquet installé n'a que la commande
+        # console. On n'affiche que ce qui marchera réellement chez le lecteur.
+        launch = "bash workflow/run.sh" if in_clone else "stateshift run"
         print("  Lancer (par config) :")
-        print(f"    bash workflow/run.sh --configfile {written[0]} --dry-run   # vérifie le DAG")
-        print(f"    bash workflow/run.sh --configfile {written[0]}")
+        print(f"    {launch} --configfile {written[0]} --dry-run   # vérifie le DAG")
+        print(f"    {launch} --configfile {written[0]}")
         if len(written) > 1:
             print("    # étude d'ablation → répéter pour chaque config, ex. :")
-            print(f"    for c in workflow/config/config.{name}*.yaml; do bash workflow/run.sh --configfile \"$c\"; done")
+            print(f"    for c in {os.path.relpath(cfg_dir, os.getcwd())}/config.{name}*.yaml; "
+                  f"do {launch} --configfile \"$c\"; done")
     if backend == "cluster":
-        print("    (cluster) adapte la partition/QOS dans workflow/profiles/slurm/config.yaml")
+        print("    (cluster) adapte la partition/QOS : `stateshift profile --edit`")
         print("    (cluster) export GNN_OUT_DIR_BASE=/scratch/.../output pour écrire sur scratch")
     if rna == "bulk" and build_enabled:
         print("    ⚠️  bulk : si coexpr/HuMess ne sont pas précalculés, le stage build")

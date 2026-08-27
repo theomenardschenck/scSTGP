@@ -1,16 +1,31 @@
 # ============================================================================
-# Snakefile — Prep data-dérivée GSE252921 (single-nucleus, système externe).
-# Produit les 3 entrées que consomme le graphe V6 (build_graph / gnn_vgae) :
+# Snakefile — Preprocess GÉNÉRIQUE data-adaptatif → 3 entrées du graphe V6 :
 #   1. coexpr_diff.tsv                 (GRNBoost2-local différentiel baseline/advanced)
 #   2. SCENIC regulon_edges + mean_TF_activity   (pySCENIC ctx + AUCell)
 #   3. HuMess cs_gene_to_importance_{baseline,advanced}.tsv  (modèle métabolique)
 # Chaîne : extract(tar→RDS) → export(RDS→mtx+pseudobulk) → mtx→expr_csv
 #          → {coexpr, SCENIC, HuMess}.
 #
-# Paramétré par --configfile (config.endo.yaml / config.oligo.yaml).
+# Config = généré par le WIZARD `workflow/preprocess/init.py` (situe les données
+# de l'utilisateur + décrit les groupes) → config.<dataset>.yaml.
+#
+# ── DÉCOUPAGE LOCAL/CLUSTER (contrainte dure : HuMess exige cplex = LOCAL) ────
+#   • `humess` est une localrule → JAMAIS soumise à SLURM (tourne sur l'hôte
+#     qui lance snakemake). Ses I/O sont petites (abundance_table+samplesheet →
+#     cs_gene_to_importance ~80 Ko).
+#   • Tout-en-local (petites données + cplex) :  snakemake ... -j 8
+#   • Split (grosses données / compute lourd) :
+#       - CLUSTER : snakemake ... --profile workflow/profiles/slurm --omit-from humess
+#                   (extract/export/coexpr/SCENIC en jobs SLURM)
+#       - LOCAL   : snakemake ... -j 4 <humess cs targets>   (HuMess seul, cplex)
+#     Les 2 sorties vivent dans le même data/ → à synchroniser entre machines.
+#
 # Doit tourner depuis la racine du dépôt (chemins relatifs à gnn_huvec/).
 # ============================================================================
 import os
+
+# HuMess = cplex = local uniquement : jamais un job SLURM (cf. en-tête).
+localrules: humess
 
 C          = config
 DATASET    = C["dataset"]

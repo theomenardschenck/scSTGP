@@ -1,7 +1,7 @@
 # ============================================================================
 # Config workflow PRINCIPAL — GSE252921 endo (EC AD vs CT), système externe sn.
 # Pipeline complet : build_graph → train ×seeds → perturb → cross-seed →
-# validation → report. Consomme les 3 inputs produits par prep_gse252921.
+# validation → report. Consomme les 3 inputs produits par preprocess.
 #
 # Lancer (cluster) :
 #   bash workflow/run.sh --backend cluster \
@@ -35,7 +35,7 @@ input:
   rna_type: scrna             # snRNA traité comme scRNA (cellule-niveau)
   degs_path: "data/pyscenic/GSE252921_endo/DEGs_AD_vs_CT.tsv"
 
-# Stage 0 OFF : coexpr/SCENIC/HuMess = inputs EXTERNES (produits par prep_gse252921).
+# Stage 0 OFF : coexpr/SCENIC/HuMess = inputs EXTERNES (produits par preprocess).
 build:
   enabled: false
 
