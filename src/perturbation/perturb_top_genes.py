@@ -579,8 +579,28 @@ def _load_model_and_baseline(run_dir: Path, hidden: int, latent: int,
         _sel = [n for n, m in zip(_fn, feature_mask.tolist()) if m]
         print(f"  [perturb-features] intervention restreinte à {len(_sel)}/"
               f"{len(_fn)} colonnes : {_sel}")
-    reactome = _load_gmt()
-    background = _load_bg()
+    # The Reactome collection lives under data/databases/, which is NOT
+    # versioned (it is a redistributable-restricted MSigDB file). It is used
+    # here only to ANNOTATE results with pathway names — never to rank, and
+    # never for the ORA statistic, where a missing collection stays fatal on
+    # purpose. Making it mandatory meant the pipeline could not run on any
+    # clone, which is exactly what the toy-dataset run exists to prove.
+    try:
+        reactome = _load_gmt()
+    except FileNotFoundError:
+        print("  [pathways] collection Reactome absente (data/databases/) — "
+              "annotation de voies désactivée, le classement est inchangé.")
+        reactome = {}
+    # Same story for the ORA background: by default it is read from a HUVEC
+    # bulk DE table under data/, which no clone has and which is meaningless
+    # for another dataset anyway. The run's own gene universe is both the
+    # correct universe for this analysis and always available.
+    try:
+        background = _load_bg()
+    except FileNotFoundError:
+        background = set(gene_symbols)
+        print(f"  [pathways] table DE de fond absente — univers du run utilisé "
+              f"({len(background)} gènes).")
     print(f"Loaded run ({len(gene_symbols)} genes); baseline computed; "
           f"group_expression={'OK' if group_expr is not None else 'absent'}; "
           f"axes={'OK' if axis_global is not None else 'absent'}; "

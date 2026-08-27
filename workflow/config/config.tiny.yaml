@@ -85,6 +85,12 @@ scoring:
 
 validation:
   ora_top_n: 10
+  # The toy fixture generates its own gene-set collection (make_tiny_dataset.py
+  # writes data_tiny/databases/). Pointing at it explicitly is what lets the
+  # ORA rule RUN on the toy dataset instead of dying on the unversioned
+  # data/databases/ collection that no clone has.
+  ora:
+    reactome_gmt: "data_tiny/databases/c2.cp.reactome.symbols.gmt"
   decoy:
     enabled: false
     top_n: 5

@@ -223,6 +223,12 @@ if AXIS_COMPARE and not CACHE_DELTA_Z:
 
 SCORING        = config["scoring"]
 ORA_TOP_N      = config["validation"]["ora_top_n"]
+# Explicit gene-set collection for the ORA rule. The default collections live
+# under data/databases/, which is NOT versioned (MSigDB redistribution terms),
+# so on any clone the rule had no collection to read and died. Pointing at one
+# is what lets the toy dataset exercise the ORA for real instead of skipping it.
+ORA_GMT        = str((config["validation"].get("ora") or {})
+                    .get("reactome_gmt", "") or "").strip()
 DECOY_ON       = config["validation"]["decoy"]["enabled"]
 DECOY_TOP_N    = config["validation"]["decoy"]["top_n"]
 # V6.2 (LOG §25bis) : n>=50 obligatoire — a n=3-5 les SD sont sous-estimees ~10x
@@ -760,8 +766,10 @@ rule ora_top_drivers:
         reactome=ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_reactome.tsv"),
         aging=ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_aging.tsv"),
         genes=ANALYSIS_DIR / "interpret" / "ora" / ("top" + str(ORA_TOP_N) + "_drivers.txt"),
+        universe=ANALYSIS_DIR / "interpret" / "ora" / "universe.txt",
     params:
         top_n=ORA_TOP_N,
+        gmt=("--gmt " + ORA_GMT) if ORA_GMT else "",
     log:
         LOG_DIR / "ora_top_drivers.log",
     shell:
@@ -774,9 +782,16 @@ rule ora_top_drivers:
         # le top-N avec awk (lit tout le flux, pas de fermeture précoce).
         "tail -n +2 {input.ranking} | sort -t$'\\t' -k2,2 -gr | "
         "awk -F'\\t' -v n={params.top_n} 'NR<=n{{print $1}}' > {output.genes} 2> {log} && "
+        # ORA universe = the genes THIS run actually scored. The default was a
+        # hardcoded HUVEC bulk DE table under data/, absent from every clone and
+        # meaningless for any other dataset; testing a top-N against a universe
+        # it does not belong to is also the wrong statistic.
+        "cut -f1 {input.ranking} | tail -n +2 > {output.universe} 2>> {log} && "
         "{PY} {SRC}/validation/ora/ora_consensus.py --genes {output.genes} "
-        "--db reactome --out {output.reactome} &>> {log} && "
+        "--background {output.universe} "
+        "--db reactome {params.gmt} --out {output.reactome} &>> {log} && "
         "{PY} {SRC}/validation/ora/ora_consensus.py --genes {output.genes} "
+        "--background {output.universe} "
         "--db aging --out {output.aging} &>> {log}"
 
 

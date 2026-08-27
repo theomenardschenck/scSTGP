@@ -476,6 +476,13 @@ def main():
                     help="Gene-set collection to test against (default: reactome). "
                          "reactome/kegg/hallmark = the three ShinyGO-comparable "
                          "pathway collections; aging = the senescence catalogues.")
+    ap.add_argument("--gmt", type=str, default=None,
+                    help="Chemin explicite d'une collection .gmt. Court-circuite "
+                         "le chemin déduit de --db. Les collections vivent sous "
+                         "data/databases/, qui n'est pas versionné : sans cette "
+                         "option, l'outil n'est utilisable que sur une machine "
+                         "où elles ont été téléchargées à la main, et le jeu "
+                         "jouet ne peut pas exercer l'ORA du tout.")
     ap.add_argument("--background", type=str, default=None,
                     help="Optional background file (gene_ranking_vgae.csv or plain "
                          "text). Default: DE table; if --consensus-runs is used and "
@@ -510,7 +517,9 @@ def main():
 
     # Resolve the gene set dictionary.
     print(f"Loading {args.db} gene sets and background ...")
-    if args.db == "reactome":
+    if args.gmt:
+        gene_sets = load_gmt(Path(args.gmt))
+    elif args.db == "reactome":
         gene_sets = load_reactome_gmt()
     elif args.db == "kegg":
         gene_sets = load_gmt(KEGG_GMT_PATH)

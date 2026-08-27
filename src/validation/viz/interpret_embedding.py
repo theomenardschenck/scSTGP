@@ -983,17 +983,34 @@ def main():
         summary = None
         print("[interpret] --umap-only : ORA/ShinyGO/PNG sautés")
     else:
-        summary = per_community_ora(labels, intra, args.min_community_size, score=score)
-        summary.to_csv(out_dir / "community_summary.tsv", sep="\t", index=False)
-        print(f"[interpret] wrote community_summary.tsv ({len(summary)} communautés ; "
-              f"{int(summary['is_novel'].sum())} sans pathway significatif)")
+        # The gene-set collections live under data/databases/, which is not
+        # versioned. Missing collection stays fatal inside ora_consensus — an
+        # ORA run against an empty collection would report "no enrichment" —
+        # but here the right answer is to SKIP the ORA, not to kill the run:
+        # this is the same state `--umap-only` already produces, and the code
+        # below is written for `summary is None`.
+        try:
+            summary = per_community_ora(labels, intra, args.min_community_size,
+                                        score=score)
+        except FileNotFoundError as exc:
+            summary = None
+            print(f"[interpret] ORA sautée — {exc}".replace("\n", " "))
+        else:
+            summary.to_csv(out_dir / "community_summary.tsv", sep="\t", index=False)
+            print(f"[interpret] wrote community_summary.tsv ({len(summary)} communautés ; "
+                  f"{int(summary['is_novel'].sum())} sans pathway significatif)")
 
     comm_tbl = pd.DataFrame({"community": labels, "intra_degree": intra.round(3)})
 
     if not args.no_umap:
         xy = precomp_xy if precomp_xy is not None else run_umap(emb, args.n_neighbors, args.seed)
         comm_tbl = comm_tbl.join(xy)
-        reactome = ora.load_reactome_gmt()
+        # Colouring the UMAP by pathway is an enrichment of the figure, not a
+        # requirement of it: without the collection the map is still drawn.
+        try:
+            reactome = ora.load_reactome_gmt()
+        except FileNotFoundError:
+            reactome = {}
         # liste de pathways à colorer (summary si dispo, sinon top-drivers/curé)
         if args.pathways:
             pw_list = [p.strip() for p in args.pathways.split(",") if p.strip()]
