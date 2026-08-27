@@ -48,6 +48,12 @@ omics = ["scanpy>=1.11", "anndata>=0.12", "omnipath>=1.0.7"]
 # snakemake ne déclare qu'un `pulp` non borné, donc le pin nous revient.
 workflow = ["snakemake==7.32.4", "pulp<2.8"]
 optim = ["optuna>=4.0"]
+# `interpret_embedding` — a rule of the standard DAG, not an optional extra —
+# imports umap. It was pinned in environment.yml (umap-learn=0.5) but declared
+# nowhere here, so a pip-only install resolved the whole DAG and then died in
+# that rule. Same family as the snakemake-minimal name: the conda env was the
+# real source of truth and pyproject had drifted from it.
+viz = ["umap-learn>=0.5"]
 dev = ["pytest>=8.0", "pytest-timeout>=2.3", "ruff>=0.6"]
 # Raccourci recommandé : tout ce qu'exige un run réel. Sans lui, l'utilisateur
 # doit deviner que le pipeline a besoin de torch ET de snakemake, et il ne le
@@ -57,6 +63,7 @@ run = [
     "scanpy>=1.11", "anndata>=0.12", "omnipath>=1.0.7",
     "snakemake==7.32.4", "pulp<2.8",
     "optuna>=4.0",
+    "umap-learn>=0.5",
 ]
 
 [project.urls]

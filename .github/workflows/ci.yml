@@ -71,7 +71,12 @@ jobs:
           # 7.32 est épinglé : Snakemake 8/9 a changé le plumbing de l'exécuteur
           # SLURM, et le profil workflow/profiles/slurm suit la syntaxe 7.x
           # (clé `cluster:`). Migrer est un chantier à part.
-          pip install -e '.[dev]' 'snakemake-minimal==7.32.4' pulp==2.7.0
+          # `snakemake-minimal` is the CONDA name and does NOT exist on PyPI:
+          # this line failed at install, so both Snakemake jobs were red before
+          # running a single test. The pin now comes from the `workflow` extra
+          # in pyproject.toml, which already carries the correct pip name and
+          # the `pulp<2.8` bound — one declaration instead of two that drift.
+          pip install -e '.[dev,workflow]'
 
       - name: Le DAG se résout, validations comprises
         run: pytest tests/test_workflow.py -q
@@ -120,7 +125,7 @@ jobs:
           pip install -e '.[dev]'
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install torch-geometric
-          pip install 'snakemake-minimal==7.32.4' pulp==2.7.0
+          pip install -e '.[workflow,viz]'   # cf. the DAG job: conda name, not PyPI
 
       - name: Générer le jeu jouet et lancer le pipeline
         run: pytest tests/test_end_to_end_tiny.py -q -m slow
