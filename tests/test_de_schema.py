@@ -1,4 +1,4 @@
-"""Unit tests for the DE schema layer (`stgp.data.loaders.de_schema`).
+"""Unit tests for the DE schema layer (`stateshift.data.loaders.de_schema`).
 
 Why this module and not another: `select_de_anchors` defines the poles of the
 DE-anchored axis, and the axis is what the whole driver score is projected
@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from stgp.data.loaders.de_schema import (
+from stateshift.data.loaders.de_schema import (
     detect_column,
     select_de_anchors,
     validate_condition_label,

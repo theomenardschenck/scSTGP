@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "scstgp"
+name = "stateshift"
 version = "0.1.0"
-description = "(sc)STGP — State Transition Gene Prediction: heterogeneous VGAE + in-silico perturbation for prioritising genes that drive a cell-state transition"
+description = "State Transition Gene Prediction: heterogeneous VGAE + in-silico perturbation for prioritising genes that drive a cell-state transition"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
@@ -36,57 +36,123 @@ dependencies = [
 [project.optional-dependencies]
 torch = ["torch>=2.11", "torch-geometric>=2.7"]
 omics = ["scanpy>=1.11", "anndata>=0.12", "omnipath>=1.0.7"]
-workflow = ["snakemake-minimal==7.32.4"]
+# ATTENTION au nom : `snakemake-minimal` est un paquet CONDA (bioconda) et
+# n'existe PAS sur PyPI — le déclarer ici rendait `pip install stateshift[run]`
+# ininstallable. Côté pip c'est `snakemake`. `environment.yml` garde, lui,
+# `snakemake-minimal` : c'est le nom correct dans le monde conda.
+# Version épinglée en 7.x : le profil SLURM livré utilise la clé `cluster:`,
+# qui a disparu de la syntaxe 8.x.
+# `pulp<2.8` n'est pas décoratif : snakemake 7.32 appelle `pulp.list_solvers`,
+# supprimé en pulp 2.8. Sans ce pin, pip résout pulp 3.x et `snakemake
+# --version` lui-même plante — vérifié dans un venv neuf le 2026-08-14.
+# snakemake ne déclare qu'un `pulp` non borné, donc le pin nous revient.
+workflow = ["snakemake==7.32.4", "pulp<2.8"]
 optim = ["optuna>=4.0"]
 dev = ["pytest>=8.0", "pytest-timeout>=2.3", "ruff>=0.6"]
+# Raccourci recommandé : tout ce qu'exige un run réel. Sans lui, l'utilisateur
+# doit deviner que le pipeline a besoin de torch ET de snakemake, et il ne le
+# découvre qu'au premier échec — au milieu du DAG.
+run = [
+    "torch>=2.11", "torch-geometric>=2.7",
+    "scanpy>=1.11", "anndata>=0.12", "omnipath>=1.0.7",
+    "snakemake==7.32.4", "pulp<2.8",
+    "optuna>=4.0",
+]
 
 [project.urls]
-Repository = "https://github.com/theomenardschenck/gnn_huvec"
+Repository = "https://github.com/theomenardschenck/scSTGP"
+Documentation = "https://github.com/theomenardschenck/scSTGP/tree/main/docs/guide"
+
+# Point d'entrée console UNIQUE. Il ne remplace pas le mode script : il le
+# localise. `stateshift run` retrouve le Snakefile EMBARQUÉ dans le paquet et
+# lance exactement la même chaîne que `bash workflow/run.sh`, depuis n'importe
+# quel répertoire de travail — ce que run.sh ne peut pas faire, puisqu'il se
+# repère par `dirname $0` et exige donc un clone.
+[project.scripts]
+stateshift = "stateshift.cli:main"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mise en paquet SANS DÉPLACER DE FICHIER.
 #
-# `package-dir = {"stgp" = "src"}` fait de src/ le paquet importable `stgp`,
-# ce qui laisse intacts tous les chemins en dur du Snakefile et des scripts
-# SLURM (`src/gnn/gnn_vgae.py`, …). Déplacer l'arborescence aurait cassé les
-# 20 scripts cluster et le Snakefile pour un bénéfice purement cosmétique.
+# `package-dir = {"stateshift" = "src"}` fait de src/ le paquet importable
+# `stateshift`, ce qui laisse intacts tous les chemins en dur du Snakefile et
+# des scripts SLURM (`src/gnn/gnn_vgae.py`, …). Déplacer l'arborescence aurait
+# cassé les 20 scripts cluster et le Snakefile pour un bénéfice cosmétique.
 #
 # Conséquence assumée — DEUX modes d'import coexistent :
 #   • mode script   : `python src/gnn/gnn_vgae.py …` — imports plats
 #                     (`from _config import …`) via le bootstrap sys.path.
 #                     C'est le mode du cluster et du Snakefile. Inchangé.
-#   • mode paquet   : `import stgp.data.loaders.bulk_rna` — après
-#                     `pip install -e .`. C'est le mode des tests et de tout
+#   • mode paquet   : `import stateshift.data.loaders.bulk_rna` — après
+#                     `pip install`. C'est le mode des tests et de tout
 #                     code nouveau. Il RÉPARE les loaders V6 (bulk_rna /
 #                     proteomics), qui utilisent des imports relatifs et
 #                     étaient donc inutilisables faute de __init__.py.
+#
+# `stateshift.workflow` mappe le répertoire workflow/ : le Snakefile, les
+# configs et le profil SLURM VOYAGENT avec le paquet. Sans ça, `pip install`
+# livrerait la bibliothèque sans le pipeline, et l'outil serait inutilisable
+# hors d'un clone — c'est-à-dire inutilisable tout court pour un tiers.
 # ─────────────────────────────────────────────────────────────────────────────
 # La liste est EXPLICITE et non auto-découverte : avec `packages.find`,
 # setuptools installe src/gnn, src/data… comme paquets RACINE (un `import data`
 # global qui masquerait n'importe quoi). Vérifié le 2026-07-27.
 # src/coexpr_benchmark est volontairement absent : ses fichiers ont un nom
 # préfixé par un chiffre (03_compare.py), donc non importables par construction.
+# src/validation/figures est absent pour une autre raison : il ne contient que
+# les figures d'un mémoire précis, produites depuis des résultats non publiés.
+# Le répertoire est gitignoré et reste utilisable en local via
+# workflow/rules/memoire.local.smk ; le livrer ferait entrer dans la roue un
+# code sans données pour le nourrir.
 [tool.setuptools]
-package-dir = { "stgp" = "src" }
+package-dir = { "stateshift" = "src", "stateshift.workflow" = "workflow" }
 packages = [
-    "stgp",
-    "stgp.gnn",
-    "stgp.optim",
-    "stgp.data",
-    "stgp.data.extract",
-    "stgp.data.loaders",
-    "stgp.data.preprocess",
-    "stgp.perturbation",
-    "stgp.validation",
-    "stgp.validation.cluster",
-    "stgp.validation.explain",
-    "stgp.validation.ora",
-    "stgp.validation.probe",
-    "stgp.validation.qc",
-    "stgp.validation.reports",
-    "stgp.validation.schema",
-    "stgp.validation.viz",
+    "stateshift",
+    "stateshift.gnn",
+    "stateshift.optim",
+    "stateshift.data",
+    "stateshift.data.extract",
+    "stateshift.data.loaders",
+    "stateshift.data.preprocess",
+    "stateshift.perturbation",
+    "stateshift.validation",
+    "stateshift.validation.cluster",
+    "stateshift.validation.explain",
+    "stateshift.validation.ora",
+    "stateshift.validation.probe",
+    "stateshift.validation.qc",
+    "stateshift.validation.reports",
+    "stateshift.validation.schema",
+    "stateshift.validation.viz",
+    "stateshift.workflow",
 ]
+
+# Le Snakefile n'est pas du code importable : sans cette section il serait
+# absent de la roue, et `stateshift run` n'aurait rien à exécuter.
+[tool.setuptools.package-data]
+"stateshift.workflow" = [
+    "Snakefile",
+    "config/*.yaml",
+    "profiles/slurm/*",
+    "rules/*.smk",
+]
+
+# DEUX fuites distinctes vers la distribution, toutes deux vérifiées le
+# 2026-08-17 en inspectant la roue construite (`python -m build --wheel`) :
+#
+#  1. `rules/*.smk` ci-dessus ratisse le SYSTÈME DE FICHIERS, pas l'index git :
+#     une roue construite sur la machine de l'auteur embarquait les extensions
+#     locales que `.gitignore` retient (règles du mémoire).
+#  2. `include-package-data` vaut TRUE par défaut dès qu'on configure par
+#     pyproject.toml. Retirer `stateshift.validation.figures` de `packages` ne
+#     suffisait donc pas : le répertoire revenait comme *données* du paquet
+#     parent `stateshift.validation`, memoire_figures.py compris.
+#
+# Le `.gitignore` protège le DÉPÔT, ce bloc protège la DISTRIBUTION. Les deux
+# sont nécessaires : ni l'un ni l'autre ne couvre le cas de l'autre.
+[tool.setuptools.exclude-package-data]
+"stateshift.workflow" = ["rules/*.local.smk"]
+"stateshift.validation" = ["figures/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

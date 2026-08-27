@@ -53,7 +53,16 @@ def tiny_run(repo_root, python_exe, tmp_path_factory):
     )
     assert gen.returncode == 0, gen.stderr[-2000:]
 
-    env = {"GNN_ALLOW_DOWNLOADS": "0", "MPLBACKEND": "Agg"}
+    # Pin the interpreter the rules will use. Without this the Snakefile falls
+    # back on `compute.python: "python"`, i.e. whatever the ambient PATH points
+    # at — routinely another project's venv, with no torch. The suite must test
+    # the pipeline, not the developer's shell.
+    env = {
+        "GNN_ALLOW_DOWNLOADS": "0",
+        "MPLBACKEND": "Agg",
+        "STATESHIFT_PYTHON": python_exe,
+        "STATESHIFT_PYTHON_TORCH": python_exe,
+    }
     import os
     full_env = {**os.environ, **env}
     proc = subprocess.run(

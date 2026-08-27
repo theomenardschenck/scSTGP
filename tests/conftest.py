@@ -1,4 +1,4 @@
-"""Shared fixtures for the (sc)STGP test-suite.
+"""Shared fixtures for the stateshift test-suite.
 
 Design note — why so much subprocess: several modules of this code base do real
 work at import time (``gnn_vgae.py`` parses the CLI at module level;
@@ -62,6 +62,14 @@ def run_script(python_exe: str, script: Path, *args: str, timeout: int = 180):
     )
 
 
+# ``cli.py`` is the console entry point: it is invoked as ``stateshift`` or
+# ``python -m stateshift.cli``, never as a loose file, and it uses package-
+# relative imports accordingly. The script-mode contract below does not apply to
+# it — its equivalent guarantee is ``test_package_layout.py::test_cli_answers``,
+# which exercises it the way users actually reach it.
+PACKAGE_MODE_ONLY = {"cli.py"}
+
+
 def cli_scripts() -> list[Path]:
     """Every src/ module that looks like a command-line entry point.
 
@@ -71,6 +79,8 @@ def cli_scripts() -> list[Path]:
     found = []
     for path in sorted(REPO_ROOT.glob("src/**/*.py")):
         if path.name == "__init__.py" or "coexpr_benchmark" in path.parts:
+            continue
+        if path.name in PACKAGE_MODE_ONLY and path.parent == REPO_ROOT / "src":
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
