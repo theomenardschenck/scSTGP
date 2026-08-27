@@ -1,0 +1,87 @@
+# EndoSEN_up — endothelial senescence gene signature (upregulated).
+# Source: Guduric-Fuchs et al. 2024, Aging Cell 23(9):e14240, PMC11488300,
+#         "A new gene signature for endothelial senescence identifies self-RNA
+#          sensing by RIG-I as a molecular facilitator of vascular aging".
+# The published signature is 75 genes ("commonly upregulated in three
+# approaches of induced endothelial senescence", GSE160166). It is NOT
+# distributed as machine-readable text: Table S1 holds only the comparator
+# signatures, and the 75 genes appear only as heatmap images.
+# These 70 symbols were transcribed from the four GSEA ranking panels of
+# Supplementary Figure SF5 (union of ECFC/HRMEC × replicative/etoposide
+# senescence). 5 low-rank members are not labelled in any SF5 panel and are
+# therefore not recoverable from the figure — this file is 70/75 of EndoSEN_up.
+# Symbols are the authors' original HGNC symbols; HGNC-alias normalisation
+# (hgnc_alias) reconciles legacy names (HIST1H2BK, HIST2H4B, C1orf143, …) with
+# the graph universe at health-check time. Clone/LOC identifiers
+# (CTD-2210P24.4, LOC441178) will not map and are expected to drop.
+gene
+ABCA4
+ACYP2
+ALOX5AP
+ATP6V0A4
+ATP6V0E1
+B3GALT2
+BST2
+C15orf59
+C15orf65
+C1orf143
+C3
+CCDC81
+CCL5
+CDH13
+CDIP1
+CLEC4G
+CPQ
+CSF1
+CTD-2210P24.4
+CTSD
+DAB2
+DHX58
+DKK3
+DRAM1
+ETV7
+FBXO32
+FGF5
+FMO4
+FOLR3
+GBA
+GNPTG
+GPNMB
+HELZ2
+HES4
+HIST1H2BK
+HIST2H4B
+ICAM1
+IDUA
+IFI27
+IFI6
+ISG15
+LAMP2
+LGALS3BP
+LOC441178
+LYNX1
+PCDHA7
+PCDHB10
+PLA1A
+PLEKHO1
+PPP1R3C
+PPP2R5B
+RASD1
+RFPL4A
+RFPL4AL1
+RNASE10
+SERPINA3
+SLC2A12
+SLC41A2
+SLC6A15
+SMPD1
+SPINK13
+SSH1
+TMEM117
+TMEM132A
+TPP1
+TRIM17
+TRIM22
+TYMP
+VWA7
+WDR66

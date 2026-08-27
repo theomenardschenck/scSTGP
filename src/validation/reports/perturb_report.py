@@ -27,6 +27,18 @@ sign-aligns and averages the coherent KO/KD/OE modes (true KO+KD+OE
 scoring, gnn_futur §6.2); ``oe-only`` reproduces the legacy OE-anchored
 behaviour (V3.4–V5.4).
 
+2026-08-13 — ``driver_score`` is now **signal minus malus**, no base
+points: ``0.5 amp + 0.5 purity - 0.15 (1-coverage) - 0.10 (1-coherence)``,
+clipped to [0, 1] (same change on ``_compute_pathway_driver_score``).
+Coverage and coherence are sanity checks, so they can only ever subtract;
+previously they were convex terms handing out a constant +0.28 floor
+(``n_modes`` is 3 for every gene of every V6.1.3 view). The ranking is
+re-scaled, not rebuilt — ρ(old, new) = 0.98-0.995, 90-96 of the top-100
+retained — but the distribution moves down, so the tier cut in
+``_compute_evidence_tier`` follows: 0.5 -> 0.33 (same quantile in all four
+views, tier counts preserved within ~2 %). Runs already on disk are
+patched by ``scripts/rescore_headline.py --apply``.
+
 Artifact filter
 ---------------
 Some genes (often lncRNAs / pseudogenes like NPPA-AS1, RP1-140K8.5) move
@@ -1411,18 +1423,54 @@ def _compute_driver_score(canon_diff: float, canon_cos: float, n_modes: int,
                            total_genes: int = 10500) -> float:
     """Continuous driver score ∈ [0, 1] — graph-intrinsic only.
 
-    Aggregates only signals the GNN itself produces : amplitude
-    (log-normalized) + purity (cosine alignment with senescence axis) +
-    coverage (n_modes) + coherence (sign-consistency). External
-    literature evidence (DE-significance, aging DBs) is **not** part of
-    the driver score — it is exposed separately via `validation_score`
-    (corroboration) and inverted in `discovery_score` (graph-only
-    findings). This decoupling lets the user choose between
+    Signal minus malus, no base points::
+
+        signal = 0.50 * amp + 0.50 * purity
+        malus  = 0.15 * (1 - coverage) + 0.10 * (1 - coherence)
+        score  = clip(signal - malus, 0, 1)
+
+    Only two ingredients can *earn* points, and they weigh the same:
+    amplitude (log-normalized displacement along the axis) and purity
+    (cosine alignment with the senescence axis). Coverage (`n_modes`)
+    and coherence (sign-consistency across modes) are **sanity checks,
+    not evidence**: they can only ever cost points, never grant any. A
+    gene that moves nothing and points nowhere scores 0 no matter how
+    well it is covered.
+
+    External literature evidence (DE-significance, aging DBs) is **not**
+    part of the driver score — it is exposed separately via
+    `validation_score` (corroboration) and inverted in `discovery_score`
+    (graph-only findings). This decoupling lets the user choose between
     confirmatory and exploratory ranking.
 
-    Weights normalised to 1.0 with amplitude+purity dominant (0.72) so
-    the score reflects the graph signal first, then coverage/coherence
-    (sanity).
+    2026-08-13 — BASE POINTS REMOVED (signal/malus refactor)
+    -------------------------------------------------------
+    The previous form was a convex combination,
+    ``(0.35 amp + 0.30 purity + 0.15 coverage + 0.10 coherence) / 0.90``,
+    which handed out points for being *checkable* rather than for being
+    a driver. Measured on the four V6.1.3 views: `n_modes` is 3 for
+    **every one of the 12 527-13 173 genes**, so coverage contributed a
+    strictly constant +0.167 to the whole ranking, and coherence a
+    further +0.033 (inconsistent) to +0.111 (consistent). Median
+    published score was 0.32, of which ~0.28 was floor. The score
+    looked like it had a dynamic range it did not have, and the two
+    sanity terms — which discriminate nothing when coverage is
+    saturated — sat between the reader and the graph signal.
+
+    The refactor keeps the same four ingredients and the same relative
+    sanity weights (0.15 / 0.10), but turns them into a penalty on
+    *missing* evidence. Consequences, measured across the four views:
+    ρ(old, new) = 0.98-0.995, 90-96 of the top-100 retained (the
+    ranking is re-scaled, not rebuilt), median 0.06-0.09 instead of
+    0.32, and 2 600-4 900 genes floored at exactly 0 — those whose
+    residual signal does not clear the malus. The floored population
+    lives beyond rank ~6 000 and is not orderable in any meaningful
+    sense anyway; ordering the tail was never a property this score
+    could honestly claim.
+
+    Because the distribution moves, the absolute tier cut in
+    ``_compute_evidence_tier`` moves with it: 0.5 -> 0.33, which is the
+    same quantile (0.90 / 0.91 / 0.988 / 0.981) in all four views.
 
     2026-08-07 — CENTRALITY AND HUB ATTENUATION REMOVED
     --------------------------------------------------
@@ -1452,25 +1500,19 @@ def _compute_driver_score(canon_diff: float, canon_cos: float, n_modes: int,
     # log-normalized amplitude: log10(|x|+1) / log10(500+1) ≈ /2.7
     amp = float(min(np.log10(abs(canon_diff) + 1.0) / np.log10(501.0), 1.0))
     purity = float(min(abs(canon_cos), 1.0))
-    coverage = float(n_modes / 3.0)
+    # --- signal: the only two terms that can earn points, 50/50 ---
+    signal = 0.50 * amp + 0.50 * purity
+    # --- malus: penalise MISSING evidence, never reward its presence ---
+    coverage = float(min(max(n_modes / 3.0, 0.0), 1.0))
     if sign_cons is True:
-        coherence = 1.0
+        coherence = 1.0   # consistent across modes — no malus
     elif sign_cons is False:
-        coherence = 0.3   # low but not 0 (keeps non-monotonic candidates visible)
+        coherence = 0.0   # modes disagree — full malus
     else:
-        coherence = 0.5   # NaN (single mode) — neutral
-    # Weights renormalised to 1.0 over the four surviving ingredients
-    # (former weights summed to 0.90 once centrality was dropped).
-    # Amplitude + purity = 0.72 (graph signal core), coverage +
-    # coherence = 0.28 (sanity). `vgae_rank`/`total_genes`/`hub` are
-    # diagnostics only — see the docstring.
-    score = (
-        0.35 * amp
-        + 0.30 * purity
-        + 0.15 * coverage
-        + 0.10 * coherence
-    ) / 0.90
-    return float(min(max(score, 0.0), 1.0))
+        coherence = 0.5   # NaN (single mode) — unverifiable, half malus
+    malus = 0.15 * (1.0 - coverage) + 0.10 * (1.0 - coherence)
+    # `vgae_rank` / `total_genes` / `hub` are diagnostics only — see docstring.
+    return float(min(max(signal - malus, 0.0), 1.0))
 
 
 def _compute_discovery_score(canon_diff: float,
@@ -2034,21 +2076,28 @@ def _compute_pathway_driver_score(canon_diff: float, canon_cos: float,
 
     Same structure as gene driver_score but pathway-scaled :
     amplitude denominator = log10(500+1), no DE/VGAE/aging boost (those
-    are gene-level concepts).
+    are gene-level concepts). Kept structurally identical on purpose —
+    the two scores are read on the same scale in the reports, so the
+    2026-08-13 signal/malus refactor (see `_compute_driver_score`)
+    applies here too: amplitude and purity earn points 50/50, coverage
+    and coherence can only subtract. The pathway-level `hub` gate is
+    NOT the gene-level x0.9 attenuation that was removed in 2026-08-07;
+    it is a hard exclusion and it stays.
     """
     if hub:
         return 0.0
     amp = float(min(np.log10(abs(canon_diff) + 1.0) / np.log10(501.0), 1.0))
     purity = float(min(abs(canon_cos), 1.0))
-    coverage = float(n_modes / 3.0)
+    signal = 0.50 * amp + 0.50 * purity
+    coverage = float(min(max(n_modes / 3.0, 0.0), 1.0))
     if sign_cons is True:
         coherence = 1.0
     elif sign_cons is False:
-        coherence = 0.3
+        coherence = 0.0
     else:
         coherence = 0.5
-    score = 0.40 * amp + 0.30 * purity + 0.15 * coverage + 0.15 * coherence
-    return float(min(max(score, 0.0), 1.0))
+    malus = 0.15 * (1.0 - coverage) + 0.10 * (1.0 - coherence)
+    return float(min(max(signal - malus, 0.0), 1.0))
 
 
 def _load_is_tf(seed_paths: list[Path]) -> pd.Series:
@@ -2367,16 +2416,16 @@ def _compute_evidence_tier(driver_score: float,
                            n_aging_dbs: int,
                            is_hub_inflated: bool,
                            is_low_purity_signal: bool,
-                           min_driver_score: float = 0.5,
+                           min_driver_score: float = 0.33,
                            min_cosine_purity: float = 0.4,
-                           weak_driver_score: float = 0.3) -> str:
+                           weak_driver_score: float = 0.10) -> str:
     """Single-letter evidence tier (column placed before `interpretation`).
 
     Priority order (first match wins) :
       D — hub : `is_hub_inflated` ∨ `is_low_purity_signal` ∨
-          (driver_score ≥ 0.5 ∧ |cos| < 0.4). Score élevé porté par la
+          (driver_score ≥ 0.33 ∧ |cos| < 0.4). Score élevé porté par la
           connectivité plutôt que par une direction cohérente : artefact.
-      A — confirmé : driver pur (driver_score ≥ 0.5 ∧ |cos| ≥ 0.4) ET
+      A — confirmé : driver pur (driver_score ≥ 0.33 ∧ |cos| ≥ 0.4) ET
           littérature (DE-sig OU ≥2 aging DBs).
       B — découverte : driver pur, sans littérature → finding graph-only,
           prioritaire pour validation expérimentale.
@@ -2387,6 +2436,15 @@ def _compute_evidence_tier(driver_score: float,
 
     Returns one of {"A_confirmed", "B_discovery", "C_effector", "D_hub",
     "E_noise"}.
+
+    2026-08-13 — `min_driver_score` 0.5 -> 0.33. The cut is unchanged in
+    meaning: `_compute_driver_score` dropped its constant base points
+    (coverage/coherence became a malus), which shifts the whole
+    distribution down without reordering it. 0.33 sits at the quantile
+    0.90 / 0.91 / 0.988 / 0.981 of the four V6.1.3 views — i.e. exactly
+    where 0.5 sat before. `weak_driver_score` is rescaled for the same
+    reason but remains **unused** by the body below (it has never been
+    consulted since the tier logic was written).
     """
     cos_abs = abs(canon_cosine) if canon_cosine is not None else 0.0
     has_lit = bool(is_de_significant is True) or n_aging_dbs >= 2

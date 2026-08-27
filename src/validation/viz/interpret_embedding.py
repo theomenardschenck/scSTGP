@@ -343,11 +343,37 @@ def fig_umap_communities(xy: pd.DataFrame, labels: pd.Series, out: Path):
 
 def fig_umap_continuous(xy: pd.DataFrame, values: pd.Series, out: Path,
                         title: str, cbar_label: str, cmap: str,
-                        diverging: bool = False):
+                        diverging: bool = False, clip_pct: float = 0.0,
+                        scale: str = "quantile", n_bins: int = 12,
+                        gamma: float = 0.5):
     """UMAP coloré par une valeur continue (driver_score, cosine_senescent…).
-    Gènes sans valeur → gris. `diverging` centre l'échelle sur 0 (anti/pro)."""
+    Gènes sans valeur → gris. `diverging` centre l'échelle sur 0 (anti/pro).
+
+    `clip_pct` (défaut 0 = AUCUN écrêtage) borne l'échelle aux percentiles
+    [clip_pct, 100-clip_pct]. ⚠️ Le défaut historique était 2, ce qui saturait
+    les 2 % de tête — c'est-à-dire précisément les drivers : sur V6.1.3
+    `driver_score` va de 0.00 à 0.80 mais p98 = 0.30-0.43, donc ~260 gènes
+    (dont toutes les cibles) recevaient la même couleur et près de la moitié de
+    l'étendue du score était invisible. Sur un score asymétrique dont l'intérêt est la queue haute,
+    écrêter détruit le signal ; on montre donc toute l'étendue par défaut, et
+    l'intervalle affiché est écrit sur la barre de couleur.
+
+    `scale` gouverne la RÉPARTITION des couleurs sur l'intervalle (branche non
+    divergente uniquement) :
+      * "quantile" (défaut) — paliers aux quantiles, donc **une couleur par
+        tranche d'effectif égal**. C'est la bonne transformation ici : le
+        problème de `driver_score` n'est pas sa dynamique mais sa DENSITÉ — la
+        moitié des gènes tient sous 0.09 (médiane 0.06-0.09 depuis le
+        2026-08-13, contre 0.32 quand le score portait encore ses points de
+        base), donc une échelle linéaire les peint tous pareil.
+        Les étiquettes de la barre restent les vraies valeurs du score.
+      * "power"  — PowerNorm d'exposant `gamma` (<1 étale le bas de l'échelle) ;
+        continu, à préférer si les paliers gênent.
+      * "linear" — comportement brut.
+    """
     import matplotlib
     matplotlib.use("Agg")
+    import matplotlib.colors as mcolors
     import matplotlib.pyplot as plt
     vals = values.reindex(xy.index).astype(float)
     have = vals.notna()
@@ -357,14 +383,34 @@ def fig_umap_continuous(xy: pd.DataFrame, values: pd.Series, out: Path,
     if diverging:
         vmax = float(np.nanmax(np.abs(vals[have]))) if have.any() else 1.0
         vmin = -vmax
+    elif not have.any():
+        vmin, vmax = 0.0, 1.0
+    elif clip_pct > 0:
+        vmin = float(np.nanpercentile(vals[have], clip_pct))
+        vmax = float(np.nanpercentile(vals[have], 100 - clip_pct))
     else:
-        vmin = float(np.nanpercentile(vals[have], 2)) if have.any() else 0.0
-        vmax = float(np.nanpercentile(vals[have], 98)) if have.any() else 1.0
+        vmin = float(np.nanmin(vals[have]))
+        vmax = float(np.nanmax(vals[have]))
+    kw, spacing, note = dict(cmap=cmap, vmin=vmin, vmax=vmax), None, ""
+    if not diverging and have.any() and scale == "quantile":
+        bounds = np.unique(np.nanpercentile(
+            vals[have], np.linspace(0, 100, n_bins + 1)))
+        if len(bounds) > 2:                       # dégénéré → repli linéaire
+            cm = plt.get_cmap(cmap, len(bounds) - 1)
+            kw = dict(cmap=cm, norm=mcolors.BoundaryNorm(bounds, cm.N))
+            spacing = "uniform"                   # 1 palier = 1 tranche égale
+            note = f", {len(bounds) - 1} paliers d'effectif égal"
+    elif not diverging and scale == "power":
+        kw = dict(cmap=cmap,
+                  norm=mcolors.PowerNorm(gamma=gamma, vmin=vmin, vmax=vmax))
+        note = f", PowerNorm γ={gamma}"
     sc = ax.scatter(xy.loc[have, "umap_x"], xy.loc[have, "umap_y"],
-                    c=vals[have], cmap=cmap, vmin=vmin, vmax=vmax,
-                    s=7, alpha=0.85)
-    cbar = fig.colorbar(sc, ax=ax, shrink=0.8)
-    cbar.set_label(cbar_label)
+                    c=vals[have], s=7, alpha=0.85, **kw)
+    cbar = fig.colorbar(sc, ax=ax, shrink=0.8,
+                        **({"spacing": spacing} if spacing else {}))
+    cbar.ax.tick_params(labelsize=8)
+    cbar.set_label(f"{cbar_label}  [{vmin:.3g} — {vmax:.3g}]" + note
+                   + (f", écrêté à ±{clip_pct} %" if clip_pct > 0 else ""))
     ax.set_title(title)
     ax.set_xlabel("UMAP-1"); ax.set_ylabel("UMAP-2")
     fig.tight_layout(); fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)

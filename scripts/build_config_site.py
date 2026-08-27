@@ -96,7 +96,9 @@ COL_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
          "sans littérature (prioritaire à valider) · C_effector = littérature "
          "mais driver impur (marqueur probable) · D_hub = artefact de "
          "connectivité · E_noise = ni l'un ni l'autre. Priorité : D testé en "
-         "premier. « Driver pur » = driver_score ≥ 0.5 ET |cos| ≥ 0.4."),
+         "premier. « Driver pur » = driver_score ≥ 0.33 ET |cos| ≥ 0.4 "
+         "(seuil 0.5 avant le 2026-08-13 : le score a perdu ses points de "
+         "base, 0.33 est le même quantile)."),
         ("direction",
          "pro-senescence / anti-senescence / neutral d'après le signe "
          "canonicalisé. Suffixe « (mixed) » si OE et perte-de-fonction ne "
@@ -145,8 +147,9 @@ COL_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
          "vrai driver causal. Vide si un seul mode disponible."),
         ("is_hub_inflated",
          "|diff| > 50 ET |cos| < 0.3 ET degré PPI > 200 : amplitude "
-         "explicable par la connectivité. Atténue le driver_score (×0.9) et "
-         "force le tier D."),
+         "explicable par la connectivité. Force le tier D. N'atténue plus le "
+         "driver_score : le facteur ×0.9 a été retiré le 2026-08-07 (mesuré "
+         "inerte — aucun gène ne porte le flag dans les configs V6.1.3)."),
         ("is_low_purity_signal",
          "Même profil mais degré ≤ 200 : l'amplitude n'est PAS explicable par "
          "un effet de hub (cas borderline type ASNS). Ne pénalise pas le score."),
@@ -394,18 +397,32 @@ button.btn{cursor:pointer}
 button.btn:hover{background:var(--acc-bg)}
 .muted{color:var(--mut);font-size:12px}
 .warn{color:var(--warn)}
+/* Virtual scroller. `#sizer` alone carries the full height and is resized only
+   when the row set changes; scrolling moves the table with `top`, so nothing
+   above the viewport ever changes size. That is what keeps the browser's
+   scroll anchoring from nudging scrollTop and re-firing `scroll` in a loop
+   (overflow-anchor:none is the belt to that braces). */
 #tw{border:1px solid var(--line);border-radius:6px;overflow:auto;max-height:70vh;
- position:relative}
+ position:relative;overflow-anchor:none}
+#tw .sizer{position:relative;width:100%;overflow-anchor:none}
+#tw table.grid{position:absolute;top:0;left:0}
 table.grid{border-collapse:separate;border-spacing:0;width:max-content;min-width:100%}
 table.grid th{position:sticky;top:0;background:var(--head);z-index:2;
  border-bottom:1px solid var(--line);padding:6px 9px;text-align:left;
  white-space:nowrap;cursor:help;font-weight:600;font-size:12px}
 table.grid th:hover{color:var(--acc)}
-table.grid td{padding:4px 9px;border-bottom:1px solid var(--line);
+/* Fixed row height: the virtual scroller assumes exactly ROW_H px per row.
+   Any mismatch makes the total height drift on every render, which fires
+   another scroll event — the table then scrolls on its own. */
+table.grid td{height:26px;padding:0 9px;line-height:25px;
+ border-bottom:1px solid var(--line);
  white-space:nowrap;font-variant-numeric:tabular-nums;
  max-width:46ch;overflow:hidden;text-overflow:ellipsis}
 table.grid tr:hover td{background:var(--acc-bg)}
 table.grid td.g{font-weight:600}
+table.grid th.rk,table.grid td.rk{text-align:right;color:var(--mut);
+ padding-right:12px;max-width:7ch}
+table.grid td.rk{font-size:12px}
 .tier-A_confirmed{color:var(--ok)}.tier-B_discovery{color:var(--acc)}
 .tier-D_hub{color:var(--warn)}.tier-E_noise{color:var(--mut)}
 .gal{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
@@ -422,9 +439,18 @@ pre{background:var(--head);padding:10px;border-radius:6px;overflow:auto;
 #detail dl{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:12px}
 #detail dt{color:var(--mut);cursor:help}
 #detail dd{margin:0;word-break:break-word}
-#lb{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;z-index:50;
- align-items:center;justify-content:center;cursor:zoom-out}
-#lb img{max-width:96vw;max-height:96vh}
+#lb{position:fixed;inset:0;background:rgba(0,0,0,.92);display:none;z-index:50;
+ flex-direction:column}
+#lb.on{display:flex}
+#lbbar{flex:0 0 auto;display:flex;gap:14px;align-items:center;padding:8px 12px;
+ color:#eee;font-size:13px;background:rgba(0,0,0,.55)}
+#lbbar a{color:#8ec2ef}
+#lbbar .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+#lbwrap{flex:1;min-height:0;overflow:auto;display:flex;align-items:center;
+ justify-content:center;padding:8px}
+#lbwrap img{max-width:100%;max-height:100%;cursor:zoom-in;background:#fff}
+#lbwrap.zoom{display:block}
+#lbwrap.zoom img{max-width:none;max-height:none;cursor:zoom-out}
 ul.cfgs{columns:2;list-style:none;padding:0}
 ul.cfgs li{margin:3px 0;break-inside:avoid}
 /* Column picker: CSS grid, NOT multi-column — `columns` + overflow pushes the
@@ -451,7 +477,9 @@ ul.cfgs li{margin:3px 0;break-inside:avoid}
 APP_JS = r"""
 /* Virtual table: columnar decoding, sort, filters, detail panel, CSV export. */
 (function(){
-var ROW_H=25, PAD=8;
+/* ROW_H MUST equal the rendered row height set in style.css
+   (table.grid td{height:26px}) — any mismatch makes the scroller drift. */
+var ROW_H=26, PAD=8;
 
 /* TSV text -> same payload shape as the Python encoder. Numeric columns are
    detected by trying to parse every non-empty cell. */
@@ -499,18 +527,23 @@ window.SiteTable = function(mount, payload, opts){
     if(col && col.d){ return function(i){ var v=col.d[col.c[i]]; return v===''?null:v; }; }
     return function(i){ return col[i]; };
   });
-  var idx = new Int32Array(N); for(var i=0;i<N;i++) idx[i]=i;
-  var view = idx, sortCol=-1, sortDir=-1;
+  /* `order` = every row in the current sort, `rankOf` = 1-based position in
+     `order` (so a filtered view still shows each row's rank in the FULL
+     table), `view` = the filtered subset in the same order. */
+  var order = new Array(N); for(var i=0;i<N;i++) order[i]=i;
+  var rankOf = new Int32Array(N);
+  var view = order, sortCol=-1, sortDir=-1;
+  var lastQ='', lastExtra=null;
   var visible = (opts.visible||cols).filter(function(c){return cols.indexOf(c)>=0;});
   if(!visible.length) visible = cols.slice(0, 12);
   var keyCol = cols.indexOf('target')>=0 ? 'target'
              : (cols.indexOf('gene')>=0 ? 'gene' : cols[0]);
   var wrap=document.createElement('div'); wrap.id='tw';
-  var spacerTop=document.createElement('div'), spacerBot=document.createElement('div');
+  var sizer=document.createElement('div'); sizer.className='sizer';
   var tbl=document.createElement('table'); tbl.className='grid';
   var thead=document.createElement('thead'), tbody=document.createElement('tbody');
   tbl.appendChild(thead); tbl.appendChild(tbody);
-  wrap.appendChild(spacerTop); wrap.appendChild(tbl); wrap.appendChild(spacerBot);
+  sizer.appendChild(tbl); wrap.appendChild(sizer);
   mount.appendChild(wrap);
 
   function ci(c){ return cols.indexOf(c); }
@@ -524,6 +557,11 @@ window.SiteTable = function(mount, payload, opts){
   }
   function head(){
     var tr=document.createElement('tr');
+    var rk=document.createElement('th');
+    rk.className='rk'; rk.textContent='#';
+    rk.title='Rang dans le tri courant, sur la table entière — il ne change '
+            +'pas quand vous filtrez.';
+    tr.appendChild(rk);
     visible.forEach(function(c){
       var th=document.createElement('th');
       th.textContent=c+(sortCol===ci(c)?(sortDir<0?' ▼':' ▲'):'');
@@ -537,8 +575,9 @@ window.SiteTable = function(mount, payload, opts){
     if(k<0) return;
     sortDir = (k===sortCol) ? -sortDir : -1;
     sortCol = k;
-    var f=get[k], arr=Array.prototype.slice.call(view);
-    arr.sort(function(a,b){
+    var f=get[k];
+    /* Sort ALL rows, not just the visible subset: ranks must stay absolute. */
+    order.sort(function(a,b){
       var x=f(a), y=f(b);
       var xe=(x===null||x===undefined||x===''), ye=(y===null||y===undefined||y==='');
       if(xe&&ye) return 0;
@@ -548,18 +587,53 @@ window.SiteTable = function(mount, payload, opts){
       /* sortDir=-1 -> descending (first click puts the big scores on top) */
       return x<y?-sortDir:(x>y?sortDir:0);
     });
-    view=arr; head(); render();
+    for(var r=0;r<order.length;r++) rankOf[order[r]]=r+1;
+    head(); refilter(true);
   }
-  function render(){
-    var st=wrap.scrollTop, h=wrap.clientHeight;
+  function refilter(keepScroll){
+    var terms=lastQ?lastQ.split(/[\s,;]+/).filter(Boolean):[];
+    var kcol=ci(keyCol), icol=ci('interpretation');
+    var out=[];
+    for(var r=0;r<order.length;r++){
+      var i=order[r];
+      if(terms.length){
+        var g=String(get[kcol](i)||'').toLowerCase();
+        var it=icol>=0?String(get[icol](i)||'').toLowerCase():'';
+        var ok=false;
+        for(var t=0;t<terms.length;t++){
+          if(g.indexOf(terms[t])>=0||it.indexOf(terms[t])>=0){ok=true;break;}
+        }
+        if(!ok) continue;
+      }
+      if(lastExtra && !lastExtra(function(c){return val(c,i);})) continue;
+      out.push(i);
+    }
+    view=out;
+    if(!keepScroll) wrap.scrollTop=0;
+    render(true);
+  }
+  /* Virtual window. `#sizer` holds the full height; the table is absolutely
+     positioned and only its `top` moves while scrolling — no layout above the
+     viewport ever changes, so the scroller cannot feed itself. The sticky
+     <thead> sits at the top of the table and takes layout space above the
+     rows, hence the headH offset in the index maths. */
+  var lastFirst=-1, lastLast=-1, pending=false, headH=0;
+  function syncSizer(){
+    headH=thead.offsetHeight||headH;
+    sizer.style.height=(view.length*ROW_H+headH)+'px';
+  }
+  function render(force){
+    if(force||!headH) syncSizer();
+    var st=Math.max(0, wrap.scrollTop-headH), h=wrap.clientHeight;
     var first=Math.max(0,Math.floor(st/ROW_H)-PAD);
     var last=Math.min(view.length,Math.ceil((st+h)/ROW_H)+PAD);
-    spacerTop.style.height=(first*ROW_H)+'px';
-    spacerBot.style.height=Math.max(0,(view.length-last)*ROW_H)+'px';
+    if(!force && first===lastFirst && last===lastLast) return;
+    lastFirst=first; lastLast=last;
+    tbl.style.top=(first*ROW_H)+'px';
     var html='';
     for(var r=first;r<last;r++){
       var i=view[r];
-      html+='<tr data-i="'+i+'">';
+      html+='<tr data-i="'+i+'"><td class="rk">'+(rankOf[i]||(r+1))+'</td>';
       for(var c=0;c<visible.length;c++){
         var v=val(visible[c],i), cls='', txt=esc(fmt(v));
         if(visible[c]===keyCol) cls=' class="g"';
@@ -569,7 +643,18 @@ window.SiteTable = function(mount, payload, opts){
       html+='</tr>';
     }
     tbody.innerHTML=html;
-    if(opts.onCount) opts.onCount(view.length, N);
+    /* thead height is only measurable once rows exist; re-sync if it moved. */
+    if(thead.offsetHeight && thead.offsetHeight!==headH) syncSizer();
+    if(opts.onCount) opts.onCount(view.length, N, summary());
+  }
+  /* Short status line: when the filter isolates a few rows, spell out their
+     rank so a gene search answers "where does it sit?" directly. */
+  function summary(){
+    if(!view.length || view.length>3 || view.length===N) return '';
+    return view.map(function(i){
+      var s = sortCol>=0 ? ' ('+cols[sortCol]+' '+fmt(get[sortCol](i))+')' : '';
+      return fmt(val(keyCol,i))+' → rang '+rankOf[i]+' / '+N+s;
+    }).join(' · ');
   }
   tbody.onclick=function(e){
     var tr=e.target.closest('tr'); if(!tr) return; showDetail(+tr.dataset.i);
@@ -591,40 +676,27 @@ window.SiteTable = function(mount, payload, opts){
     });
     d.innerHTML=h+'</dl>'; d.classList.add('on');
   }
-  wrap.addEventListener('scroll',render);
+  /* rAF-throttled: one render per frame at most, never re-entrant. */
+  wrap.addEventListener('scroll', function(){
+    if(pending) return;
+    pending=true;
+    requestAnimationFrame(function(){ pending=false; render(false); });
+  });
 
   var api={
     filter:function(q, extra){
-      q=(q||'').trim().toLowerCase();
-      var terms=q?q.split(/[\s,;]+/).filter(Boolean):[];
-      var kcol=ci(keyCol), icol=ci('interpretation');
-      var out=[];
-      for(var r=0;r<idx.length;r++){
-        var i=idx[r];
-        if(terms.length){
-          var g=String(get[kcol](i)||'').toLowerCase();
-          var it=icol>=0?String(get[icol](i)||'').toLowerCase():'';
-          var ok=false;
-          for(var t=0;t<terms.length;t++){
-            if(g.indexOf(terms[t])>=0||it.indexOf(terms[t])>=0){ok=true;break;}
-          }
-          if(!ok) continue;
-        }
-        if(extra && !extra(function(c){return val(c,i);})) continue;
-        out.push(i);
-      }
-      view=out;
-      if(sortCol>=0){ var k=sortCol; sortCol=-1; sortDir=-1; sort(k); }
-      else { wrap.scrollTop=0; render(); }
+      lastQ=(q||'').trim().toLowerCase();
+      lastExtra=extra||null;
+      refilter(false);
     },
-    setVisible:function(list){ visible=list.slice(); head(); render(); },
+    setVisible:function(list){ visible=list.slice(); head(); render(true); },
     cols:cols, keyCol:keyCol, visible:function(){return visible.slice();},
     has:function(c){ return cols.indexOf(c)>=0; },
     exportCSV:function(name){
-      var lines=[visible.join(',')];
+      var lines=['rang,'+visible.join(',')];
       for(var r=0;r<view.length;r++){
         var i=view[r];
-        lines.push(visible.map(function(c){
+        lines.push(rankOf[i]+','+visible.map(function(c){
           var v=val(c,i); v=(v===null||v===undefined)?'':String(v);
           return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;
         }).join(','));
@@ -633,9 +705,12 @@ window.SiteTable = function(mount, payload, opts){
       var a=document.createElement('a'); a.href=URL.createObjectURL(b);
       a.download=name||'view.csv'; a.click();
     },
-    sortBy:function(c){ sort(ci(c)); }
+    sortBy:function(c){ sort(ci(c)); },
+    rankOf:function(i){ return rankOf[i]; }
   };
-  head(); render();
+  head();
+  for(var r=0;r<order.length;r++) rankOf[order[r]]=r+1;
+  render(true);
   return api;
 };
 
@@ -655,11 +730,48 @@ window.initTabs=function(){
   var want=location.hash.slice(1);
   var start=document.querySelector('nav.tabs button[data-tab="'+want+'"]')||btns[0];
   if(start) start.click();
+  initLightbox();
+};
+
+/* Lightbox. Event delegation on document, so figures added later (or living
+   in a hidden panel at init time) still open. Click the image to toggle a
+   true 1:1 zoom inside a scrollable area; click the backdrop or Escape to
+   close; the toolbar links to the original file. */
+window.initLightbox=function(){
   var lb=document.getElementById('lb');
-  document.querySelectorAll('.gal img').forEach(function(im){
-    im.onclick=function(){ lb.style.display='flex'; lb.querySelector('img').src=im.src; };
+  /* Defer instead of giving up: the overlay markup may not be parsed yet
+     depending on where the caller's <script> sits in the document. */
+  if(!lb){
+    if(document.readyState==='loading')
+      document.addEventListener('DOMContentLoaded', window.initLightbox);
+    return;
+  }
+  if(lb.dataset.ready) return;
+  lb.dataset.ready='1';
+  var wrap=document.getElementById('lbwrap');
+  var img=wrap.querySelector('img');
+  var name=document.getElementById('lbname');
+  var open=document.getElementById('lbopen');
+  function close(){ lb.classList.remove('on'); wrap.classList.remove('zoom'); }
+  window.__lbClose=close;
+  document.addEventListener('click', function(e){
+    var t=e.target;
+    if(t.tagName==='IMG' && t.closest('.gal')){
+      img.src=t.src;
+      name.textContent=decodeURIComponent(t.getAttribute('src').split('/').pop());
+      open.href=t.src;
+      wrap.classList.remove('zoom');
+      lb.classList.add('on');
+    }
   });
-  if(lb) lb.onclick=function(){ lb.style.display='none'; };
+  img.addEventListener('click', function(e){
+    e.stopPropagation();
+    wrap.classList.toggle('zoom');
+  });
+  wrap.addEventListener('click', function(e){ if(e.target===wrap) close(); });
+  document.addEventListener('keydown', function(e){
+    if(e.key==='Escape') close();
+  });
 };
 })();
 """
@@ -686,16 +798,46 @@ window.COL_DOC_FN = function(name){
 # --------------------------------------------------------------------------- #
 def page(title: str, body: str, depth: int = 1) -> str:
     up = "../" * depth
-    return f"""<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
+    html = f"""<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
 <link rel="stylesheet" href="{up}assets/style.css">
 <script src="{up}assets/app.js"></script>
 <script src="{up}assets/coldoc.js"></script>
 </head><body>
+<div id="detail"></div>
+<div id="lb">
+  <div id="lbbar">
+    <span class="name" id="lbname"></span>
+    <span class="muted" style="color:#aaa">clic sur l'image = zoom 1:1 &middot;
+      Échap = fermer</span>
+    <a id="lbopen" href="#" target="_blank" rel="noopener">Ouvrir l'original</a>
+    <button class="btn" onclick="__lbClose()">Fermer</button>
+  </div>
+  <div id="lbwrap"><img alt=""></div>
+</div>
 {body}
-<div id="detail"></div><div id="lb"><img alt=""></div>
 </body></html>"""
+    check_overlay_order(html, title)
+    return html
+
+
+def check_overlay_order(html: str, title: str = "") -> None:
+    """Guard the ordering invariant that already broke once.
+
+    The overlay markup must be parsed BEFORE the inline script that wires it,
+    otherwise getElementById returns null at init time and clicking a figure
+    silently does nothing.
+    """
+    lb_at = html.find('id="lb"')
+    if lb_at < 0:
+        raise RuntimeError(f"page({title!r}): #lb markup missing.")
+    inits = [i for i in (html.find("initLightbox()"), html.find("initTabs()"))
+             if i != -1]
+    if inits and lb_at > min(inits):
+        raise RuntimeError(
+            f"page({title!r}): #lb markup at {lb_at} comes after the init call "
+            f"at {min(inits)} — the lightbox would never bind.")
 
 
 def rel(target: Path, from_dir: Path) -> str:
@@ -811,6 +953,7 @@ def build_config_page(cfg: dict, assets: dict, out: Path, version: str,
   <button class="btn" id="colsbtn">Colonnes</button>
   <button class="btn" id="csvbtn">Export CSV</button>
   <span class="muted" id="cnt"></span>
+  <span id="hit" style="font-weight:600;color:var(--acc)"></span>
 </div>
 <div class="cols">
   <div class="bar"><button class="btn" id="calla">Tout</button>
@@ -939,7 +1082,10 @@ function pickerFor(cols, checked){{
 function mount(payload, visible, keepPicker){{
   T=SiteTable($('mount'), payload, {{
     visible:visible,
-    onCount:function(n,tot){{$('cnt').textContent=n+' / '+tot+' lignes';}}
+    onCount:function(n,tot,detail){{
+      $('cnt').textContent=n+' / '+tot+' lignes';
+      $('hit').textContent=detail||'';
+    }}
   }});
   if(!keepPicker) pickerFor(payload.cols, T.visible());
   if(T.has('driver_score')) T.sortBy('driver_score');
@@ -1101,6 +1247,7 @@ function show(){{
   o.innerHTML=h+'</tbody></table>';
 }}
 document.getElementById('g').addEventListener('change',show);
+initLightbox();
 </script>"""
     (out / "genes.html").write_text(page(f"Gènes — {version}", body, depth=0),
                                     encoding="utf-8")
@@ -1139,6 +1286,14 @@ graphe plutôt que par le DE.</p>
 
 def write_assets(out: Path) -> None:
     from string import Template
+    # The virtual scroller positions rows arithmetically: a JS/CSS row-height
+    # mismatch makes the table drift and scroll on its own.
+    js_h = re.search(r"var ROW_H=(\d+)", APP_JS)
+    css_h = re.search(r"table\.grid td\{height:(\d+)px", CSS)
+    if not js_h or not css_h or js_h.group(1) != css_h.group(1):
+        raise RuntimeError(
+            f"ROW_H (JS {js_h and js_h.group(1)}) must equal the CSS row height "
+            f"({css_h and css_h.group(1)}).")
     (out / "assets").mkdir(parents=True, exist_ok=True)
     (out / "assets" / "style.css").write_text(CSS, encoding="utf-8")
     (out / "assets" / "app.js").write_text(APP_JS, encoding="utf-8")

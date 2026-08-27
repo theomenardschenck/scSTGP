@@ -213,6 +213,59 @@ def load_reactome_gmt() -> dict[str, set[str]]:
     return load_gmt(GMT_PATH)
 
 
+# Legacy symbols carried by our gene universe, absent from current MSigDB/KEGG.
+ALIAS_MAP_PATH = Path("data/omnipath/hgnc_alias_map.tsv.gz")
+
+
+def expand_gmt_with_legacy_symbols(
+    sets: dict[str, set[str]],
+    universe,
+    alias_path: Path | str = ALIAS_MAP_PATH,
+) -> tuple[dict[str, set[str]], int]:
+    """Let gene sets recognise the legacy symbols our universe still uses.
+
+    MSigDB and KEGG ship *current* HGNC symbols; our expression matrix predates
+    several renamings (H2AFZ -> H2AZ1, SETD8 -> KMT5A, WHSC1 -> NSD2, GBA ->
+    GBA1, the whole HIST1* family). Those genes therefore matched **no** set and
+    were silently invisible to every ORA -- the same defect already fixed on the
+    OmniPath edge side, never fixed here. Measured cost: 278 genes for KEGG
+    (+5.1 % of the annotated universe), and they are not random genes, they are
+    the histones and chromatin writers this work is about.
+
+    We widen the *sets* rather than rename the *lists*, so list sizes, the
+    universe and every rank stay bit-identical: only the overlap ``k`` changes.
+
+    A legacy symbol is added only when its approved symbol is **absent** from
+    the universe. When both are present they are two distinct rows for us
+    (LINC01004 vs KMT2E-AS1, C2orf48 vs RRM2, ...), and folding them would count
+    one gene twice. 16 such pairs exist; all are skipped.
+
+    Returns the widened sets and the number of legacy symbols injected.
+    """
+    universe = set(universe)
+    alias_path = Path(alias_path)
+    if not alias_path.exists():
+        return sets, 0
+    tab = pd.read_csv(alias_path, sep="\t")
+    # approved -> legacy variants that WE use and that are unambiguous
+    back: dict[str, set[str]] = {}
+    for variant, approved in zip(tab["variant"], tab["approved"]):
+        if (variant in universe and approved != variant
+                and approved not in universe):
+            back.setdefault(approved, set()).add(variant)
+    if not back:
+        return sets, 0
+    out, injected = {}, set()
+    for name, genes in sets.items():
+        extra = set()
+        for g in genes:
+            if g in back:
+                extra |= back[g]
+        out[name] = genes | extra
+        injected |= extra
+    return out, len(injected)
+
+
 def _load_from_registry() -> dict[str, set[str]] | None:
     """Named gene-sets from the declarative registry (``data/gene_sets/registry.yaml``).
 

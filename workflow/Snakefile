@@ -30,6 +30,9 @@ Lancement :
 """
 
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 configfile: "config/config.yaml"
@@ -48,8 +51,90 @@ DE_CSV     = P["de_magnitude_csv"]
 COEXPR     = P["coexpr_file"]
 
 DEVICE   = config["compute"]["device"]
-PY       = config["compute"]["python"]
-PY_TORCH = config["compute"]["python_torch"]
+
+# ──────────────────────────────────────────────────────────────────
+# Localisation des scripts — indépendante du répertoire de travail
+# ──────────────────────────────────────────────────────────────────
+# Historiquement les règles écrivaient `python src/gnn/gnn_vgae.py`, un chemin
+# relatif au CWD : le pipeline n'était donc lançable QUE depuis la racine d'un
+# clone. `SRC` est désormais un chemin absolu, ce qui autorise les trois cas :
+# clone, paquet installé (les scripts vivent dans site-packages), et workflow
+# recopié sur un scratch de cluster (STATESHIFT_SRC).
+_SRC_ENV = os.environ.get("STATESHIFT_SRC")
+if _SRC_ENV:
+    SRC = str(Path(_SRC_ENV).resolve())
+else:
+    try:
+        import stateshift as _stateshift
+        SRC = str(_stateshift.package_dir())
+    except Exception:
+        # Repli : snakemake tourne dans un AUTRE environnement que le paquet
+        # (cas courant — snakemake système, paquet dans un venv). On ne déduit
+        # pas la disposition, on la CONSTATE en cherchant un script connu, sinon
+        # le mode installé recevrait un chemin plausible mais faux.
+        _here = Path(workflow.basedir).resolve()          # .../workflow
+        _probe = Path("gnn") / "gnn_vgae.py"
+        for _cand in (_here.parent / "src",   # clone   : <repo>/src
+                      _here.parent):          # installé: <site-packages>/stateshift
+            if (_cand / _probe).is_file():
+                SRC = str(_cand)
+                break
+        else:
+            raise WorkflowError(
+                "Impossible de localiser les scripts du pipeline depuis "
+                + str(_here) + ". Installe le paquet (`pip install stateshift`) "
+                "dans l'environnement qui exécute snakemake, ou fixe "
+                "STATESHIFT_SRC=/chemin/vers/src."
+            )
+
+# Interpréteur des règles. `compute.python: "python"` signifie historiquement
+# « le python de l'environnement actif » — une hypothèse qui casse dès que le
+# PATH pointe ailleurs (un venv d'un autre projet, un nœud de calcul au PATH
+# minimal). Le symptôme était un `ModuleNotFoundError: torch` enfoui dans le log
+# d'une règle, après quarante minutes de construction du graphe.
+#
+# On résout donc par CAPACITÉ, pas par nom : l'interpréteur retenu doit savoir
+# importer torch. Ordre — variable d'environnement (explicite, gagne toujours),
+# puis la valeur configurée si elle convient, puis l'interpréteur qui exécute
+# Snakemake. Aucun changement pour un environnement correctement activé.
+def _can_import_torch(exe):
+    try:
+        return subprocess.run([exe, "-c", "import torch"], capture_output=True,
+                              timeout=120).returncode == 0
+    except Exception:
+        return False
+
+def _resolve_python(key, env_var):
+    override = os.environ.get(env_var)
+    if override:
+        return override
+
+    configured = config["compute"].get(key) or ""
+    usable = bool(configured) and bool(shutil.which(configured) or Path(configured).is_file())
+
+    if usable and _can_import_torch(configured):
+        return configured
+    if _can_import_torch(sys.executable):
+        if usable:
+            sys.stderr.write(
+                "\n[stateshift] ⚠️  compute." + key + " = '" + str(configured)
+                + "' ne peut pas importer torch.\n"
+                "             Utilisation de " + sys.executable + " à la place.\n"
+                "             (fixe " + env_var + " pour imposer un interpréteur)\n\n")
+        return sys.executable
+
+    # Personne ne sait importer torch : on garde la valeur configurée pour ne pas
+    # empêcher un dry-run, mais on le dit AVANT le DAG, pas au milieu.
+    sys.stderr.write(
+        "\n[stateshift] ⚠️  AUCUN interpréteur disponible ne sait importer torch.\n"
+        "             Le DAG se résoudra, mais l'entraînement ÉCHOUERA.\n"
+        "             Active l'environnement du projet, ou : pip install "
+        "'stateshift[run]'\n"
+        "             Diagnostic complet : stateshift doctor\n\n")
+    return configured or sys.executable
+
+PY       = _resolve_python("python", "STATESHIFT_PYTHON")
+PY_TORCH = _resolve_python("python_torch", "STATESHIFT_PYTHON_TORCH")
 
 VGAE        = config["models"]["vgae"]
 RUN_TAG     = VGAE["run_tag"]
@@ -177,18 +262,6 @@ PURITY_N_RANDOM = int(_v("purity_source", "n_random", 200))
 
 H2H_ON      = _v("head_to_head")
 H2H_TARGETS = str(_v("head_to_head", "targets", "") or "").strip()
-
-# Thesis "result" figures F1-F8 (src/validation/figures/memoire_figures.py).
-# Opt-in, défaut OFF. Consomme le ranking de LA config + des références curées
-# partagées (MASTER, nulles, bulk cross-dataset) dont les chemins sont
-# surchargeables. Chaque figure saute proprement si son entrée manque → sortie
-# = MANIFEST listant les PNG réellement produits (récupérés par le site).
-MEMOIRE_FIGS_ON      = _v("memoire_figures")
-MEMOIRE_FIGS_MASTER  = str(_v("memoire_figures", "master", "") or "").strip()
-MEMOIRE_FIGS_RANDNULL = str(_v("memoire_figures", "random_axis_null", "") or "").strip()
-MEMOIRE_FIGS_DECOY   = str(_v("memoire_figures", "decoy", "") or "").strip()
-MEMOIRE_FIGS_GSE     = str(_v("memoire_figures", "gse98440", "") or "").strip()
-MEMOIRE_FIGS_ONLY    = str(_v("memoire_figures", "only", "") or "").strip()
 
 READOUT_SPEC_ON = _v("readout_specificity")
 ORA_DE_BASE_ON  = _v("ora_de_baseline")
@@ -382,9 +455,28 @@ def final_targets():
                  / "comparison_summary.tsv")
     if CASCADE_ON:
         t.append(ANALYSIS_DIR / "interpret" / "signed_cascade.tsv")
-    if MEMOIRE_FIGS_ON:
-        t.append(ANALYSIS_DIR / "memoire_figures" / "MANIFEST.txt")
+    t.extend(EXTRA_TARGETS)
     return t
+
+
+# ──────────────────────────────────────────────────────────────────
+# Local extensions — rules that are NOT part of the published tool
+# ──────────────────────────────────────────────────────────────────
+# Some rules drive artefacts of one specific write-up (thesis figures, its
+# appendices) rather than the pipeline itself. They are real rules, they must
+# keep working here, and they must not ship: a rule whose `shell:` names a
+# script absent from the wheel fails mid-DAG, after the graph build — the exact
+# failure mode `tests/test_package_layout.py` was written to prevent.
+#
+# So they live in `rules/*.local.smk`, which `.gitignore` excludes. Present →
+# included; absent → the DAG is simply smaller. A local rule adds its own
+# targets by appending to EXTRA_TARGETS, which is why this include has to run
+# BEFORE `rule all` evaluates `final_targets()`.
+EXTRA_TARGETS = []
+
+for _local in sorted((Path(workflow.basedir) / "rules").glob("*.local.smk")):
+    include: str(_local)
+
 
 rule all:
     input:
@@ -446,7 +538,7 @@ rule build_graph:
         mem_mb=32000,
         runtime=120,
     shell:
-        "{GNN_ENV} {PY} src/gnn/gnn_vgae.py --build-only "
+        "{GNN_ENV} {PY} {SRC}/gnn/gnn_vgae.py --build-only "
         "--run-tag {RUN_TAG}/build --graph-cache {output.cache} "
         "{GRAPH_FLAGS} &> {log}"
 
@@ -469,7 +561,7 @@ rule train_vgae:
         runtime=720,    # minutes
         gpu=1,          # mappé vers --gres=gpu:1 par le profil cluster
     shell:
-        "{GNN_ENV} {PY} src/gnn/gnn_vgae.py "
+        "{GNN_ENV} {PY} {SRC}/gnn/gnn_vgae.py "
         "--seed {wildcards.seed} --run-tag {RUN_TAG}/s{wildcards.seed} "
         "--reuse-graph --graph-cache {input.cache} "
         "{GRAPH_FLAGS} &> {log}"
@@ -514,7 +606,7 @@ rule perturb:
         # la même variable pour ordonner les noeuds cell_group. Sans elle, la
         # perturbation retombe sur les 5 groupes HUVEC et échoue en KeyError
         # sur tout autre dataset, alors que le graphe, lui, était correct.
-        "{DATASET_ENV} {PY} src/perturbation/perturb_top_genes.py "
+        "{DATASET_ENV} {PY} {SRC}/perturbation/perturb_top_genes.py "
         "--run-dir {params.rd} --all-genes --modes {wildcards.mode} "
         "--device {DEVICE} {params.suffix} {params.genes} {params.multi} "
         "{params.axis} {params.rndaxis} {POLE_FLAGS} &> {log}"
@@ -557,7 +649,7 @@ rule aggregate_cross_seed:
         LOG_DIR / "aggregate_cross_seed.log",
     threads: 4
     shell:
-        "{PY} src/validation/reports/perturb_report.py --cross-seed {params.runs} "
+        "{PY} {SRC}/validation/reports/perturb_report.py --cross-seed {params.runs} "
         "--report-dir {params.report_dir} {params.axis} "
         "--de-magnitude-csv {DE_CSV} --coexpr-degree-file {COEXPR} "
         "--de-significance {params.de_sig} --de-padj-max {params.padj} "
@@ -590,39 +682,12 @@ rule axis_method_compare:
     log:
         LOG_DIR / "axis_method_compare.log",
     shell:
-        "{PY_TORCH} src/perturbation/reproject_axes.py "
+        "{PY_TORCH} {SRC}/perturbation/reproject_axes.py "
         "--run-dirs {params.runs} --out {params.out_dir} "
         "--axis-method {params.methods} "
         "--axis-lda-shrinkage {params.shrink} "
         "--axis-cav-top-n {params.cav_n} --axis-cav-seed {params.cav_seed} "
         "--axis-cav-permutations {params.cav_perm} &> {log}"
-
-
-rule memoire_figures:
-    """Thesis result figures F1-F8 → analysis/memoire_figures/ (picked up by the
-    config site gallery). Config ranking drives F1/F4 ; curated references
-    (MASTER, nulls, bulk) drive F2/F3/F7/F8 and are overridable. Each panel
-    skips gracefully → MANIFEST.txt is the sentinel output."""
-    input:
-        ranking=ANALYSIS_DIR / "cross_seed_gene_ranking.tsv",
-    output:
-        manifest=ANALYSIS_DIR / "memoire_figures" / "MANIFEST.txt",
-    params:
-        out_dir=ANALYSIS_DIR / "memoire_figures",
-        h2h=ANALYSIS_DIR / "interpret" / "head_to_head_baselines.tsv",
-        master=("--master " + MEMOIRE_FIGS_MASTER) if MEMOIRE_FIGS_MASTER else "",
-        randnull=("--random-axis-null " + MEMOIRE_FIGS_RANDNULL) if MEMOIRE_FIGS_RANDNULL else "",
-        decoy=("--decoy " + MEMOIRE_FIGS_DECOY) if MEMOIRE_FIGS_DECOY else "",
-        gse=("--gse98440 " + MEMOIRE_FIGS_GSE) if MEMOIRE_FIGS_GSE else "",
-        only=("--only " + MEMOIRE_FIGS_ONLY) if MEMOIRE_FIGS_ONLY else "",
-    log:
-        LOG_DIR / "memoire_figures.log",
-    shell:
-        "{PY} src/validation/figures/memoire_figures.py "
-        "--baseline-ranking {input.ranking} --head-to-head {params.h2h} "
-        "--out {params.out_dir} --manifest "
-        "{params.master} {params.randnull} {params.decoy} {params.gse} "
-        "{params.only} &> {log}"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -637,7 +702,7 @@ rule driver_baselines:
     log:
         LOG_DIR / "driver_baselines.log",
     shell:
-        "{PY} src/validation/reports/driver_baselines.py "
+        "{PY} {SRC}/validation/reports/driver_baselines.py "
         "--ranking {input.ranking} --coexpr-file {COEXPR} "
         "--out {output.baselines} &> {log}"
 
@@ -655,7 +720,7 @@ rule interpret_embedding:
     log:
         LOG_DIR / "interpret_embedding.log",
     shell:
-        "{PY_TORCH} src/validation/viz/interpret_embedding.py "
+        "{PY_TORCH} {SRC}/validation/viz/interpret_embedding.py "
         "--run-dir {params.rd} --ranking {input.ranking} --shinygo "
         "--out-dir {params.out_dir} &> {log}"
 
@@ -679,7 +744,7 @@ rule perturb_decoy:
     log:
         LOG_DIR / "perturb_decoy.log",
     shell:
-        "{PY_TORCH} src/validation/explain/perturb_decoy.py confidence "
+        "{PY_TORCH} {SRC}/validation/explain/perturb_decoy.py confidence "
         "--run-dir {params.rd} --ranking {input.ranking} "
         "--top-n {params.top_n} --n-rewires {params.rewires} {params.frozen} "
         "--out {output.decoy} &> {log}"
@@ -709,9 +774,9 @@ rule ora_top_drivers:
         # le top-N avec awk (lit tout le flux, pas de fermeture précoce).
         "tail -n +2 {input.ranking} | sort -t$'\\t' -k2,2 -gr | "
         "awk -F'\\t' -v n={params.top_n} 'NR<=n{{print $1}}' > {output.genes} 2> {log} && "
-        "{PY} src/validation/ora/ora_consensus.py --genes {output.genes} "
+        "{PY} {SRC}/validation/ora/ora_consensus.py --genes {output.genes} "
         "--db reactome --out {output.reactome} &>> {log} && "
-        "{PY} src/validation/ora/ora_consensus.py --genes {output.genes} "
+        "{PY} {SRC}/validation/ora/ora_consensus.py --genes {output.genes} "
         "--db aging --out {output.aging} &>> {log}"
 
 
@@ -726,7 +791,7 @@ rule cluster_annotation:
     log:
         LOG_DIR / "cluster_annotation.log",
     shell:
-        "{PY} src/validation/cluster/cluster_annotation.py "
+        "{PY} {SRC}/validation/cluster/cluster_annotation.py "
         "--cross-seed-runs {input.ge} --out-dir {params.out_dir} &> {log}"
 
 
@@ -769,7 +834,7 @@ rule pipeline_qc:
         LOG_DIR / "pipeline_qc.log",
     shell:
         'mkdir -p "$(dirname {output.report})" "$(dirname {log})" && '
-        "{PY} src/validation/qc/pipeline_qc.py all "
+        "{PY} {SRC}/validation/qc/pipeline_qc.py all "
         "--wave {params.wave} --run-dir {params.rd} {params.repro} "
         "--out {output.report} &> {log}{params.guard}"
 
@@ -802,11 +867,11 @@ rule purity_source_attribution:
         LOG_DIR / "purity_source_attribution.log",
     shell:
         'mkdir -p "$(dirname {output.decompose})" "$(dirname {log})" && '
-        "{PY_TORCH} src/validation/explain/purity_source_attribution.py decompose "
+        "{PY_TORCH} {SRC}/validation/explain/purity_source_attribution.py decompose "
         "--run-dir {params.rd} --ranking {input.ranking} "
         "--targets {params.targets} --device {DEVICE} "
         "--out {output.decompose} &> {log} && "
-        "{PY_TORCH} src/validation/explain/purity_source_attribution.py mediate "
+        "{PY_TORCH} {SRC}/validation/explain/purity_source_attribution.py mediate "
         "--run-dir {params.rd} --ranking {input.ranking} "
         "--targets {params.targets} --device {DEVICE} "
         "--n-random {params.n_random} --out {output.mediate} &>> {log}"
@@ -831,7 +896,7 @@ rule head_to_head_baselines:
         LOG_DIR / "head_to_head_baselines.log",
     shell:
         'mkdir -p "$(dirname {output.h2h})" "$(dirname {log})" && '
-        "{PY} src/validation/reports/head_to_head_baselines.py "
+        "{PY} {SRC}/validation/reports/head_to_head_baselines.py "
         "--ranking {input.ranking} --humess-dir {params.humess} "
         "--coexpr-file {params.coexpr}{params.targets} "
         "--out {output.h2h} &> {log}"
@@ -856,7 +921,7 @@ rule readout_specificity:
         LOG_DIR / "readout_specificity.log",
     shell:
         'mkdir -p "$(dirname {output.spec})" "$(dirname {log})" && '
-        "{PY_TORCH} src/validation/explain/readout_specificity.py "
+        "{PY_TORCH} {SRC}/validation/explain/readout_specificity.py "
         "--run-dir {params.rd} --ranking {input.ranking} "
         "--mode {params.mode} --out {output.spec} &> {log}"
 
@@ -883,7 +948,7 @@ rule ora_de_baseline:
         LOG_DIR / "ora_de_baseline.log",
     shell:
         'mkdir -p "{params.out_dir}" "$(dirname {log})" && '
-        "{PY} src/validation/ora/ora_de_baseline.py "
+        "{PY} {SRC}/validation/ora/ora_de_baseline.py "
         "--top-k {params.top_n} --gnn-genes {input.genes} "
         "--out-dir {params.out_dir} &> {log}"
 
@@ -914,7 +979,7 @@ rule signed_cascade:
         LOG_DIR / "signed_cascade.log",
     shell:
         'mkdir -p "$(dirname {output.casc})" "$(dirname {log})" && '
-        "{PY_TORCH} src/perturbation/signed_cascade.py "
+        "{PY_TORCH} {SRC}/perturbation/signed_cascade.py "
         "--run-dir {params.rd} --sign-source {params.sign_src} "
         "--alpha {params.alpha} --hops {params.hops} --norm {params.norm} "
         "{params.pro} {params.anti} --device {DEVICE} "
