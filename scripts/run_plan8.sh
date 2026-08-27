@@ -64,15 +64,29 @@ case "$PHASE" in
   downstream)
     # The thesis reads the cross-seed aggregate, never the per-seed runs, so
     # this chain must be replayed after ANY change of seeds or of the score.
+    #
+    # Some steps of this chain build the artefacts of one specific write-up and
+    # are therefore NOT part of the published repository (see .gitignore and
+    # workflow/rules/memoire.local.smk). A missing step is skipped with a notice
+    # rather than aborting the chain: on a clone the generic steps must still
+    # run, and locally every step is present so nothing changes.
     echo "== aval : table de reference -> ORA -> figures -> annexes -> synthese =="
-    python scripts/gene_reference_table.py                         || exit 1
-    python scripts/build_ora_memoire.py                            || exit 1
-    python scripts/module_ora.py                                   || exit 1
-    python src/validation/figures/memoire_figures.py --regime-default \
+    run_step() {  # run_step <script> [args…] — skip (not fail) if absent
+      local script="$1"; shift
+      if [ ! -f "$script" ]; then
+        echo "   -- $script absent (etape locale non publiee) : ignoree"
+        return 0
+      fi
+      python "$script" "$@" || exit 1
+    }
+    run_step scripts/gene_reference_table.py
+    run_step scripts/build_ora_memoire.py
+    run_step scripts/module_ora.py
+    run_step src/validation/figures/memoire_figures.py --regime-default \
         --ora-dir output/ora_memoire \
-        --out output/gnn_vgae/V6.1.3/global_figures --manifest     || exit 1
-    python scripts/build_annexes.py                                || exit 1
-    python scripts/wave_synthesis.py                               || exit 1
+        --out output/gnn_vgae/V6.1.3/global_figures --manifest
+    run_step scripts/build_annexes.py
+    run_step scripts/wave_synthesis.py
     ;;
   *)
     sed -n '2,30p' "$0"

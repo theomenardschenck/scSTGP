@@ -1,5 +1,5 @@
 # =============================================================================
-# .gitignore — (sc)STGP
+# .gitignore — scSTGP (paquet `stateshift`)
 #
 # Règle de lecture : ce dépôt versionne l'OUTIL (code, workflow, caches de bases
 # publiques légers) et RIEN des données d'entrée, des sorties, ni du cahier de
@@ -52,7 +52,15 @@ output/
 /figures/
 
 # ── Cahier de labo : local, non publié (décision 2026-07-27) ─────────
-docs/
+# Les résultats non publiés, les cibles thérapeutiques et les notes de
+# conception restent hors du dépôt public. La DOC UTILISATEUR fait exception
+# (2026-08-14) : elle est le mode d'emploi de l'outil, elle doit voyager avec
+# lui — sans elle, `pip install stateshift` livre un binaire sans notice.
+# NB : `docs/*` et non `docs/` — git ne descend pas dans un répertoire exclu,
+# donc une négation sous `docs/` serait sans effet. Exclure le CONTENU laisse
+# la porte ouverte pour ré-inclure docs/guide/.
+docs/*
+!docs/guide/
 CLAUDE.md
 TODO
 to_ignore/
@@ -60,6 +68,33 @@ memoire/
 TOM/
 axis_idea.md
 *.pdf
+
+# ── Ce qui PRODUIT le mémoire (décision 2026-08-17) ──────────────────
+# Frontière retenue : un script qui fabrique les artefacts d'UN écrit précis
+# (ses figures, ses annexes, ses listes ORA) reste local ; un script d'analyse
+# GÉNÉRAL qui a servi à cet écrit est publié (wave_synthesis, module_ora,
+# score_variants, rescore_headline, gene_reference_table, fetch_kegg_gmt).
+# Ils lisent des résultats non publiés : livrés seuls, ils n'auraient rien à
+# lire, et `run_plan8.sh downstream` les saute proprement quand ils manquent.
+#
+# ⚠️ `src/validation/figures/` est le SEUL répertoire de code ignoré. Il ne
+# contient que memoire_figures.py et memoire_umap.py — d'où le retrait de
+# `stateshift.validation.figures` de pyproject.toml ET de la liste SUBPACKAGES
+# de tests/test_package_layout.py. Y remettre un module d'intérêt général
+# demande de défaire les trois d'un coup.
+/src/validation/figures/
+/scripts/build_annexes.py
+/scripts/build_ora_memoire.py
+/scripts/export_cell_umap.R
+/scripts/fig_edge_semantics.py
+/run_all_v613.sh
+
+# La règle Snakemake qui appelle ces figures voyage avec elles : le Snakefile
+# inclut `rules/*.local.smk` s'il en trouve, et n'en trouve aucun sur un clone.
+# Sans ce découpage, `test_every_script_the_snakefile_calls_is_installed`
+# échouerait — une règle dont le `shell:` nomme un script absent de la roue
+# casse en plein DAG, après la construction du graphe.
+/workflow/rules/*.local.smk
 
 # ── Python ──────────────────────────────────────────────────────────
 # ⚠️ NE PAS ré-ajouter `__init__.py` ici. Il y a figuré jusqu'au 2026-07-27 et

@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "Si vous utilisez ce logiciel, merci de le citer comme suit."
-title: "(sc)STGP — State Transition Gene Prediction"
+title: "scSTGP — single-cell State Transition Gene Prediction"
 abstract: >-
   Priorisation des gènes pilotant une transition d'état cellulaire, par
   auto-encodeur variationnel de graphe hétérogène sur réseaux biologiques curés,
@@ -8,12 +8,13 @@ abstract: >-
   projetée sur un axe d'état. L'encodeur n'accède jamais au contraste entre
   états : celui-ci n'intervient qu'au readout, ce qui distingue les gènes
   moteurs des simples marqueurs différentiels. Application de référence :
-  sénescence réplicative endothéliale (HUVEC).
+  sénescence réplicative endothéliale (HUVEC). Distribué sur PyPI sous le nom
+  `stateshift`, le nom `stgp` y étant déjà pris.
 type: software
 version: "0.1.0"
-date-released: "2026-07-27"
+date-released: "2026-08-17"
 license: MIT
-repository-code: "https://github.com/theomenardschenck/gnn_huvec"
+repository-code: "https://github.com/theomenardschenck/scSTGP"
 
 authors:
   - family-names: "Ménard"
