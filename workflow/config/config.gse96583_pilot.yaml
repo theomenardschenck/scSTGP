@@ -1,0 +1,122 @@
+# ============================================================================
+# config.gse96583_pilot.yaml — PILOTE de généralisation : PBMC humains,
+# contrôle vs stimulation IFN-β (Kang 2018, GSE96583). Aucun rapport avec la
+# sénescence : c'est le but — vérifier que la chaîne tourne sur un système
+# étranger, avec ses propres bases de validation.
+#
+# Entrées produites par :
+#   python scripts/sc_to_inputs.py --sample ctrl … --sample stim … \
+#       --genes … --cell-meta … --subsample 3000 --min-frac 0.02 \
+#       --out-dir data/pyscenic/GSE96583
+#
+# Régime de graphe = STRUCTUREL SEUL (PPI + Reactome + OmniPath signé +
+# Reactome FI). Pas de co-expression (GRNBoost2 non lancé), pas de régulons
+# SCENIC, pas de HuMess (cplex = local). Les trois sont ablatés explicitement :
+# un pilote ne doit rien attendre qui ne soit pas là.
+#
+# Lancer :
+#   bash workflow/run.sh --dry-run  --configfile workflow/config/config.gse96583_pilot.yaml
+#   bash workflow/run.sh --backend cluster --jobs 8 \
+#        --configfile workflow/config/config.gse96583_pilot.yaml
+# ============================================================================
+run:
+  name: "gse96583_pilot"
+  description: "PBMC ctrl vs IFN-β (Kang 2018) — pilote de généralisation, 2 graines"
+
+paths:
+  data_root: "data"
+  # ISOLEMENT : une racine par étude, un run_tag par configuration.
+  out_base: "output/GSE96583"
+  humess_dir: "data/humess/GSE96583"                 # inexistant → --no-humess
+  scenic_dir: "data/pyscenic/GSE96583/scenic_out"    # inexistant → --no-scenic-regulons
+  coexpr_file: "data/pyscenic/GSE96583/coexpr_diff.tsv"   # inexistant → --no-coexpr
+  de_magnitude_csv: "data/pyscenic/GSE96583/DE_stim_vs_ctrl.tsv"
+
+compute:
+  deterministic: true
+  device: "cpu"
+  python: "python"
+  python_torch: "python"
+  backend: "cluster"
+
+input:
+  rna_type: scrna
+  degs_path: "data/pyscenic/GSE96583/DE_stim_vs_ctrl.tsv"
+
+build:
+  enabled: false          # les entrées sont préparées en amont, pas reconstruites
+
+# Chemins RELATIFS à data_root. group_meta = mapping par CELLULE (cell_group.tsv),
+# surtout pas la samplesheet des donneurs : la jointure se fait sur la première
+# colonne de la matrice, qui contient des codes-barres.
+dataset:
+  cell_groups: "ctrl,stim"
+  expr_matrix: "pyscenic/GSE96583/expr_all.csv"
+  group_meta: "pyscenic/GSE96583/cell_group.tsv"
+  pole_a: "ctrl"
+  pole_b: "stim"
+
+models:
+  vgae:
+    enabled: true
+    run_tag: "gse96583.pilot"
+    seeds: [1, 2]          # 2 minimum : l'agrégation cross-seed en exige au moins deux
+    extra_flags: >-
+      --no-coexpr --no-scenic-regulons --no-humess
+      --use-omnipath-signaling --use-omnipath-tf-curated --include-omnipath-genes
+      --use-reactome-fi --signed-message --signed-decoder
+      --n-epochs 200 --patience 50
+  gnn_lite:
+    enabled: false
+
+perturbation:
+  enabled: true
+  modes: [knockout]
+  scope: all_genes
+  axis: phenotypic          # contraste ctrl → stim des cell_groups
+  axis_tag: ""
+  out_suffix: ""
+  genes_file: ""
+  transition_axes: none
+  cluster_anchor_mode: none
+  cache_delta_z: true
+  axis_method: diff
+
+scoring:
+  de_significance: "pvalue"
+  de_padj_max: 0.05
+  de_abs_lfc_min: 0.5
+
+validation:
+  ora_top_n: 100
+  qc:
+    enabled: true
+    blocking: false
+    repro_a: ""
+    repro_b: ""
+  decoy:
+    enabled: false          # coûteux ; le pilote répond « ça tourne ? »
+    top_n: 40
+    n_rewires: 50
+    random_axis: 0
+    random_axis_seed: 0
+  cluster_annotation:
+    enabled: false          # deux groupes, pas de sous-clusters
+  purity_source:
+    enabled: false
+    targets: ""
+    n_random: 20
+  head_to_head:
+    enabled: false          # exige HuMess
+  readout_specificity:
+    enabled: false
+  ora_de_baseline:
+    enabled: false
+  signed_cascade:
+    enabled: false
+
+comparison:
+  enabled: false
+
+output:
+  generate_html_report: false

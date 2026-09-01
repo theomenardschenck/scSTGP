@@ -70,3 +70,27 @@
   format: txt
   role: validation
   direction: up
+
+# Systemic lupus erythematosus (DOID:9074) — DISEASES/knowledge — 28 gènes, ajouté par scripts/fetch_disease_genes.py
+- name: sle_knowledge
+  path: data/gene_sets/sle_knowledge.tsv
+  symbol_col: gene_symbol
+  format: tsv
+  role: validation      # post-hoc uniquement — jamais dans le graphe
+
+# Systemic lupus erythematosus (DOID:9074) — DISEASES/integrated, score >= 2.0 — 459 gènes, ajouté par scripts/fetch_disease_genes.py
+- name: sle_integrated
+  path: data/gene_sets/sle_integrated.tsv
+  symbol_col: gene_symbol
+  format: tsv
+  role: validation      # post-hoc uniquement — jamais dans le graphe
+
+# Voies interféron (MSigDB HALLMARK + REACTOME) — la « voie » du phénotype
+# étudié dans le test GSE96583 (PBMC ctrl vs IFN-β). gmt_keywords filtre les
+# ensembles du GMT ; role: validation → ORA et rappel post-hoc uniquement.
+- name: interferon_pathway
+  path: data/databases/h.all.symbols.gmt
+  format: gmt
+  role: validation
+  gmt_keywords:
+    - INTERFERON

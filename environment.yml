@@ -1,4 +1,4 @@
-name: gnn
+name: STGP-env
 
 channels:
   - conda-forge

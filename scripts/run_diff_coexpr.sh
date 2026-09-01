@@ -70,8 +70,14 @@ MIN_IMAX_QUANTILE=0.5
 # GRNBoost2-local sklearn prend ~2× plus longtemps. 4h ne suffit pas.
 TIME_GRN="08:00:00"
 TIME_MERGE="00:30:00"
-DIFF_DIR="/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data/pyscenic/diff_coexpr"
-TF_LIST="/LAB-DATA/GLiCID/users/${GNN_CLUSTER_USER:-$USER}/gnn/data/pyscenic/scenic_refs/allTFs_hg38.txt"
+# Chemins RELATIFS au dépôt par défaut (l'ancien défaut pointait un clone
+# précis, ce qui rendait le script inutilisable ailleurs). --diff-dir et
+# --tf-list restent surchargeables.
+DIFF_DIR="data/pyscenic/diff_coexpr"
+TF_LIST="data/pyscenic/scenic_refs/allTFs_hg38.txt"
+# Conditions : les noms des deux groupes. HUVEC = P4,P16 (rétro-compat) ;
+# tout autre jeu passe les siens (ex. --conditions ctrl,stim).
+CONDITIONS="P4,P16"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -84,6 +90,8 @@ while [[ $# -gt 0 ]]; do
         --top-quantile)   TOP_QUANTILE="$2"; shift 2 ;;
         --time-grn)       TIME_GRN="$2"; shift 2 ;;
         --diff-dir)       DIFF_DIR="$2"; shift 2 ;;
+        --tf-list)        TF_LIST="$2"; shift 2 ;;
+        --conditions)     CONDITIONS="$2"; shift 2 ;;
         *) echo "Option inconnue : $1"; exit 1 ;;
     esac
 done
@@ -93,6 +101,22 @@ if [[ "$STEP" != "grnboost2" && "$STEP" != "merge" ]]; then
     exit 1
 fi
 
+IFS=',' read -r COND_A COND_B <<< "$CONDITIONS"
+if [[ -z "${COND_A:-}" || -z "${COND_B:-}" ]]; then
+    echo "[err] --conditions attend deux noms séparés par une virgule (ex. ctrl,stim)"
+    exit 1
+fi
+
+# Deux conventions de nommage cohabitent : expr_<cond>.csv (sc_to_inputs.py,
+# run_v6_build.sh) et expr_matrix_<cond>.csv (extract-matrices, historique).
+# On accepte les deux plutôt que d'imposer un renommage.
+expr_file() {
+    local d="$1" c="$2"
+    if   [[ -f "$d/expr_${c}.csv" ]];        then echo "$d/expr_${c}.csv"
+    elif [[ -f "$d/expr_matrix_${c}.csv" ]]; then echo "$d/expr_matrix_${c}.csv"
+    else echo "$d/expr_${c}.csv"; fi        # inexistant : message d'erreur en aval
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -101,14 +125,14 @@ mkdir -p "$LOG_DIR"
 
 # --- Vérif prérequis SELON l'étape -----------------------------------------
 if [[ "$STEP" == "grnboost2" ]]; then
-    # GRNBoost2 a besoin des matrices d'expression P4/P16.
-    for cond in P4 P16; do
-        M="$DIFF_DIR/expr_matrix_${cond}.csv"
+    # GRNBoost2 a besoin d'une matrice d'expression par condition.
+    for cond in "$COND_A" "$COND_B"; do
+        M="$(expr_file "$DIFF_DIR" "$cond")"
         if [[ ! -f "$M" ]]; then
-            echo "[err] $M absent."
-            echo "      Lance d'abord (local/frontal) :"
-            echo "      python src/data/preprocess/build_diff_coexpr.py extract-matrices \\"
-            echo "          --gene-universe graph --graph-genes <cross_seed_gene_ranking.tsv>"
+            echo "[err] $M absent (conditions = $COND_A,$COND_B)."
+            echo "      single-cell  : python scripts/sc_to_inputs.py … --out-dir $DIFF_DIR"
+            echo "      bulk         : python src/data/preprocess/build_diff_coexpr.py prep-matrices …"
+            echo "      scRNA fusionné : … extract-matrices --gene-universe graph"
             exit 1
         fi
     done
@@ -117,7 +141,7 @@ else
     # GARDE-FOU : on REFUSE de soumettre si elles sont absentes/vides
     # (remplace le --dependency=afterok fragile).
     missing=0
-    for cond in P4 P16; do
+    for cond in "$COND_A" "$COND_B"; do
         A="$DIFF_DIR/adjacencies_${cond}.csv"
         if [[ ! -s "$A" ]]; then
             echo "[err] $A absent ou vide."
@@ -167,8 +191,17 @@ cat > "$GRN_SBATCH" <<EOF
 set -euo pipefail
 cd "$PROJECT_DIR"
 
-CONDS=(P4 P16)
+CONDS=($COND_A $COND_B)
 COND=\${CONDS[\$SLURM_ARRAY_TASK_ID]}
+
+# Deux conventions de nommage acceptées (cf. expr_file() côté soumission).
+EXPR_FILE="$DIFF_DIR/expr_\${COND}.csv"
+[ -f "\$EXPR_FILE" ] || EXPR_FILE="$DIFF_DIR/expr_matrix_\${COND}.csv"
+
+# Le dépôt a été déployé à plat sur certains clusters (src/*.py) et en arbre
+# complet ailleurs (src/data/preprocess/*.py) : on prend celui qui existe.
+BD=src/data/preprocess/build_diff_coexpr.py
+[ -f "\$BD" ] || BD=src/build_diff_coexpr.py
 echo "[\$(date +%T)] GRNBoost2-local \$COND sur \$(hostname) (\$SLURM_CPUS_PER_TASK jobs)"
 
 # arboreto est CASSÉ sur l'env GLiCID : dask ≥ 2025.1 a retiré l'API
@@ -177,8 +210,8 @@ echo "[\$(date +%T)] GRNBoost2-local \$COND sur \$(hostname) (\$SLURM_CPUS_PER_T
 # dask (fragile, risque de casser torch/pyg dans l'env `gnn`), on
 # utilise notre réimplémentation GRNBoost2 en sklearn pur (Moerman 2019,
 # mêmes hyperparams SGBM) : zéro dask, zéro arboreto, parallélisé joblib.
-python3 src/build_diff_coexpr.py grnboost2-local \\
-    --expr "$DIFF_DIR/expr_matrix_\${COND}.csv" \\
+python3 "\$BD" grnboost2-local \\
+    --expr "\$EXPR_FILE" \\
     --tf-list "$TF_LIST" \\
     --out "$DIFF_DIR/adjacencies_\${COND}.csv" \\
     --n-jobs $N_WORKERS \\
@@ -206,9 +239,11 @@ cat > "$MERGE_SBATCH" <<EOF
 set -euo pipefail
 cd "$PROJECT_DIR"
 
-python3 src/build_diff_coexpr.py merge-adjacencies \\
-    --adj-p4  "$DIFF_DIR/adjacencies_P4.csv" \\
-    --adj-p16 "$DIFF_DIR/adjacencies_P16.csv" \\
+BD=src/data/preprocess/build_diff_coexpr.py
+[ -f "\$BD" ] || BD=src/build_diff_coexpr.py
+python3 "\$BD" merge-adjacencies \\
+    --adj-p4  "$DIFF_DIR/adjacencies_${COND_A}.csv" \\
+    --adj-p16 "$DIFF_DIR/adjacencies_${COND_B}.csv" \\
     --prune-mode "$PRUNE_MODE" \\
     --per-target-k $PER_TARGET_K \\
     --top-quantile $TOP_QUANTILE \\

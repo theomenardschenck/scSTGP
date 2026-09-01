@@ -174,6 +174,31 @@ def main():
     coexpr     = ask_path("Fichier de co-expression (coexpr_diff.tsv)",
                           default=f"{data_root}/pyscenic/diff_coexpr/coexpr_diff.tsv", repo=repo)
 
+    # ── Décrire le dataset : ces 5 clés deviennent GNN_EXPR_MATRIX /
+    #    GNN_GROUP_META / GNN_CELL_GROUPS, sans quoi le pipeline retombe sur le
+    #    jeu HUVEC historique et s'arrête sur merged_P4_P16_metadata.csv.
+    #    ⚠ RELATIFS à data_root (le préfixe data/ est déjà dans data_root).
+    print("\n— Décrire vos données (chemins RELATIFS à data_root) —")
+    if rna == "sc":
+        print("    Produits par : python scripts/sc_to_inputs.py … --out-dir "
+              f"{data_root}/pyscenic/{name}")
+        _def_expr = f"pyscenic/{name}/expr_all.csv"
+        _def_meta = f"pyscenic/{name}/cell_group.tsv"
+        print("    (single-cell : le mapping de groupe est par CELLULE — "
+              "cell_group.tsv, pas la samplesheet des donneurs)")
+    else:
+        print("    Produits par : bash scripts/run_v6_build.sh … --out-dir "
+              f"{data_root}/pyscenic/{name}")
+        _def_expr = f"pyscenic/{name}/expr_all.csv"
+        _def_meta = f"pyscenic/{name}/samplesheet.tsv"
+    ds_expr = ask("Matrice (1re colonne = identifiant de ligne, puis les gènes)",
+                  default=_def_expr)
+    ds_meta = ask("Table identifiant → groupe (sans en-tête)", default=_def_meta)
+    for _p, _label in ((ds_expr, "matrice"), (ds_meta, "groupes")):
+        if _p and not os.path.exists(os.path.join(repo, data_root, _p)):
+            print(f"    ⚠️  {_label} introuvable pour l'instant : "
+                  f"{os.path.join(data_root, _p)} (ok si produite plus tard)")
+
     build_block_matrix = build_block_meta = ""
     build_enabled = False
     if rna == "bulk":
@@ -374,6 +399,16 @@ compute:
 input:
   rna_type: {rna}
   degs_path: "{de_csv}"
+
+# DÉCRIT le dataset (≠ le RECONSTRUIRE : voir build). Ces clés deviennent
+# GNN_CELL_GROUPS / GNN_EXPR_MATRIX / GNN_GROUP_META et définissent l'axe
+# phénotypique pole_a → pole_b. Chemins RELATIFS à data_root.
+dataset:
+  cell_groups: "{grpA},{grpB}"
+  expr_matrix: "{ds_expr}"
+  group_meta: "{ds_meta}"
+  pole_a: "{grpA}"          # référence
+  pole_b: "{grpB}"          # condition
 
 # Stage 0 : build features data-dérivées (coexpr + HuMess) depuis une matrice.
 # enabled=true (bulk) → orchestré ; si coexpr/HuMess existent déjà, sauté.
